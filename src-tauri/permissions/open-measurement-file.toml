@@ -1,0 +1,11 @@
+# Hakutaku 独自コマンド open_measurement_file の許可定義（P04-3）。
+#
+# 計測モード専用のコマンドであり、計測モードでない場合はコマンド自身が要求を
+# 拒否する（本ファイルは Capability の許可を与えるだけで、実行時の可否判定は
+# src-tauri/src/measurement.rs が行う）。SEC-012 に従い、フロントエンドへ
+# 計測対象ファイルの絶対パスは一切渡さない。
+
+[[permission]]
+identifier = "allow-open-measurement-file"
+description = "計測モードが有効な場合に限り、環境変数 HAKUTAKU_MEASURE_FILE が指す計測用ファイルを読み込んで表示集合として登録することを許可する。"
+commands.allow = ["open_measurement_file"]

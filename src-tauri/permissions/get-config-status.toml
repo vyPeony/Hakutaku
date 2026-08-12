@@ -1,0 +1,14 @@
+# Hakutaku 独自コマンド get_config_status の許可定義（P03-2）。
+#
+# SEC-012 に従い、必要になった時点で個別コマンドだけを許可する
+# （src-tauri/capabilities/default.toml のコメント参照）。core:default は
+# 復元しない。
+#
+# 参照: https://schema.tauri.app/config/2/ (tauri_build の AppManifest は
+# 既定で ./permissions/**/* を読み込む。src-tauri/build.rs は
+# AppManifest::commands を使っていないため、このファイルが唯一の定義元)。
+
+[[permission]]
+identifier = "allow-get-config-status"
+description = "起動時に読み込んだ hakutaku.yaml の状態（起動経路・通知・エラー一覧）を取得することを許可する。"
+commands.allow = ["get_config_status"]

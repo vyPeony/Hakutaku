@@ -1,0 +1,10 @@
+# Hakutaku 独自コマンド launch_elevated の許可定義（PRIV-002〜004、P11-2）。
+#
+# SEC-012 に従い、必要になった時点で個別コマンドだけを許可する
+# （src-tauri/capabilities/default.toml のコメント参照）。core:default は
+# 復元しない。
+
+[[permission]]
+identifier = "allow-launch-elevated"
+description = "アクセス拒否エラー表示の「管理者として新しいウィンドウで開く」ボタンからだけ呼ばれる。自分自身の実行ファイルを runas verb・引数なしで新しい昇格済みプロセスとして起動する（PROD-012）。呼び出し元プロセス自体は昇格せず、開いた状態を維持する（PRIV-003）。キャンセル・失敗しても呼び出し元プロセスへ影響しない（PRIV-004）。"
+commands.allow = ["launch_elevated"]

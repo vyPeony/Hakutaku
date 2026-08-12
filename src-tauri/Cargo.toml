@@ -1,0 +1,60 @@
+[package]
+name = "hakutaku"
+version = "0.1.0"
+description = "Hakutaku の起動確認用 Tauri アプリ"
+authors = ["Hakutaku contributors"]
+edition = "2021"
+
+[lib]
+name = "hakutaku_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "Hakutaku"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = ["config-toml"] }
+
+[dependencies]
+hakutaku-config = { path = "../crates/config" }
+hakutaku-core = { path = "../crates/core-services" }
+# hakutaku-core（crates/core-services）が既に依存しているワークスペース内クレート
+# であり、Cargo.lock 上の外部依存グラフを増やすものではない（禁止事項の「外部
+# クレートの追加」には該当しない）。P11-3（PERF-014／CFG-024）の抑制設定
+# （同時実行数・I/O 発行間隔）を IoThrottle の共有インスタンスとして Tauri の
+# managed state に載せるため、型 `hakutaku_data_source::IoThrottle` を直接名指し
+# する必要があり、直接依存として明示する（src-tauri/src/targets.rs・lib.rs 参照）。
+hakutaku-data-source = { path = "../crates/data-source" }
+hakutaku-diagnostics = { path = "../crates/diagnostics" }
+hakutaku-memory-accounting = { path = "../crates/memory-accounting" }
+tauri = { version = "2", features = ["config-toml"] }
+# tauri 自身が既に serde 1 系（derive フィーチャ込み）を要求しているため、新規の
+# 外部依存を増やすものではない。get_config_status（P03-2）の応答型
+# （src-tauri/src/config_status.rs）を #[derive(serde::Serialize)] するために
+# 直接依存として明示する。
+serde = { version = "1", features = ["derive"] }
+# tauri 自身が IPC の直列化に既に serde_json を使用しているため（Tauri v2 の
+# invoke 応答は内部で serde_json 経由）、新規の外部依存を増やすものではない。
+# 計測モード（P04-3）の record_measurement_results が、フロントエンド
+# から受け取った計測結果 JSON と、Rust 側で採取した PrivateUsage 時系列を
+# 1つの JSON ファイルへまとめて書き出すために使う（src-tauri/src/measurement.rs）。
+serde_json = "1"
+
+# ブートストラップは Tauri 初期化前に動くため、Win32 API を直接使う（TECH-005）。
+# webview2-com は Tauri（wry）が既に使用している版に合わせ、WebView2Loader の
+# バージョン問い合わせ API だけを利用する。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

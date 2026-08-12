@@ -1,0 +1,12 @@
+# Hakutaku 独自コマンド get_measurement_mode の許可定義（P04-3）。
+#
+# 計測モードは開発・検証専用の機能である（利用者向け機能ではない。
+# HAKUTAKU_MEASURE_FILE 環境変数が絶対パスを指している場合だけ有効になる）。
+# SEC-012 に従い、必要になった時点で個別コマンドだけを許可する
+# （src-tauri/capabilities/default.toml のコメント参照）。core:default は
+# 復元しない。
+
+[[permission]]
+identifier = "allow-get-measurement-mode"
+description = "計測モード（HAKUTAKU_MEASURE_FILE 環境変数による開発・検証専用の起動モード）が有効かどうかを取得することを許可する。"
+commands.allow = ["get_measurement_mode"]

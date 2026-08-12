@@ -1,0 +1,8 @@
+# Hakutaku の製品ビルドは Windows 10 / 11 の 64 ビット版だけを対象とする。
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[env]
+# ネイティブ依存も Windows 10 1809（RS5 / build 17763）を下限として
+# Windows ヘッダーを参照する。`#` は MSVC の `_CL_` で `=` を表す。
+_CL_ = { value = "/DWINVER#0x0A00 /D_WIN32_WINNT#0x0A00 /DNTDDI_VERSION#0x0A000006", force = true }

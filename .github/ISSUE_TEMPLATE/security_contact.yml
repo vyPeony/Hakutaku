@@ -1,0 +1,19 @@
+name: セキュリティ報告経路の照会
+description: 脆弱性の詳細を書かず、非公開の報告方法だけを確認します
+title: "security: 非公開の報告方法を確認する"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        タイトルと本文は、分かりやすい日本語で書いてください。
+        この Issue は、脆弱性の非公開報告機能（Private vulnerability reporting）が利用できない場合に、非公開の連絡方法だけを確認するためのものです。
+
+        **脆弱性の種類、対象コンポーネント、影響、重大度、再現手順、画像、ログなど、問題を推測できる情報を一切記載しないでください。** メンテナーは公開 Issue 上で詳細を質問しません。
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: 公開情報の確認
+      options:
+        - label: この Issue に脆弱性の詳細、認証情報、個人情報、本番データを含めていません
+          required: true

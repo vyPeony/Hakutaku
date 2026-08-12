@@ -1,0 +1,10 @@
+[package]
+name = "hakutaku-config"
+version = "0.1.0"
+description = "Hakutaku の設定ファイル `hakutaku.yaml` を解釈する唯一の入口"
+authors = ["Hakutaku contributors"]
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+saphyr = "0.0.11"

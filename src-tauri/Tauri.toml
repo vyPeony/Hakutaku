@@ -1,0 +1,92 @@
+"$schema" = "https://schema.tauri.app/config/2"
+productName = "Hakutaku"
+mainBinaryName = "Hakutaku"
+version = "0.1.0"
+identifier = "com.vypeony.hakutaku"
+
+[build]
+frontendDist = "../src"
+
+[app]
+
+# [[app.windows]] は意図的に定義していません（P01-5、SEC-009・DIST-013）。
+#
+# Tauri 2.11.5 は src-tauri/src/manager/webview.rs の
+# 「in `windows`, we need to force a data_directory / but we do respect
+# user-specification」の分岐で、ウィンドウの `data_directory` が未指定のとき
+# WebView2 のユーザーデータフォルダを `%LOCALAPPDATA%\<identifier>` へ強制設定します
+# （tauri-2.11.5/src/manager/webview.rs 534〜行目付近）。これは
+# `SEC-009`（実行時に作成・書き込みするフォルダを logs／temp／WebView2 に限定し、
+# %LOCALAPPDATA% 配下へは書き込まない）と `DIST-013`（WebView2 のユーザーデータ
+# フォルダを実行ファイル直下の `WebView2` に固定する）に違反します。
+# 設定ファイル（TOML/JSON）側の `data_directory` は相対パスしか受け付けず、
+# `%LOCALAPPDATA%` 配下へ解決されてしまうため使えません
+# （tauri-utils-2.9.3/src/config.rs の WindowConfig.data_directory の実装）。
+#
+# したがってメインウィンドウは、設定ファイルではなく Rust 側（統合担当）で
+# `WebviewWindowBuilder::new(app, "main", ...).data_directory(<exe_dir>/WebView2)`
+# を使って生成します。見た目の値は次のとおりで、統合担当はここに掲げる値を
+# そのまま Rust 側で使用してください（P01 実装契約より）。
+#
+#   label      = "main"
+#   title      = "Hakutaku"
+#   width      = 640
+#   height     = 420
+#   minWidth   = 480
+#   minHeight  = 320
+#   resizable  = true
+#   fullscreen = false
+#
+# devtools（SEC-011）: WindowConfig / WebviewWindowBuilder には `devtools: Option<bool>`
+# があります（tauri-utils-2.9.3/src/config.rs 2173行目、
+# tauri-2.11.5/src/webview/webview_window.rs 1167行目の `.devtools(bool)`）。
+# ただし `tauri-runtime-wry-2.11.4/src/lib.rs` 5209〜5212行目で、この値を実際に
+# wry へ反映する呼び出し自体が `#[cfg(any(debug_assertions, feature = "devtools"))]`
+# でコンパイル時に囲まれており、`src-tauri/Cargo.toml` が `devtools` feature を
+# 有効にしていない現状（`tauri = { version = "2", features = ["config-toml"] }`）
+# では、リリースビルドでは devtools を有効化する経路自体が生成されません。
+# 念のための多重防御として、統合担当は Rust 側のウィンドウ生成時に
+# `.devtools(false)` を明示指定してください（効果は無くても意図の明文化になります）。
+
+[app.security]
+# SEC-011: リリースビルドで、ローカル同梱リソース（'self'）以外への
+# ナビゲーション・読み込み・通信を CSP で明示的に閉じる。リモートオリジン
+# （http:／https: の外部ホスト）は一切許可しない。
+# SEC-012 との関係: フロントエンドへ任意パスのファイルアクセス権を与えないという
+# 方針を、WebView 側でも script-src／frame-src／worker-src 等の実行系オリジンを
+# 'self' 以外禁止することで補強する。
+#
+# connect-src の `ipc:` と `http://ipc.localhost` は Tauri v2 の IPC 呼び出しに
+# 必要な最小限の許可です。裏取り根拠:
+#   - tauri-utils-2.9.3/src/config.rs 2741・2756行目（HeaderConfig の公式サンプルが
+#     `csp: "default-src 'self'; connect-src ipc: http://ipc.localhost"` を明示）
+#   - tauri-2.11.5/scripts/ipc-protocol.js 22〜41行目（フロントエンドは
+#     `fetch(window.__TAURI_INTERNALS__.convertFileSrc(cmd, 'ipc'), {method:'POST',...})`
+#     で IPC を送る。CSP でブロックされた場合のみ `window.ipc.postMessage` へ
+#     フォールバックする）
+#   - tauri-2.11.5/scripts/core.js 13〜19行目（`convertFileSrc` は Windows では
+#     `${protocolScheme}://ipc.localhost/...` を生成する。`protocolScheme` は
+#     ウィンドウの `useHttpsScheme`（既定 false）により `http` になる）
+#   - tauri-2.11.5/src/manager/mod.rs 340〜342行目（メインページ自体の生成元は
+#     Windows で既定 `http://tauri.localhost` であり、`ipc.localhost` とは
+#     別オリジンのため、connect-src への明示追加が必要）
+# 統合担当が Rust 側で `use_https_scheme(true)` を指定する場合は、ここも
+# `https://ipc.localhost` に合わせて変更してください（インターフェースの結合点）。
+csp = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'none'; worker-src 'none'; media-src 'none'"
+
+# dangerousDisableAssetCspModification は設定しない（既定値 Flag(false) のまま）。
+# SEC-011: Tauri が同梱 HTML の script-src／style-src へ nonce・hash を注入して
+# 保護する既定の仕組みを無効化しない
+# （tauri-utils-2.9.3/src/config.rs 2515〜2518行目の Default 実装）。
+#
+# app.security.capabilities は設定しない。未設定または空リストの場合、
+# `src-tauri/capabilities/` 配下のすべてのファイルが自動的に読み込まれる
+# （tauri-utils-2.9.3/src/config.rs 2931〜2934行目のコメント）ため、
+# 既存の capabilities/default.toml がそのまま有効になる。
+#
+# assetProtocol・pattern（isolation 等）はどちらも設定しない。既定は
+# 無効／Brownfield であり、リモート許可や別オリジンの読み込みを追加しない。
+
+[bundle]
+active = false
+icon = ["icons/icon.ico"]

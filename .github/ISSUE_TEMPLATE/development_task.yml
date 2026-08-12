@@ -1,0 +1,90 @@
+name: 開発タスク
+description: 実装・文書・設計作業の対象範囲と受け入れ条件を定義します
+title: "task: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        タイトルと本文は、分かりやすい日本語で書いてください。
+        Issue の作成だけでは着手承認を意味しません。対象範囲と受け入れ条件をレビューし、着手可能（Ready）になってから担当範囲を宣言してください。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決する問題
+      description: 背景、現在の状態、なぜ必要かを記載してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 期待する結果
+      description: 完了時に利用者またはリポジトリがどう変わるかを記載してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: in-scope
+    attributes:
+      label: 対象範囲
+      description: このタスクで変更する範囲を記載してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: 対象外
+      description: 明示的に扱わない範囲を記載してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 受け入れ条件
+      description: 直接検証できるチェックリストとして記載してください。
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: planned-scope
+    attributes:
+      label: 予定する変更範囲
+      description: ファイル、ディレクトリ、公開形式、設定、文書など、他のタスクと競合を確認する単位を記載してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: 依存・関連タスク
+      description: Issue、PR、ADR、マージ順、停止要因を記載してください。なければ「なし」。
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: 検証計画
+      description: テスト、手動確認、文書の表示確認、セキュリティ確認などを記載してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: リスクと切り戻し
+      description: 互換性、データ、セキュリティ、性能、切り戻しの考慮事項を記載してください。なければ「なし」。
+
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: 着手前の確認
+      options:
+        - label: 認証情報、個人情報、本番データを Issue に含めていない
+          required: true
+        - label: 既存の Issue / PR と担当範囲の重複を確認した
+          required: true

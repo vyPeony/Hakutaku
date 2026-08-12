@@ -1,0 +1,82 @@
+name: バグ報告
+description: 再現可能な不具合を報告します
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        タイトルと本文は、分かりやすい日本語で書いてください。
+        報告ありがとうございます。認証情報、接続文字列、個人情報、本番データは必ず除去し、再現データは合成または匿名化してください。
+        セキュリティ上の問題は公開 Issue にせず、[セキュリティポリシー](https://github.com/vyPeony/Hakutaku/security/policy)の手順で報告してください。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 概要
+      description: 何が問題なのかを簡潔に説明してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順
+      description: 最小限の手順を順番に記載してください。
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待する結果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際の結果
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source-kind
+    attributes:
+      label: 関係するデータ種別
+      multiple: true
+      options:
+        - ログ
+        - データベース
+        - Web API
+        - ファイル
+        - 複数データソースの統合
+        - その他・不明
+
+  - type: input
+    id: version
+    attributes:
+      label: バージョンまたはコミット
+      placeholder: 例: v0.1.0 / abc1234
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 実行環境
+      description: OS、配布形態、関係する外部システムの種類などを記載してください。
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 診断情報
+      description: 秘密情報と実データを除去・匿名化したログ、エラー、画像などを添付してください。
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: 補足

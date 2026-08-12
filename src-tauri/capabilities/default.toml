@@ -1,0 +1,116 @@
+"$schema" = "../gen/schemas/desktop-schema.json"
+identifier = "default"
+description = "Hakutaku のメインウィンドウに必要な既定権限"
+windows = ["main"]
+
+# SEC-012: Capability は必要最小限に限定し、フロントエンドへ任意パスの
+# ファイルシステムアクセス権を与えない。読み取りは Rust コマンド経由に限定する。
+#
+# permissions を空にしています（従来の ["core:default"] から変更）。根拠:
+#
+# 1. `core:default` は tauri-2.11.5/build.rs の PLUGINS 一覧（16〜370行目）と
+#    define_default_permission_set（449〜485行目）が生成するもので、
+#    core:path・core:event・core:window・core:webview・core:app・core:image・
+#    core:resources・core:menu・core:tray の各 `<plugin>:default` を束ねた集合
+#    です。fs／shell／http 系のコマンドは含まれておらず、これ自体は SEC-012 に
+#    違反していません（パス文字列の解決 core:path はファイル内容へアクセスしない）。
+#
+# 2. ただし現在の `src/index.html` と `src/styles.css` には <script> が一切なく、
+#    `invoke()` を呼び出すフロントエンドコードが存在しません。Tauri が自動注入する
+#    ランタイムスクリプト（tauri-2.11.5/scripts/core.js、ipc-protocol.js）も、
+#    ページ読み込み時に自発的にコマンドを呼び出す処理はありません
+#    （core.js は window.__TAURI_INTERNALS__ に invoke 等の関数を定義するだけ）。
+#    ウィンドウの表示・ネイティブタイトルバーの最小化／閉じる操作・IPC エンドポイント
+#    自体の登録（tauri-2.11.5/src/manager/webview.rs 280〜286行目）は Capability の
+#    許可状態と無関係に行われます。
+#
+# 3. したがって「Hakutaku のメインウィンドウ表示に本当に必要な」コマンドは
+#    現時点でゼロです。permissions = [] は
+#    tauri-utils-2.9.3/src/acl/resolved.rs 265行目付近の解決処理
+#    （`for permission_entry in &capability.permissions` で空なら何もしない）と
+#    src-tauri/gen/schemas/desktop-schema.json の permissions フィールド定義
+#    （type: array, uniqueItems: true。minItems 等の下限制約は無い）の両方で
+#    スキーマ上・実装上妥当です。
+#
+# 後続フェーズへの引き継ぎ: フロントエンドに invoke() を伴う JS を追加する時点で、
+# 必要になった時点の最小権限（例: `core:app:allow-version` のような個別許可）だけを
+# 都度追加してください。`core:default` を一括で復元しないこと。
+#
+# P03-2 で `src/main.js` から `get_config_status` を呼び出すため、
+# 上記の方針どおり、そのコマンド専用の最小権限だけを追加する。定義は
+# src-tauri/permissions/get-config-status.toml（プレフィックス無し = アプリ自身の
+# コマンド。tauri-utils の ACL 解決では `<プラグイン名>:` プレフィックスが無い
+# 許可はアプリ自身の ACL として扱われる）。
+#
+# P04-1 で `open_log_file` / `fetch_log_range` を追加する。同じ方針
+# どおり、コマンドごとに専用の最小権限だけを追加する（定義は
+# src-tauri/permissions/open-log-file.toml・fetch-log-range.toml）。
+#
+# P04-3 で計測モード用の3コマンドを追加する。計測モードは開発・
+# 検証専用（HAKUTAKU_MEASURE_FILE 環境変数が有効な場合だけ動作し、通常の
+# 利用者向け起動では各コマンドが要求を拒否する）だが、Capability の許可自体は
+# 他コマンドと同じ最小権限の方針に従う（定義は
+# src-tauri/permissions/get-measurement-mode.toml・open-measurement-file.toml・
+# record-measurement-results.toml）。
+#
+# P07-1 で共通シェルの参照対象一覧用に4コマンドを追加する。
+# 同じ方針どおり、コマンドごとに専用の最小権限だけを追加する（定義は
+# src-tauri/permissions/list-targets.toml・open-config-data-source.toml・
+# close-target.toml・retry-target.toml）。
+#
+# P07-2 で進捗・キャンセル・手動プロファイル選択用に2コマンドを
+# 追加する（定義は src-tauri/permissions/cancel-load.toml・
+# list-log-profiles.toml）。進捗・完了イベント（"hakutaku://load-progress"・
+# "hakutaku://load-outcome"）は Rust 側から AppHandle::emit で発行するだけで
+# あり、Capability の許可（ACL）は invoke() 経由のコマンド呼び出しだけを
+# 対象とするため、イベント発行そのものに追加の permission は不要（詳細は
+# src-tauri/src/targets.rs のモジュール doc コメント「イベント vs
+# ポーリング」を参照）。フロントエンドは events を listen() せず、
+# list_targets のポーリングを主経路として使うため、core:event 系の
+# permission（allow-listen 等）もあえて追加しない。
+#
+# P06-5 で明示的な再読み込み（LOG-028）用に reload_target を
+# 追加する。同じ方針どおり、専用の最小権限だけを追加する（定義は
+# src-tauri/permissions/reload-target.toml）。
+#
+# P11-2 でアクセス拒否時の昇格経路用に launch_elevated を追加
+# する。同じ方針どおり、専用の最小権限だけを追加する（定義は
+# src-tauri/permissions/launch-elevated.toml）。誤用防止のため、フロント
+# エンド（src/shell.js）はアクセス拒否エラー表示のときだけこのコマンドを
+# 呼び出すボタンを出す（PRIV-001 の趣旨「常時管理者権限を要求しない」を
+# 損なわないため）。
+#
+# P09-1 で時系列統合表示（LOG-007〜LOG-008、LOG-015）用に
+# enable_merged_view・disable_merged_view を追加する。同じ方針どおり、
+# コマンドごとに専用の最小権限だけを追加する（定義は
+# src-tauri/permissions/enable-merged-view.toml・disable-merged-view.toml）。
+# P10 で選択範囲のクリップボードコピー用に copy_selection を
+# 追加する。同じ方針どおり、専用の最小権限だけを追加する（定義は
+# src-tauri/permissions/copy-selection.toml）。
+#
+# P07 で「日時書式を選んで再解析」の選択肢を取得するため
+# list_datetime_formats を追加する。同じ方針どおり、専用の最小権限だけを
+# 追加する（定義は src-tauri/permissions/list-datetime-formats.toml）。
+# 返すのは解析側が持つ固定の書式一覧（要件 ID と表示用パターン）だけで、
+# 設定値・パス・ファイル内容は含まないため、list_log_profiles と同じく
+# SEC-012 上の追加リスクはない。
+permissions = [
+    "allow-get-config-status",
+    "allow-open-log-file",
+    "allow-fetch-log-range",
+    "allow-get-measurement-mode",
+    "allow-open-measurement-file",
+    "allow-record-measurement-results",
+    "allow-list-targets",
+    "allow-list-log-profiles",
+    "allow-list-datetime-formats",
+    "allow-open-config-data-source",
+    "allow-close-target",
+    "allow-cancel-load",
+    "allow-retry-target",
+    "allow-reload-target",
+    "allow-launch-elevated",
+    "allow-enable-merged-view",
+    "allow-disable-merged-view",
+    "allow-copy-selection",
+]

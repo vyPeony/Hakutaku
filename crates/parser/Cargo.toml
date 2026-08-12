@@ -1,0 +1,9 @@
+[package]
+name = "hakutaku-parser"
+version = "0.1.0"
+description = "Hakutaku のパーサー境界"
+authors = ["Hakutaku contributors"]
+edition = "2021"
+license = "MIT"
+
+[dependencies]

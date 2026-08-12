@@ -1,0 +1,10 @@
+# Hakutaku 独自コマンド list_log_profiles の許可定義（P07-2）。
+#
+# SEC-012 に従い、必要になった時点で個別コマンドだけを許可する
+# （src-tauri/capabilities/default.toml のコメント参照）。core:default は
+# 復元しない。
+
+[[permission]]
+identifier = "allow-list-log-profiles"
+description = "設定（hakutaku.yaml の log_profiles）のプロファイル名一覧を取得することを許可する（LOG-022 の手動選択 UI）。パス等の詳細は含まれない。"
+commands.allow = ["list_log_profiles"]

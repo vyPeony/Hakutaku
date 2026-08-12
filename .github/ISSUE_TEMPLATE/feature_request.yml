@@ -1,0 +1,60 @@
+name: 機能提案
+description: 解決したい課題や新しいユースケースを提案します
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        タイトルと本文は、分かりやすい日本語で書いてください。
+        機能名だけでなく、誰がどのような状況で困っているかを教えてください。
+        提案 Issue の作成だけでは着手承認を意味しません。採用後、実装前に対象範囲と受け入れ条件を着手可能（Ready）にします。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい課題
+      description: 利用者、状況、現在の回避方法を含めて説明してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 希望する振る舞い
+      description: 実現したい結果を記載してください。実装方法の指定は任意です。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source-kind
+    attributes:
+      label: 関係するデータ種別
+      multiple: true
+      options:
+        - ログ
+        - データベース
+        - Web API
+        - ファイル
+        - 複数データソースの統合
+        - データ種別に依存しない
+        - その他・不明
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 検討した代替案
+      description: 現在の回避策や、別の解決方法があれば記載してください。
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 受け入れ条件の案
+      description: 何ができれば課題が解決したと言えるかを記載してください。
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: 補足
+      description: 参考資料、画面案、制約などがあれば記載してください。

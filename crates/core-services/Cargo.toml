@@ -1,0 +1,14 @@
+[package]
+name = "hakutaku-core"
+version = "0.1.0"
+description = "Hakutaku の GUI 非依存な共通サービス境界"
+authors = ["Hakutaku contributors"]
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+hakutaku-config = { path = "../config" }
+hakutaku-data-source = { path = "../data-source" }
+hakutaku-format-detection = { path = "../format-detection" }
+hakutaku-memory-accounting = { path = "../memory-accounting" }
+hakutaku-parser = { path = "../parser" }

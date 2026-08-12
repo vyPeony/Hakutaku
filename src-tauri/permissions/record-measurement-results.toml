@@ -1,0 +1,9 @@
+# Hakutaku 独自コマンド record_measurement_results の許可定義（P04-3）。
+#
+# 計測モード専用のコマンドであり、計測モードでない場合はコマンド自身が要求を
+# 拒否する。書き込み先は logs ディレクトリに限定する（SEC-009）。
+
+[[permission]]
+identifier = "allow-record-measurement-results"
+description = "計測モードが有効な場合に限り、計測結果 JSON を logs ディレクトリへ書き出すことを許可する。"
+commands.allow = ["record_measurement_results"]

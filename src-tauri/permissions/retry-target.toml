@@ -1,0 +1,10 @@
+# Hakutaku 独自コマンド retry_target の許可定義（P07-1）。
+#
+# SEC-012 に従い、必要になった時点で個別コマンドだけを許可する
+# （src-tauri/capabilities/default.toml のコメント参照）。core:default は
+# 復元しない。
+
+[[permission]]
+identifier = "allow-retry-target"
+description = "失敗した対象（LOG-027）を、対象 ID を指定して再試行することを許可する。フロントエンドはパスを持たないため対象 ID で参照する（SEC-012）。"
+commands.allow = ["retry_target"]

@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      CSP の meta タグはここには置きません（正本は src-tauri/Tauri.toml の
+      [app.security] csp のみ）。Tauri は同梱 HTML への応答ごとに、
+      script-src／style-src へランダムな nonce を追加した CSP ヘッダーを動的に
+      付与します（tauri-2.11.5/src/manager/mod.rs 86〜153行目の
+      replace_csp_nonce。nonce は getrandom::u64() で応答のたびに生成される。
+      根拠: 同ファイル 126〜151行目）。加えて <style> や外部 script タグには
+      nonce 属性そのものも注入されます（tauri-utils-2.9.3/src/html.rs
+      147〜158行目の inject_nonce_token）。
+      ブラウザは複数の CSP 指定を積集合として適用するため、ここに静的な
+      meta タグ（nonce を含められない）を置くと、ヘッダー側が nonce で許可した
+      リソースを meta 側が必ず拒否し、多重防御のつもりが防御の無効化になります。
+      CSP を変更する場合は src-tauri/Tauri.toml だけを編集してください。
+    -->
+    <title>Hakutaku</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <!--
+      #config-banners は src/banner.js のヘルパー（src/main.js から呼び出される）
+      が起動時に動的へ挿入する共通の通知コンテナです（get_config_status の結果に
+      応じた CFG-015 / CFG-016 の通知バナー。P03-2・P04-2）。静的な要素は
+      ここには置きません。
+
+      対象を開く操作の失敗（ERR-002 の5要素）は、ここではなく画面下部の
+      #status-error-area（src/error_panel.js が body 末尾へ動的に挿入する。
+      P07-1）に表示します。起動時の非致命的な通知（画面上部）と、
+      個々の対象を開く操作のエラー（画面下部）を意図的に分けています。
+    -->
+    <main class="app">
+      <!--
+        共通シェルの本体（P07-1）。左に参照対象一覧、右に
+        「開いているビューのタブ」とビュー領域を並べる（3.2 の暫定方針、
+        ENV-005 の 1920×1080 基準）。
+      -->
+      <div class="app-body" id="app-body">
+        <!--
+          左ペイン: 参照対象一覧（CFG-003／PROD-006 の事前定義パスと、
+          アドホックに開いた対象を同じ一覧に表示する。src/shell.js が
+          src/targets.js の状態モデルを使って描画する）。
+        -->
+        <aside class="target-pane" id="target-pane">
+          <div class="target-pane__header">
+            <h2 class="target-pane__heading">参照対象</h2>
+            <!--
+              「ファイルを開く」ボタン（PROD-016／LOG-020）。設定ファイルに
+              記載のない任意のローカルログファイルを、ネイティブのファイル
+              選択ダイアログ経由でアドホックに開く。設定編集とアプリ再起動を
+              必須としない。安全モード・設定なしでも利用できる
+              （src/shell.js・src-tauri/src/log_view.rs の open_log_file）。
+            -->
+            <button type="button" id="open-file-button">ファイルを開く</button>
+          </div>
+          <ul class="target-list" id="target-list"></ul>
+        </aside>
+        <!--
+          右側: 開いているビューのタブ（上部）とビュー領域（中央）。
+          統合表示 OFF 時のファイル別タブ切り替えで、分割表示は作らない
+          （LOG-015）。
+        -->
+        <div class="app-main" id="app-main">
+          <!--
+            時系列統合の ON/OFF トグル（P09-1、LOG-007〜LOG-008）。
+            ON で開いている全ソースを横断する統合表示（統合タブ1つ）を表示し、
+            OFF でファイル別タブ表示へ戻す（LOG-015。分割表示は作らない）。
+            src/shell.js が押下・表示ラベルの更新を行う。
+          -->
+          <div class="view-toolbar" id="view-toolbar">
+            <button
+              type="button"
+              id="merged-view-toggle"
+              class="merged-view-toggle"
+              aria-pressed="false"
+            >
+              時系列統合: OFF
+            </button>
+          </div>
+          <div class="tab-bar" id="tab-bar" role="tablist" aria-label="開いているビュー"></div>
+          <!--
+            ビュー領域 = 「形式別ビューアの差し込み口」（src/log_view.js の
+            モジュール doc コメント「形式別ビューアの差し込み口」を参照）。
+            現時点ではテキストログビューア（log-toolbar + log-viewport）が
+            唯一の実装。将来 DICOM（P14）等を追加する場合もこの領域の中へ
+            差し込む想定で、共通シェル側の構造（app-body・tab-bar 等）は
+            形式に依存しない。
+          -->
+          <div class="view-area" id="view-area">
+            <div class="log-toolbar" id="log-toolbar">
+              <span class="log-toolbar__label" id="log-source-label"></span>
+              <span class="log-toolbar__count" id="log-total-items"></span>
+              <!--
+                コピー列の選択（P10、COPY-001）。行選択（クリック・
+                Shift+クリック・Ctrl+A）で選ぶのは「どの行を」コピーするかで
+                あり、ここで選ぶのは「どの列を」コピーするか（本文のみ =
+                原文そのまま、複数列 = quoted TSV。ADR-0009）。「選択メニュー
+                （右クリックまたはツールバー）で列の組を選んでコピー」という
+                計画正本の最小実装案のうち、常設のツールバー方式を採用した
+                （src/log_view.js のモジュール doc コメント参照）。
+              -->
+              <div class="log-toolbar__copy-columns" id="log-copy-columns">
+                <span class="log-toolbar__copy-columns-label">コピー列</span>
+                <label class="log-toolbar__copy-columns-option">
+                  <input type="checkbox" id="log-copy-column-line-number" />
+                  行番号
+                </label>
+                <label class="log-toolbar__copy-columns-option">
+                  <input type="checkbox" id="log-copy-column-timestamp" />
+                  日時
+                </label>
+                <label class="log-toolbar__copy-columns-option">
+                  <input type="checkbox" id="log-copy-column-raw-text" checked />
+                  本文
+                </label>
+              </div>
+              <!--
+                行番号でジャンプ（P08-2、tasks/phase-08-log-view.md
+                作業項目4）。表示集合内のインデックスへスクロールする（原本の
+                source_line_number ではない。src/virtual_scroll.js の
+                parseJumpTargetRowIndex の doc コメント参照）。範囲外の入力は
+                丸める。
+              -->
+              <div class="log-toolbar__jump">
+                <label class="log-toolbar__jump-label" for="log-jump-input"
+                  >行番号でジャンプ</label
+                >
+                <input
+                  type="number"
+                  id="log-jump-input"
+                  class="log-toolbar__jump-input"
+                  min="1"
+                  step="1"
+                  inputmode="numeric"
+                />
+                <button type="button" id="log-jump-button" class="log-toolbar__jump-button">
+                  ジャンプ
+                </button>
+              </div>
+            </div>
+            <!--
+              仮想スクロールのビューポート（P04-2）。#log-viewport が
+              スクロールを担い、#log-spacer-top・#log-spacer-bottom の高さ
+              （src/log_view.js が totalItems × 行高から算出）で全体の高さを
+              表現する。実際に DOM へ描画するのは可視範囲＋前後バッファの行
+              だけで、#log-rows の中身は src/log_view.js がスクロールの
+              たびに作り直す。
+
+              tabindex="0"（P08-2）: フォーカス可能にすることで、
+              PageUp／PageDown／Home／End のブラウザ既定のスクロール動作が
+              この要素に対して自然に働くようにする（Ctrl+Home／Ctrl+End だけ
+              src/log_view.js の handleViewportKeydown が明示的に処理する）。
+
+              P10（COPY-001／002）: 行クリック・Shift+クリックで
+              行を選択し、Ctrl+A で全行選択、Ctrl+C でクリップボードへコピー
+              する（いずれも handleViewportKeydown／handleRowsClick が扱う）。
+              選択はインデックス範囲だけを保持し（PERF-012）、ブラウザ既定の
+              テキスト選択（P04-4 の最小コピー）は置き換えた
+              （src/styles.css の .log-rows 参照）。
+            -->
+            <div
+              class="log-viewport"
+              id="log-viewport"
+              tabindex="0"
+              aria-label="ログ本文の表示領域（クリックで行を選択、Shift+クリックで範囲選択、Ctrl+A で全選択、Ctrl+C でコピー、キーボードでスクロールできます）"
+            >
+              <div class="log-spacer" id="log-spacer-top"></div>
+              <div class="log-rows" id="log-rows"></div>
+              <div class="log-spacer" id="log-spacer-bottom"></div>
+            </div>
+            <!--
+              継続行の詳細パネル（P08-2、LOG-014）。折りたたみ方式（一律1行高。
+              src/virtual_scroll.js 冒頭のコメント参照）で行一覧には表示されない
+              継続行を、改行を保ったまま確認するための領域。既定は非表示
+              （hidden 属性）で、src/log_view.js の showDetailPanel /
+              hideDetailPanel が開閉する。
+            -->
+            <div class="log-detail-panel" id="log-detail-panel" hidden>
+              <div class="log-detail-panel__header">
+                <span class="log-detail-panel__title" id="log-detail-panel-title"></span>
+                <button
+                  type="button"
+                  class="log-detail-panel__close"
+                  id="log-detail-panel-close"
+                  aria-label="詳細表示を閉じる"
+                >
+                  ×
+                </button>
+              </div>
+              <pre class="log-detail-panel__body" id="log-detail-panel-body"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

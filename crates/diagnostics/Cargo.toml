@@ -1,0 +1,10 @@
+[package]
+name = "hakutaku-diagnostics"
+version = "0.1.0"
+description = "Hakutaku の GUI 非依存な診断ログ（DIAG-001〜007）"
+authors = ["Hakutaku contributors"]
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

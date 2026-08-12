@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/config",
+    "crates/core-services",
+    "crates/data-source",
+    "crates/diagnostics",
+    "crates/format-detection",
+    "crates/memory-accounting",
+    "crates/parser",
+    "src-tauri",
+]
+resolver = "2"

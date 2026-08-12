@@ -1,0 +1,23 @@
+[package]
+name = "hakutaku-data-source"
+version = "0.1.0"
+description = "Hakutaku の読み取り専用データソース境界"
+authors = ["Hakutaku contributors"]
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+# PERF-010: 読み込みバッファの確保前にグローバル予算へ予約するため依存する
+# （P04-1）。
+hakutaku-memory-accounting = { path = "../memory-accounting" }
+
+# ファイル識別子（ボリューム連番＋ファイルインデックス）の取得は Win32 API を
+# 直接使う（P06-1）。std::os::windows::fs::MetadataExt の該当メソッドは現行の
+# 安定版 Rust では unstable（windows_by_handle）のため使えない。
+# src-tauri/Cargo.toml・crates/format-detection/Cargo.toml と同じバージョン
+# 系列。必要な feature だけを列挙する。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

@@ -1,0 +1,17 @@
+[package]
+name = "hakutaku-memory-accounting"
+version = "0.1.0"
+description = "Hakutaku のメモリ会計（グローバルアロケータ計装・予算・予約トークン）を担うクレート"
+authors = ["Hakutaku contributors"]
+edition = "2021"
+license = "MIT"
+
+# 参考指標（PrivateUsage 合計、PERF-011）の計測は Win32 API を直接使う
+# （src-tauri/Cargo.toml と同じバージョン系列。必要な feature だけを列挙する）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

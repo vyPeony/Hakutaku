@@ -1,0 +1,10 @@
+# Hakutaku 独自コマンド enable_merged_view の許可定義（P09-1）。
+#
+# SEC-012 に従い、必要になった時点で個別コマンドだけを許可する
+# （src-tauri/capabilities/default.toml のコメント参照）。core:default は
+# 復元しない。
+
+[[permission]]
+identifier = "allow-enable-merged-view"
+description = "現在開いている全ソースを横断する時系列統合表示集合を構築し、ONにすることを許可する（LOG-007〜LOG-008）。参照対象ファイルは変更しない。"
+commands.allow = ["enable_merged_view"]

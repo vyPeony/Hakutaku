@@ -1,0 +1,10 @@
+# Hakutaku 独自コマンド list_datetime_formats の許可定義（P07）。
+#
+# SEC-012 に従い、必要になった時点で個別コマンドだけを許可する
+# （src-tauri/capabilities/default.toml のコメント参照）。core:default は
+# 復元しない。
+
+[[permission]]
+identifier = "allow-list-datetime-formats"
+description = "既知の日時書式（LOG-DT-001〜006）の要件 ID と表示用パターンの一覧を取得することを許可する（LOG-022 の手動選択 UI）。設定・パス・ファイル内容には触れない固定の一覧である。"
+commands.allow = ["list_datetime_formats"]

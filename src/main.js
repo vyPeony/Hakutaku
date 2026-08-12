@@ -1,0 +1,177 @@
+// 起動時に get_config_status を呼び出し、設定読み込み結果に応じた通知を
+// 表示する（CFG-015: 既定値起動の非致命的通知、CFG-016: 安全モードの警告と
+// エラー一覧）。P03-2。
+//
+// 同じ応答から CFG-022（フロントエンドの保持上限。frontend_retention）を
+// 読み取り、ログ表示ビュー（log_view.js）へ渡して初期化する（P04-2）。
+// フロントエンドは保持上限をハードコードせず、常にこの応答を
+// 単一の情報源として使う。
+//
+// ビルドツールを使わない素の ES モジュールとして書く（tasks/phase-03-configuration.md
+// の制約。src/index.html は `<script type="module" src="./main.js">` で読み込む）。
+//
+// Tauri の IPC 呼び出しには window.__TAURI_INTERNALS__.invoke を直接使う。
+// window.__TAURI__（@tauri-apps/api 相当の便利ラッパー）は Tauri.toml の
+// app.withGlobalTauri を有効化しないと注入されないが、
+// window.__TAURI_INTERNALS__.invoke はその設定に関わらず常に注入される
+// 内部 API であり、Tauri 自身の JS API 実装（@tauri-apps/api の invoke）も
+// 最終的にこれを呼び出す（根拠: tauri-2.11.5/scripts/core.js の
+// window.__TAURI_INTERNALS__.invoke 定義、および src-tauri/Tauri.toml の
+// [app.security] コメント）。Tauri.toml を変更せずに済む分、変更範囲が
+// 最小になるためこちらを採用する。
+//
+// 通知バナーの表示機構（コンテナ・閉じるボタン）は src/banner.js に切り出して
+// いる。log_view.js（ログ操作のエラー通知）と共有するため（P04-2）。
+//
+// P07-1 以降、起動直後のログ表示ビューの初期化は共通シェル
+// （src/shell.js）へ委譲する。src/main.js はここまでの起動処理（設定状態の
+// 取得とバナー表示、計測モードの起動判定）だけを担当する。
+
+import { showInfoBanner, showWarningBanner } from "./banner.js";
+import { initShell } from "./shell.js";
+import { runMeasurement } from "./measurement.js";
+
+/**
+ * `get_config_status` コマンドを呼び出す。
+ *
+ * @returns {Promise<{
+ *   route: "loaded" | "missing" | "invalid",
+ *   errors: Array<{
+ *     file_name: string,
+ *     line: number | null,
+ *     column: number | null,
+ *     item_path: string,
+ *     reason: string,
+ *   }>,
+ *   frontend_retention: { max_rows: number, max_bytes: number },
+ *   data_source_names: string[],
+ * }>}
+ */
+function fetchConfigStatus() {
+  return window.__TAURI_INTERNALS__.invoke("get_config_status");
+}
+
+/**
+ * エラー1件を「ファイル名:行:列 項目: 理由」の形式へ整形する
+ * （`crates/config` の `ConfigError` の Display 表現と揃える）。
+ *
+ * @param {{file_name: string, line: number | null, column: number | null, item_path: string, reason: string}} error
+ */
+function formatConfigError(error) {
+  const line = error.line ?? "?";
+  const column = error.column ?? "?";
+  const location = `${error.file_name}:${line}:${column}`;
+  return error.item_path
+    ? `${location} ${error.item_path}: ${error.reason}`
+    : `${location}: ${error.reason}`;
+}
+
+/**
+ * `get_config_status` の応答そのものが取得できなかった場合だけに使う、最後の
+ * 砦のフォールバック値。`crates/config/src/schema.rs` の
+ * `FrontendConfig::default()` と同じ値（`CFG-022` の実測前の暫定既定値）。
+ * 通常経路では常に応答の `frontend_retention` を使い、この値は使われない
+ * （フロントエンドは保持上限をハードコードしない、という方針の例外ではなく、
+ * 応答取得自体が失敗した異常系のための最終防御）。
+ */
+const FALLBACK_RETENTION_LIMITS = {
+  maxRows: 10_000,
+  maxBytes: 64 * 1024 * 1024,
+};
+
+/**
+ * `get_measurement_mode` コマンドを呼び出す（P04-3）。
+ *
+ * 計測モードは開発・検証専用の機能であり、`HAKUTAKU_MEASURE_FILE` 環境変数を
+ * 設定して起動した場合だけ `active: true` になる。通常の利用者向け起動では
+ * 常に `active: false` であり、`src/measurement.js` は一切実行されない。
+ *
+ * @returns {Promise<{ active: boolean }>}
+ */
+function fetchMeasurementMode() {
+  return window.__TAURI_INTERNALS__.invoke("get_measurement_mode");
+}
+
+/**
+ * 設定状態に応じたバナーを表示する（CFG-015 / CFG-016）。
+ *
+ * @param {Awaited<ReturnType<typeof fetchConfigStatus>>} status
+ */
+function showBannerForConfigStatus(status) {
+  switch (status.route) {
+    case "loaded":
+      // 正常起動。通知なし。
+      break;
+    case "missing":
+      showInfoBanner(
+        "hakutaku.yaml が見つからないため、組み込み既定値で起動しました。",
+      );
+      break;
+    case "invalid":
+      showWarningBanner(
+        "hakutaku.yaml の内容が不正なため、安全モードで起動しました。組み込みの" +
+          "既定値を使用しており、設定由来のデータソースとログ解析プロファイルは" +
+          "無効化されています。アドホックなファイル選択は引き続き利用できます。",
+        status.errors.map(formatConfigError),
+      );
+      break;
+    default:
+      console.warn("未知の起動経路です:", status.route);
+  }
+}
+
+/**
+ * 起動処理。設定状態を取得してバナーを表示し、そこから読み取った保持上限で
+ * ログ表示ビューを初期化する。
+ *
+ * `get_config_status` 自体の失敗は想定外だが、フロントエンドの初期化全体を
+ * 止めないよう、コンソールへ記録したうえでフォールバック値を使って続行する
+ * （画面はブロックしない）。
+ */
+async function bootstrap() {
+  let status = null;
+  try {
+    status = await fetchConfigStatus();
+  } catch (error) {
+    console.error("設定状態の取得に失敗しました:", error);
+  }
+
+  if (status) {
+    showBannerForConfigStatus(status);
+  }
+
+  const retentionLimits = status
+    ? {
+        maxRows: status.frontend_retention.max_rows,
+        maxBytes: status.frontend_retention.max_bytes,
+      }
+    : FALLBACK_RETENTION_LIMITS;
+
+  // CFG-016（安全モード）では ConfigState::config が組み込み既定値になり
+  // data_source_names も空になるため、事前定義パスの一覧には現れない
+  // （設定由来のデータソースを無効化する要件どおり）。get_config_status 自体が
+  // 取得できなかった異常系（status が null）でも、アドホックな選択は
+  // 引き続き利用できるよう空配列で起動する（CFG-015／CFG-017）。
+  initShell({
+    retentionLimits,
+    dataSourceNames: status ? status.data_source_names : [],
+  });
+
+  // P04-3: 計測モード（開発・検証専用）が有効な場合だけ、計測
+  // スクリプトを自動実行する。通常起動では get_measurement_mode が
+  // active: false を返し、以降は何も行わない。計測の失敗で通常の起動処理を
+  // 止めないよう、ここでも例外を握りつぶしてコンソールへ記録するだけにする。
+  let measurementMode = { active: false };
+  try {
+    measurementMode = await fetchMeasurementMode();
+  } catch (error) {
+    console.error("計測モードの確認に失敗しました:", error);
+  }
+  if (measurementMode.active) {
+    runMeasurement(retentionLimits).catch((error) => {
+      console.error("計測モードの実行に失敗しました:", error);
+    });
+  }
+}
+
+bootstrap();

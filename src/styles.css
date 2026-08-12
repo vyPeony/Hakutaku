@@ -1,0 +1,772 @@
+:root {
+  color: #222;
+  background: #fff;
+  font-family: "Yu Gothic UI", "Meiryo", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/*
+ * body を縦方向の flex コンテナにし、#config-banners（body 先頭に動的挿入
+ * される起動時通知。P03-2・P04-2）・.app（共通シェル本体）・
+ * #status-error-area（body 末尾に動的挿入される対象を開く操作のエラー領域。
+ * P07-1）を縦に積む。バナーやエラー領域が表示されている間も、
+ * ページ全体がビューポートの高さ（100%）に収まるようにする（.app 側で
+ * height: 100vh のような固定値を使うと、他の兄弟要素の分だけ全体高さが
+ * ビューポートを超え、二重スクロールや操作領域のはみ出しを起こすため、
+ * .app は flex: 1 1 auto で残り高さに合わせて伸縮させる）。
+ */
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * 共通シェル本体（P07-1）。左に参照対象一覧、右にタブ＋ビュー領域
+ * を横並びに配置する（.app-body）。banner・状態エラー領域の有無に関わらず
+ * 残りの高さいっぱいに広がる（flex: 1 1 auto）。画面解像度 1920×1080 を
+ * 基準に、スクロールやダイアログの画面外配置なしに操作できることを狙う
+ * （ENV-005）。
+ */
+.app {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.app-body {
+  display: flex;
+  flex-direction: row;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/*
+ * 左ペイン: 参照対象一覧（CFG-003／PROD-006 の事前定義パスと、アドホックに
+ * 開いた対象を同じ一覧に表示する）。幅は固定し、一覧部分だけが縦スクロール
+ * する（ヘッダーの「ファイルを開く」ボタンは常に見える位置に固定する）。
+ */
+.target-pane {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  width: 280px;
+  min-height: 0;
+  border-right: 1px solid #ddd;
+  background: #fafafa;
+}
+
+.target-pane__header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  flex: none;
+  border-bottom: 1px solid #ddd;
+}
+
+.target-pane__heading {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.target-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.target-row {
+  border-bottom: 1px solid #e6e6e6;
+}
+
+.target-row__main {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.target-row--ready .target-row__main:hover,
+.target-row--not_opened .target-row__main:hover {
+  background: #eef4ff;
+}
+
+.target-row__name {
+  font-weight: bold;
+  word-break: break-all;
+}
+
+.target-row__origin {
+  font-size: 0.75rem;
+  color: #888;
+}
+
+.target-row__status {
+  font-size: 0.8rem;
+}
+
+.target-row__status--not_opened {
+  color: #888;
+}
+
+.target-row__status--loading {
+  color: #1a3d7c;
+}
+
+.target-row__status--ready {
+  color: #1b7a1b;
+}
+
+.target-row__status--error {
+  color: #c0341f;
+  font-weight: bold;
+}
+
+.target-row__status--cancelled_partial {
+  color: #a15c00;
+  font-weight: bold;
+}
+
+.target-row__status--changed {
+  color: #a15c00;
+  font-weight: bold;
+}
+
+.target-row__retry {
+  margin: 0 12px 8px;
+}
+
+/*
+ * 明示的な再読み込み（LOG-028、ADR-0007）。Ready 状態の行に常設する（既存の
+ * 行内ボタン群と同じ控えめな見た目にし、常設化で行の視覚的ノイズを増やさない。
+ * src/shell.js の handleReloadTargetClick の doc コメント参照）。
+ */
+.target-row__reload {
+  margin: 0 12px 8px;
+}
+
+/*
+ * アクセス拒否時の「管理者として新しいウィンドウで開く」ボタン
+ * （PRIV-002〜004、P11-2）。誤用防止のため、アクセス拒否時だけ表示する
+ * （src/shell.js の buildTargetRowElement 参照）。
+ */
+.target-row__elevate {
+  margin: 0 12px 8px;
+}
+
+/*
+ * 読み込み中のキャンセルボタン（P07-2）。読み込み中の行にだけ
+ * 表示する。
+ */
+.target-row__cancel {
+  margin: 0 12px 8px;
+}
+
+.target-row__error-reason {
+  margin: 0 12px 8px;
+  font-size: 0.75rem;
+  color: #7a1212;
+  word-break: break-all;
+}
+
+/*
+ * LOG-022 の「選んで再解析」操作（P07-2）。生表示へ
+ * 退避した対象（ready／cancelled_partial かつ fell_back_to_raw_display）に
+ * だけ表示する。常設の行内 UI（モーダルにしない、という裁定）。
+ * プロファイルと日時書式の2つのセレクトが並ぶため、左ペインの幅では折り返す
+ * ことを前提に flex-wrap を効かせている。
+ */
+.target-row__reparse {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 12px 8px;
+}
+
+.target-row__reparse-label {
+  font-size: 0.75rem;
+  color: #1a3d7c;
+}
+
+/*
+ * 各セレクトに付く可視ラベル。セレクトが2つ並ぶため、どちらが
+ * 何の選択かを見た目で区別できるようにする。
+ */
+.target-row__reparse-field-label {
+  font-size: 0.75rem;
+  color: #1a3d7c;
+}
+
+.target-row__reparse-select {
+  font-size: 0.75rem;
+}
+
+/*
+ * 右側: 開いているビューのタブ（上部）とビュー領域（中央）を縦積みする。
+ */
+.app-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/*
+ * 時系列統合の ON/OFF トグル（P09-1、LOG-007〜LOG-008）。
+ * タブバーの直前に固定表示する。
+ */
+.view-toolbar {
+  display: flex;
+  align-items: center;
+  padding: 4px 4px 0;
+  flex: none;
+}
+
+.merged-view-toggle[aria-pressed="true"] {
+  background: #dbe9ff;
+  border-color: #7aa7e8;
+  font-weight: bold;
+}
+
+/*
+ * 開いているビューのタブ（LOG-015。統合表示 OFF 時のファイル別タブ。
+ * 分割表示は作らない）。タブ数が多い場合は横スクロールする。
+ */
+.tab-bar {
+  display: flex;
+  flex: none;
+  gap: 2px;
+  padding: 4px 4px 0;
+  overflow-x: auto;
+  border-bottom: 1px solid #ddd;
+  background: #f0f0f0;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid #ddd;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  background: #e4e4e4;
+  cursor: pointer;
+  flex: none;
+  max-width: 260px;
+}
+
+.tab--active {
+  background: #fff;
+  font-weight: bold;
+}
+
+.tab__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab__close {
+  flex: none;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  line-height: 1;
+  color: inherit;
+}
+
+.tab__close:hover {
+  opacity: 0.7;
+}
+
+/*
+ * 統合表示 ON 時に表示する単一の疑似タブ（P09-1、LOG-015: 分割表示を作らない
+ * ため、常に1つだけ表示する）。閉じるボタンを持たない（トグルで OFF にする）。
+ */
+.tab--merged {
+  cursor: default;
+}
+
+/*
+ * ビュー領域 = 形式別ビューアの差し込み口（src/log_view.js のモジュール doc
+ * コメント参照）。現時点ではテキストログビューア（.log-toolbar +
+ * .log-viewport）が唯一の実装。
+ */
+.view-area {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #ddd;
+  flex: none;
+}
+
+.log-toolbar__label {
+  font-weight: bold;
+}
+
+.log-toolbar__count {
+  color: #666;
+}
+
+/*
+ * コピー列の選択（P10、COPY-001）。行選択（どの行を）とは独立に
+ * 「どの列を」コピーするかを選ぶ常設のツールバー UI（右クリックメニューでは
+ * なくツールバー方式を採用。src/index.html のコメント参照）。
+ */
+.log-toolbar__copy-columns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-toolbar__copy-columns-label {
+  font-size: 0.8rem;
+  color: #555;
+}
+
+.log-toolbar__copy-columns-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.8rem;
+  color: #333;
+  cursor: pointer;
+}
+
+/*
+ * 行番号でジャンプ（P08-2）。ツールバーの右端へ寄せる。
+ */
+.log-toolbar__jump {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.log-toolbar__jump-label {
+  font-size: 0.8rem;
+  color: #555;
+}
+
+.log-toolbar__jump-input {
+  width: 8ch;
+}
+
+/*
+ * 仮想スクロールのビューポート（PERF-012）。#log-viewport 自体が
+ * 縦横のスクロールを担う。横方向のスクロールは行を折り返さない設計
+ * （white-space: pre、下記 .log-row__text）で行高を一定に保つための代償として
+ * 発生する（仕様どおり）。
+ */
+.log-viewport {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* 全体の高さを total_items × 行高 で表現するスペーサ（実データは持たない）。 */
+.log-spacer {
+  width: 1px;
+}
+
+/*
+ * 実際に描画される行の並び。可視範囲＋前後バッファの行だけを持ち、内容は
+ * スクロールのたびに src/log_view.js が作り直す。width: max-content により
+ * 最長行の分だけ横スクロールできるようにする。
+ *
+ * P10: クリック・Shift+クリックによる行選択モデルへ置き換えた
+ * ため、ブラウザ既定のドラッグでの自由なテキスト選択（P04-4 の最小コピー）は
+ * 無効化する（user-select: none）。選択の可視化は行単位のハイライト
+ * （.log-row--selected）で行い、コピー内容は src/log_view.js が
+ * copy_selection コマンド経由で組み立てる（COPY-001 / COPY-002）。
+ */
+.log-rows {
+  display: flex;
+  flex-direction: column;
+  width: max-content;
+  min-width: 100%;
+  user-select: none;
+}
+
+/*
+ * 1行の表示。固定行高（src/log_view.js の ROW_HEIGHT_PX と必ず一致させる。
+ * ビルド工程が無いため値の同期は手動）。white-space: pre で折り返さず、行高を
+ * 一定に保つ（仕様どおり）。日本語が文字化けしないよう、既定のフォント
+ * スタック（:root）に加え、行内の等幅整列用に Consolas を優先させる
+ * （.config-banner__errors li と同じ考え方のフォントスタック）。
+ */
+.log-row {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  line-height: 22px;
+  overflow: hidden;
+  white-space: pre;
+  font-family: "Consolas", "Yu Gothic UI", "Meiryo", monospace;
+  font-size: 0.85rem;
+}
+
+.log-row__lineno {
+  flex: none;
+  min-width: 6ch;
+  text-align: right;
+  color: #888;
+}
+
+/*
+ * 日時列（LOG-024）。解析結果（原文からの派生値）であることが見た目で
+ * 分かるよう、本文列とは異なる色に加えて斜体にする（本文列は原文そのもの、
+ * 変更しない）。
+ */
+.log-row__timestamp {
+  flex: none;
+  min-width: 24ch;
+  color: #555;
+  font-style: italic;
+}
+
+/*
+ * 読み込み元ラベル列（P09-1、LOG-007）。統合表示（時系列統合）
+ * ONのときだけ表示する（src/log_view.js の state.isMerged）。個別ファイルの
+ * タブでは全行が同じファイルのため表示しない。
+ */
+.log-row__source {
+  flex: none;
+  min-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #444;
+}
+
+.log-row__text {
+  flex: none;
+}
+
+/*
+ * raw_display=true の行（LOG-022 の日時未解析データ）。日時列を空にする
+ * ことに加え、行全体の見た目もわずかに変えることで、生データであることが
+ * 一覧上でも分かるようにする（P08-2、作業項目3）。
+ */
+.log-row--raw {
+  background: #f7f5ef;
+}
+
+.log-row--raw .log-row__text {
+  font-style: italic;
+}
+
+/*
+ * 未確定行（LOG-026）。書き込み途中の可能性がある末尾の行。解析エラー
+ * （.config-banner--error 等の赤系、.target-row__status--error）や警告
+ * （.config-banner--warning 等の橙系）とは明確に異なる、中立的な見た目にする
+ * （P08-2、作業項目5）。
+ */
+.log-row--unconfirmed {
+  background: #f3f3f6;
+}
+
+/*
+ * 選択中の行（P10、COPY-001）。.log-row--raw／--unconfirmed と
+ * 同じ詳細度（単一クラス）のため、CSS 上はソース順で決まる。この規則を
+ * それらより後方に置くことで、選択ハイライトが常に優先して見えるようにする。
+ */
+.log-row--selected {
+  background: #cfe3ff;
+}
+
+/*
+ * 行内バッジの共通スタイル（未確定バッジ・継続行バッジ、P08-2）。
+ */
+.log-row__badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 16px;
+  padding: 0 5px;
+  margin-right: 2px;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 0.7rem;
+  font-style: normal;
+  line-height: 14px;
+}
+
+/* 未確定バッジ: 中立的な灰系（エラーの赤・警告の橙のいずれとも異なる）。 */
+.log-row__badge--unconfirmed {
+  background: #e2e2ea;
+  color: #44445a;
+  border: 1px solid #c9c9d6;
+}
+
+/* 継続行バッジ（LOG-014）: クリックで詳細パネルを開くことが分かる配色。 */
+.log-row__badge--continuation {
+  background: #e8f1ff;
+  color: #1a3d7c;
+  border: 1px solid #b7d0f5;
+  cursor: pointer;
+}
+
+.log-row__badge--continuation:hover {
+  background: #d9e8ff;
+}
+
+/*
+ * 継続行の詳細パネル（P08-2、LOG-014）。#log-viewport の下に固定領域として
+ * 置く（.view-area は縦の flex コンテナ。パネルは flex: none で必要な高さ
+ * だけを取り、#log-viewport 側の高さを圧迫しすぎないよう最大高さを制限する）。
+ */
+.log-detail-panel {
+  flex: none;
+  max-height: 35vh;
+  display: flex;
+  flex-direction: column;
+  border-top: 2px solid #1a3d7c;
+  background: #fbfbfd;
+}
+
+.log-detail-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  flex: none;
+  border-bottom: 1px solid #ddd;
+  background: #eef4ff;
+}
+
+.log-detail-panel__title {
+  font-size: 0.85rem;
+  font-weight: bold;
+  color: #1a3d7c;
+}
+
+.log-detail-panel__close {
+  flex: none;
+  border: none;
+  background: transparent;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  color: inherit;
+}
+
+.log-detail-panel__close:hover {
+  opacity: 0.7;
+}
+
+/* 改行を保ったまま全文を表示する（LOG-014）。長い行は折り返す
+ * （行一覧の .log-row とは異なり、詳細パネルは横スクロールより折り返しを
+ * 優先する）。 */
+.log-detail-panel__body {
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: "Consolas", "Yu Gothic UI", "Meiryo", monospace;
+  font-size: 0.85rem;
+}
+
+/*
+ * 通知バナー（CFG-015 / CFG-016、P03-2。P04-2 で
+ * ログ操作のエラー通知にも拡張）。src/banner.js のヘルパーが、src/main.js
+ * （起動時の設定状態）・src/log_view.js（ログ操作のエラー）から呼び出されて
+ * #config-banners（body 先頭）へ動的に挿入する。操作をブロックしないよう、
+ * 通常のフローに載る要素として表示する（モーダル・オーバーレイにはしない）。
+ */
+#config-banners {
+  display: flex;
+  flex-direction: column;
+  /* body（flex column）内で常に内容分の高さだけを取り、.app 側へ残りの高さを
+   * 譲る（複数バナーが重なって表示された場合に .app を圧迫しすぎないよう、
+   * 必要ならこのコンテナ自身がスクロールする方が .app のログ表示より優先度が
+   * 低いため、伸縮させない）。 */
+  flex: none;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.config-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  font-size: 0.85rem;
+  text-align: left;
+  line-height: 1.5;
+}
+
+.config-banner--info {
+  background: #e8f1ff;
+  color: #1a3d7c;
+  border-bottom: 1px solid #b7d0f5;
+}
+
+/* 安全モード（CFG-016）: 明確な警告色にする。 */
+.config-banner--warning {
+  background: #fff2e0;
+  color: #7a3e00;
+  border-bottom: 3px solid #d97a00;
+}
+
+/*
+ * ログ操作のエラー通知（open_log_file の failed、範囲取得の失敗など。
+ * P04-2）。安全モードの警告（オレンジ系）とは区別できる、より
+ * 明確な赤系の色にする。
+ */
+.config-banner--error {
+  background: #fdeaea;
+  color: #7a1212;
+  border-bottom: 3px solid #c0341f;
+}
+
+.config-banner__text {
+  flex: 1;
+}
+
+.config-banner__heading {
+  margin: 0 0 8px;
+  font-weight: bold;
+}
+
+.config-banner__errors {
+  margin: 0;
+  padding-left: 20px;
+  list-style: disc;
+}
+
+.config-banner__errors li {
+  margin: 4px 0;
+  font-family: "Consolas", "Yu Gothic UI", monospace;
+  word-break: break-all;
+}
+
+.config-banner__close {
+  flex: none;
+  border: none;
+  background: transparent;
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: 0 0 0 8px;
+  cursor: pointer;
+  color: inherit;
+}
+
+.config-banner__close:hover {
+  opacity: 0.7;
+}
+
+/*
+ * 下部の状態・エラー表示領域（ERR-002、P07-1）。src/error_panel.js
+ * のヘルパーが body 末尾へ動的に挿入する。#config-banners（画面上部、起動時の
+ * 非致命的通知）とは意図的に別領域にしている。body（flex column）内で
+ * 内容分の高さだけを取り、.app 側へ残りの高さを譲る（#config-banners と
+ * 同じ考え方）。
+ */
+#status-error-area {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  max-height: 35vh;
+  overflow-y: auto;
+}
+
+.status-error-panel {
+  padding: 10px 16px;
+  font-size: 0.85rem;
+  text-align: left;
+  line-height: 1.5;
+  background: #fdeaea;
+  color: #7a1212;
+  border-bottom: 3px solid #c0341f;
+}
+
+/* LOG-022 の生表示への退避通知（エラーではない、非致命的な案内）。 */
+.status-error-panel--info {
+  background: #e8f1ff;
+  color: #1a3d7c;
+  border-bottom: 1px solid #b7d0f5;
+}
+
+.status-error-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.status-error-panel__heading {
+  margin: 0;
+  font-weight: bold;
+  word-break: break-all;
+}
+
+.status-error-panel__text {
+  margin: 8px 0 0;
+}
+
+.status-error-panel__close {
+  flex: none;
+  border: none;
+  background: transparent;
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: 0 0 0 8px;
+  cursor: pointer;
+  color: inherit;
+}
+
+.status-error-panel__close:hover {
+  opacity: 0.7;
+}
+
+/*
+ * ERR-002 の5要素（対象・発生位置・理由・継続可否・次操作）を定義リストで
+ * 表示する。フルパスを含み得るため word-break で折り返す（マスキングしない。
+ * DIAG-004）。
+ */
+.status-error-panel__fields {
+  margin: 8px 0 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+}
+
+.status-error-panel__term {
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+.status-error-panel__description {
+  margin: 0;
+  word-break: break-all;
+  font-family: "Consolas", "Yu Gothic UI", monospace;
+}

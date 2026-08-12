@@ -1,0 +1,18 @@
+[package]
+name = "hakutaku-format-detection"
+version = "0.1.0"
+description = "Hakutaku の形式判定境界"
+authors = ["Hakutaku contributors"]
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+
+# 文字コード判定（ENC-005 の4段階のうち環境 ANSI コードページ）とデコード
+# （任意の Windows コードページ）は Win32 API を直接使う（P05-3）。
+# src-tauri/Cargo.toml・crates/memory-accounting/Cargo.toml と同じバージョン
+# 系列。必要な feature だけを列挙する。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Globalization",
+] }

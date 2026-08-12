@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: セキュリティ上の問題
+    url: https://github.com/vyPeony/Hakutaku/security/policy
+    about: 詳細を公開 Issue に書かず、セキュリティポリシーの非公開報告手順を確認してください。
