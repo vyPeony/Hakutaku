@@ -428,6 +428,48 @@ FodyWeavers.xsd
 *.msm
 *.msp
 
+# 認証情報・秘密鍵・個人情報の混入防止（公開リポジトリのため既定で除外する）。
+# 意図して追跡したいファイルがある場合だけ、`git add -f` ではなく
+# ここに `!` の例外行を追加して理由を残す。
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p8
+*.p12
+*.p7b
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+*.ppk
+*.kdbx
+id_rsa
+id_rsa.*
+id_dsa
+id_dsa.*
+id_ecdsa
+id_ecdsa.*
+id_ed25519
+id_ed25519.*
+*.asc
+*.gpg
+.netrc
+_netrc
+.npmrc
+.pypirc
+credentials
+credentials.json
+secrets.json
+service-account*.json
+*.secret
+*secrets.toml
+.aws/
+.ssh/
+
 # Claude Code の個人設定とローカル状態（共有設定 .claude/settings.json は追跡する）
 .claude/settings.local.json
 .claude/*.local.json
