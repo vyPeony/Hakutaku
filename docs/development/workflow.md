@@ -191,6 +191,16 @@ Rust、Tauri、またはビルド構成を変更した場合は、リポジト�
 | Rust コードの整形確認 | `cargo fmt --all -- --check` |
 | Tauri アプリの release ビルド（インストーラー生成なし） | `npm run tauri -- build --no-bundle` |
 
+Rust 以外の資産を変更した場合は、次も実行します。cargo と Tauri のビルドはこれらの
+中身を検証しないため、破損しても上表のコマンドでは検出できません。いずれも外部依存を
+導入せず、Node と PowerShell Core の標準機能だけで動作します。
+
+| 目的 | 標準コマンド |
+| --- | --- |
+| `src/` の構文、相対 import の解決、`index.html` の参照先 | `node scripts/check-frontend.mjs` |
+| Markdown の相対リンクと見出しアンカーの整合（外部 URL は対象外） | `node scripts/check-docs-links.mjs` |
+| PowerShell スクリプトの構文解析（実行はしない） | `pwsh -File scripts/check-powershell.ps1` |
+
 `--locked` を付けた検査では、意図しない `Cargo.lock` の更新を許可しません。`--no-bundle` はアプリ本体の release ビルドを検証し、正式な配布物は生成しません。これらの検査は CI（[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)）でも push と PR ごとに自動実行されます。ブランチ保護による必須化は P13 の完了後に扱います。
 
 技術スタックの最終確定後に、上記の標準コマンドを必要に応じて見直し、次をこの文書または専用の採用済み（`Accepted`）文書へ追加します。

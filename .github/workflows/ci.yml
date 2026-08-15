@@ -8,9 +8,32 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+env:
+  # CI ではデバッガーを接続しないため、dev / test プロファイルの完全なデバッグ情報を
+  # 生成しない。Windows では PDB の生成とリンクが debug ビルドの主要な負荷になる。
+  # `line-tables-only` は行番号表を残すので、テスト失敗時のバックトレースの行番号は
+  # 保てる。release プロファイルは製品ビルドの検証対象そのものなので変更しない。
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 jobs:
-  check:
-    runs-on: windows-latest
+  # ビルド入力に変更があるときだけ、重い Windows ジョブを実行する。
+  #
+  # 段階0の標準検査は `cargo fmt` / `clippy` / `build` / `test` と Tauri の release
+  # ビルドだけであり、その入力は下の「ビルド入力」に挙げたパスに限られる。文書、
+  # タスク記録、スクリプトを変えても、これらのコマンドの結果は変わらない。
+  #
+  # 判定の対象は Windows の2ジョブだけで、非 Rust の検査（quality ジョブ）は
+  # 常に実行する。数十秒で終わるうえ、省略するとそれらの変更が無検査になる。
+  #
+  # ワークフロー全体の `paths-ignore` を使わないのは、それだとワークフロー自体が
+  # 起動せず、P13 でブランチ保護の必須チェックにしたときに、必須チェックが未報告の
+  # まま PR が進めなくなるため。ジョブ単位で切り分け、最後の `ci` ジョブが常に結果を
+  # 返すことで、必須チェックにしても文書だけの変更が滞らないようにする。
+  changes:
+    name: 変更範囲の判定
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
     steps:
       # 供給網対策として、アクションはタグではなくコミット SHA で固定する。
       # 行末コメントは固定した版を示す。更新時は、上げたい版の SHA を取り直して差し替える。
@@ -18,18 +41,169 @@ jobs:
         with:
           # ビルド中に GITHUB_TOKEN を .git/config へ残さない
           persist-credentials: false
+          # 差分の基点コミットを参照するため履歴全体を取得する
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+            head="$HEAD_SHA"
+          fi
+
+          # 基点を特定できない場合（新規ブランチ、強制送信、履歴の欠落）は、
+          # 判定を諦めて検査を実行する。判定不能時は必ず安全側へ倒す。
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "基点コミットを特定できないため、検査を実行します。"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `core.quotepath=false` を指定しないと、日本語などの非 ASCII を含むパスが
+          # `"docs/\346..."` のようにエスケープされ、パスの判定に一致しなくなる。
+          changed="$(git -c core.quotepath=false diff --name-only "$base" "$head")"
+          echo "変更ファイル:"
+          printf '%s\n' "$changed" | sed 's/^/  /'
+
+          # 分岐は上から順に一致したものが採用される。ビルド入力を先に判定するため、
+          # 例えば `.github/workflows/ci.yml` は後段の `.github/*` ではなく
+          # ビルド入力として扱われる。
+          run=false
+          while IFS= read -r file; do
+            case "$file" in
+              # --- ビルド入力: 検査結果を変え得るもの ---
+              # Rust ソース、build.rs、Tauri 設定、capabilities、アイコン、マニフェスト
+              crates/*|src-tauri/*) run=true ;;
+              # release ビルドへ埋め込むフロントエンド資産（Tauri.toml の frontendDist）
+              src/*) run=true ;;
+              # 依存とビルド構成（対象トリプル、_CL_ のヘッダー境界）
+              Cargo.toml|Cargo.lock|.cargo/*|rust-toolchain.toml) run=true ;;
+              # Tauri CLI の版
+              package.json|package-lock.json) run=true ;;
+              # 検査手順そのもの
+              .github/workflows/*) run=true ;;
+              # 改行コードの正規化は `cargo fmt --check` の結果に影響し得る
+              .gitattributes) run=true ;;
+
+              # --- 検査結果に影響しないもの ---
+              docs/*|tasks/*|scripts/*|.claude/*|.github/*) ;;
+              *.md|LICENSE|.gitignore|.editorconfig) ;;
+
+              # --- 未分類は安全側で実行する ---
+              # 新しいビルド入力を追加したときに検査が飛ばされることを防ぐ。
+              # 該当した場合は、上のどちらかへ分類を追加する。
+              *)
+                echo "分類のないパスのため、検査を実行します: $file"
+                run=true
+                ;;
+            esac
+            if [ "$run" = "true" ]; then
+              break
+            fi
+          done <<< "$changed"
+
+          if [ "$run" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ビルド入力の変更がないため、ビルドと検査を省略します。"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # 段階0の標準検査（docs/development/workflow.md）を、成果物を共有できる単位で
+  # 2つのジョブへ分けて並列に実行する。debug プロファイルの検査（このジョブ）と
+  # release ビルド（build ジョブ）は target ディレクトリを共有しないため、直列に
+  # 実行しても再利用できるものがなく、待ち時間だけが積み上がっていた。
+  lint-test:
+    name: 静的解析とテスト（debug）
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # SHA 固定時は参照名からツールチェーンを推定できないため、toolchain を明示する
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
+      # rust-cache のキーはジョブごとに分かれるため、build ジョブの release 成果物と
+      # 混ざらない。分割によって1つあたりのキャッシュが小さくなり、復元と保存も速い。
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+
+  build:
+    name: release ビルド（インストーラー生成なし）
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # このジョブは clippy と rustfmt を使わないため、コンポーネントを追加しない
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      # Node は Tauri CLI の実行だけに必要で、フロントエンドのビルド工程はない
+      # （Tauri.toml の frontendDist は src/ の静的ファイルを直接指す）。
+      # そのため lint-test ジョブでは Node を用意しない。
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: npm ci
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
-      - run: cargo build --workspace --locked
-      - run: cargo test --workspace --locked
       - run: npm run tauri -- build --no-bundle
+
+  # Rust 以外の資産の検査。cargo と Tauri のビルドはこれらを検証しないため、
+  # 文書リンク、フロントエンド資産、PowerShell スクリプトの破損は CI をすり抜けて
+  # いた。いずれも外部依存を導入せず、Node と PowerShell Core の標準機能だけで
+  # 実行する（`npm ci` も不要）。Windows を必要としないため ubuntu で実行する。
+  quality:
+    name: 非 Rust の検査
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # ランナー既定の Node 版に依存しないよう、build ジョブと同じ版を明示する
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      # 構文、相対 import の解決、index.html の参照先を検査する
+      - run: node scripts/check-frontend.mjs
+      # Markdown の相対リンクと見出しアンカーの整合を検査する（外部 URL は対象外）
+      - run: node scripts/check-docs-links.mjs
+      # 解析のみで、スクリプトは実行しない
+      - run: ./scripts/check-powershell.ps1
+        shell: pwsh
+
+  # 常に実行し、常に結果を返す集約ジョブ。ブランチ保護の必須チェックには、個別の
+  # ジョブではなくこのジョブを指定する。省略（skipped）は失敗として扱わない。
+  ci:
+    name: CI 完了判定
+    needs: [changes, lint-test, build, quality]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          set -euo pipefail
+          if [ "$FAILED" = "true" ]; then
+            echo "先行ジョブが失敗または中止されました。"
+            exit 1
+          fi
+          echo "CI は成功、または実行対象がありませんでした。"
