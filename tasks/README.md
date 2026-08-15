@@ -12,13 +12,13 @@
 **この計画に書かれた要件を、採用済み（`Accepted`）の仕様として扱わないでください。** 理由は次の二点です。
 
 1. 入力資料の版 1.10 は「レビュー反映済み・未決事項なし」と記載されていますが、**リポジトリの外にある文書**です。[`AGENTS.md`](../AGENTS.md) は「チャット履歴、エージェントの記憶、引き継ぎ文だけを現在状態の証拠にしません」と定め、正本はリポジトリ側の文書と Issue / PR に置いています。
-2. リポジトリ側の [`docs/product/scope.md`](../docs/product/scope.md)、[`docs/requirements/functional.md`](../docs/requirements/functional.md)、[`docs/architecture/overview.md`](../docs/architecture/overview.md)、[`docs/security/data-handling.md`](../docs/security/data-handling.md)、[`docs/roadmap.md`](../docs/roadmap.md) は**すべて草案（Draft）**であり、技術選定、対象範囲、診断ログの方針などに版 1.10 との実質的な差があります。[`docs/README.md`](../docs/README.md) は「草案（`Draft`）の文は現在の作業仮説です。明示的なレビューまたは ADR なしに、確定仕様として扱わないでください」と定めています。
+2. リポジトリ側の [`docs/product/scope.md`](../docs/product/scope.md)、[`docs/requirements/functional.md`](../docs/requirements/functional.md)、[`docs/architecture/overview.md`](../docs/architecture/overview.md)、[`docs/security/data-handling.md`](../docs/security/data-handling.md)、[`docs/roadmap.md`](../docs/roadmap.md) は、この計画を策定した時点では**すべて草案（Draft）**であり、技術選定、対象範囲、診断ログの方針などに版 1.10 との実質的な差がありました。[`docs/README.md`](../docs/README.md) は「草案（`Draft`）の文は現在の作業仮説です。明示的なレビューまたは ADR なしに、確定仕様として扱わないでください」と定めています。現在は、対象文書をすべて版 1.10 と整合させ、採用済み（`Accepted`）にしています（詳細は下記「実装着手前の前提」）。
 
-したがって、**実装に着手する前に「版 1.10 の内容をリポジトリ正本へ取り込み、採用済みにする」作業が必要です**。これを P00 の開始条件としています（下記「実装着手前の前提」）。
+この「版 1.10 の内容をリポジトリ正本へ取り込み、採用済みにする」作業は P00 の開始条件であり、実施済みです（下記「実装着手前の前提」）。
 
 | 種類 | 正本 |
 | --- | --- |
-| 要件・対象範囲・アーキテクチャ | [`docs/`](../docs/README.md) 配下の各文書（現在すべて草案） |
+| 要件・対象範囲・アーキテクチャ | [`docs/`](../docs/README.md) 配下の各文書（現在すべて採用済み） |
 | 設計判断 | [`docs/architecture/decisions/`](../docs/architecture/decisions/README.md) |
 | タスクの目的、受け入れ条件、担当者、進捗、現在状態 | GitHub Issue / PR |
 | 差分と検証結果 | 下書き PR / PR |
@@ -44,11 +44,11 @@
 
 ## 実装着手前の前提
 
-P00 に着手する前に、次を満たす必要があります。この計画では扱いません。
+次の前提は、P00 の着手前に満たしました（達成済み）。この計画では扱わず、詳細と根拠は [`docs/roadmap.md`](../docs/roadmap.md) の「実装着手前の前提（達成済み）」節を正本とします。
 
-1. **版 1.10 の内容をリポジトリ正本へ取り込む。** `docs/product/scope.md`、`docs/requirements/functional.md`、`docs/requirements/quality.md`、`docs/architecture/overview.md`、`docs/security/data-handling.md`、`docs/roadmap.md` を版 1.10 と整合させ、レビューを経て採用済み（`Accepted`）にします
-2. **技術選定を ADR へ記録する。** 版 1.10 の `DEC-002`（Rust＋Tauri の暫定採用）に対応する ADR を作成します。状態は暫定決定であり、確定は P13 の完了時です（`VER-001`）
-3. **着手可能（`Ready`）な Issue を用意する。** [`docs/development/workflow.md`](../docs/development/workflow.md) は、大きな機能や複数領域にまたがる変更を実装前に Issue 上で合意することを求めています
+1. **版 1.10 の内容をリポジトリ正本へ取り込んだ。** `docs/product/scope.md`、`docs/requirements/functional.md`、`docs/requirements/quality.md`、`docs/architecture/overview.md`、`docs/security/data-handling.md`、`docs/roadmap.md` を版 1.10 と整合させ、レビューを経て採用済み（`Accepted`）にしました
+2. **技術選定を ADR へ記録した。** 版 1.10 の `DEC-002`（Rust＋Tauri の暫定採用）に対応する [ADR-0001](../docs/architecture/decisions/0001-rust-tauri-provisional-adoption.md) を作成しました。状態は暫定決定であり、確定は P13 の完了時です（`VER-001`）
+3. **着手可能（`Ready`）な Issue を用意した。** [`docs/development/workflow.md`](../docs/development/workflow.md) が求める、大きな機能や複数領域にまたがる変更の実装前 Issue 合意を満たしました
 
 ## 分割の考え方
 

@@ -20,12 +20,12 @@ Hakutaku は、ログ、データベース、Web API、構造化ファイルな�
 
 以下は [プロダクトビジョン](docs/product/vision.md) の要約です。原則の正本は同文書で管理します。
 
-- **読み取り専用（Read-only by design）**: 閲覧対象のデータを変更する機能を持たない
-- **元データへの忠実さ（Source fidelity）**: 元データとその出所を見失わない
-- **安全な取り扱い（Secure handling）**: 認証情報や機密データを表示・保存・ログ出力から守る
-- **部分的な失敗への耐性（Partial failure tolerance）**: 一つの失敗で作業全体を失わない
-- **データ取得元の拡張性（Extensible sources）**: 新しいデータソースを追加しても既存の閲覧体験を壊さない
-- **根拠に基づく技術判断（Technology decisions by evidence）**: 技術選定は要件と ADR に基づいて行う
+- **閲覧対象データを変更しない**: 作成・更新・削除機能を持たず、調査による影響を最小化する
+- **元データへ戻れる**: 表示や正規化の後も、出所と原文を追跡できる
+- **段階的に理解できる**: 概要から詳細、共通属性からデータソース固有の内容へ掘り下げられる
+- **部分失敗を隔離する**: 一つのデータソースの失敗で他のデータや作業状態を失わない
+- **秘密を露出しない**: 認証情報と閲覧データの保存・表示・ログ出力を最小化する
+- **測ってから決める**: 技術や構造は、代表ユースケースと品質要件で検証して選ぶ
 
 ## 現在の状態
 
@@ -124,27 +124,16 @@ Windows の生成物は `target/x86_64-pc-windows-msvc/release/Hakutaku.exe` で
 
 ## ドキュメント
 
-- [ドキュメント一覧](docs/README.md)
+文書の一覧と正本の分担は[ドキュメント一覧](docs/README.md)を参照してください。主要な入口は次のとおりです。
+
 - [プロダクトビジョン](docs/product/vision.md)
 - [プロダクトスコープ](docs/product/scope.md)
-- [用語集](docs/domain/glossary.md)
-- [時間モデル](docs/domain/time-model.md)
-- [機能要件](docs/requirements/functional.md)
-- [品質要件](docs/requirements/quality.md)
-- [アーキテクチャ概要](docs/architecture/overview.md)
-- [コネクター契約](docs/architecture/connector-contract.md)
-- [設計判断（ADR）](docs/architecture/decisions/README.md)
-- [データ取り扱いとセキュリティ](docs/security/data-handling.md)
-- [エラーコード体系](docs/development/error-codes.md)
 - [ロードマップ](docs/roadmap.md)
-- [実装計画（フェーズ一覧）](tasks/README.md)
-- [リリースノート](docs/release-notes/README.md)
 - [手動での動作確認手順](docs/verification/manual-check.md)
-- [段階0検証記録](docs/verification/stage0-results.md)
 
-## コントリビューション
+## 開発運用
 
-作業を始める前に[貢献ガイド](.github/CONTRIBUTING.md)と[開発運用](docs/development/README.md)を確認してください。複数セッションでは専用の worktree とブランチを使い、重要な設計判断は[アーキテクチャ判断記録（ADR）](docs/architecture/decisions/README.md)に記録します。
+Hakutaku は個人開発のリポジトリであり、外部からのコード貢献は受け付けていません（[外部貢献の方針](.github/CONTRIBUTING.md)）。開発は AI エージェントとの並行セッションで行い、規則はルートの [`AGENTS.md`](AGENTS.md) と[開発運用](docs/development/README.md)を正本とします。
 
 ## セキュリティ
 
