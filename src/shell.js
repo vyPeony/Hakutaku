@@ -1,8 +1,10 @@
 // 共通シェル（P07-1／P07-2）。
 //
 // `tasks/phase-07-shell-ui.md` の P07-1 が定める共通画面
-// ——「参照対象一覧」「開いているビューのタブ」「状態・エラー表示領域」——
-// の描画と操作を統括する。DOM 操作と IPC 呼び出し、それらをつなぐ状態管理を
+// ——「参照対象一覧」「開いているビューのタブ」——の描画と操作、および対象を
+// 開く操作のエラー・通知の表示（モーダルダイアログ。P07-1 当時の下部の
+// 状態・エラー表示領域から Issue #9 で置き換えた。src/error_panel.js）を
+// 統括する。DOM 操作と IPC 呼び出し、それらをつなぐ状態管理を
 // 担当し、純粋ロジック（一覧の状態モデル・タブ状態管理）は
 // src/targets.js・src/tabs.js へ切り出している（ADR-0006、AGENTS.md の
 // 指示）。
@@ -325,8 +327,8 @@ async function handleReloadTargetClick(targetId) {
     if (response.kind === "rejected_over_limit" || response.kind === "failed") {
       // rejected_over_limit（上限超過拒否、対象は Ready のまま update_pending
       // が立つ）・failed（LOG-023 の変更検知・LOG-027 の共有違反等、対象は
-      // Error へ遷移）のいずれも ERR-002 の5要素を持つ。下部の状態・エラー
-      // 表示領域へ既存の作法で表示する。
+      // Error へ遷移）のいずれも ERR-002 の5要素を持つ。モーダルダイアログ
+      // （src/error_panel.js）へ既存の作法で表示する。
       showTargetError(/** @type {import("./targets.js").UserFacingErrorDto} */ (response.error));
       await refreshTargets();
       return;
@@ -793,9 +795,9 @@ async function applyLoadAttemptResponse(response) {
     return;
   }
 
-  // failed（対象の登録前に判明した同期的な失敗。ダイアログ操作自体の失敗、
-  // 設定に存在しない名前、フォルダ未対応など）。ERR-002 の5要素をそのまま
-  // 下部の状態・エラー表示領域へ表示する（フルパスをマスキングしない）。
+  // failed（対象の登録前に判明した同期的な失敗。ファイル選択ダイアログ操作
+  // 自体の失敗、設定に存在しない名前、フォルダ未対応など）。ERR-002 の5要素を
+  // そのままモーダルダイアログへ表示する（フルパスをマスキングしない）。
   showTargetError(/** @type {import("./targets.js").UserFacingErrorDto} */ (response.error));
   await refreshTargets();
 }

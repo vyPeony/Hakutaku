@@ -30,10 +30,10 @@ frontendDist = "../src"
 #
 #   label      = "main"
 #   title      = "Hakutaku"
-#   width      = 640
-#   height     = 420
-#   minWidth   = 480
-#   minHeight  = 320
+#   width      = 1024
+#   height     = 768
+#   minWidth   = 800
+#   minHeight  = 600
 #   resizable  = true
 #   fullscreen = false
 #

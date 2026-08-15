@@ -277,8 +277,13 @@ pub fn run() {
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .title("Hakutaku")
-            .inner_size(640.0, 420.0)
-            .min_inner_size(480.0, 320.0)
+            // Issue #9: 800×600 未満では GUI のレイアウトが崩れる（1列に潰れて
+            // 縦書きのように見える）ため、レイアウトが成立する下限として最小
+            // サイズを 800×600 とする。初期サイズ 1024×768 はその上で余裕を
+            // 持たせた値で、どちらも `ENV-005` の基準解像度 1920×1080 に収まる。
+            // 値の正本は Tauri.toml の P01 実装契約コメントと同期させる。
+            .inner_size(1024.0, 768.0)
+            .min_inner_size(800.0, 600.0)
             .resizable(true)
             .data_directory(webview2_data_dir) // DIST-013 / SEC-009。必須。
             .devtools(false) // SEC-011。多重防御（CSP・feature 無効化に加えて明示指定）。
