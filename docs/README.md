@@ -28,7 +28,7 @@
 | 検証 | [手動での動作確認手順](verification/manual-check.md) | サンプルログの生成と、画面・操作を通した動作確認の手順 |
 | 検証 | [段階0検証記録](verification/stage0-results.md) | 段階0検証シナリオの実施結果、不成立・未実施項目の記録 |
 | アーキテクチャ | [概要](architecture/overview.md) | 論理構成、データフロー、信頼境界 |
-| アーキテクチャ | [コネクター契約](architecture/connector-contract.md) | データソース統合境界の契約 |
+| アーキテクチャ | [コネクター契約](architecture/connector-contract.md) | データソース統合境界の契約（将来構想。初期・後続リリースの確定要件では外部プラグイン機構を設けない） |
 | アーキテクチャ | [設計判断](architecture/decisions/README.md) | 重要な設計判断と理由 |
 | セキュリティ | [データの取り扱い](security/data-handling.md) | 認証情報、キャッシュ、ログ、外部通信 |
 | 開発 | [運用の索引](development/README.md) | 人間・AIのリポジトリ運用と正本一覧 |
@@ -43,7 +43,7 @@
 ## 関連する入口
 
 - プロジェクト全体の入口: [`README.md`](../README.md)
-- 貢献者向け入口: [`.github/CONTRIBUTING.md`](../.github/CONTRIBUTING.md)
+- 外部貢献の方針（外部からのコード貢献は受け付けない）: [`.github/CONTRIBUTING.md`](../.github/CONTRIBUTING.md)
 - 脆弱性の報告: [`.github/SECURITY.md`](../.github/SECURITY.md)
 - AI エージェントの自動検出と規則: [`AGENTS.md`](../AGENTS.md)
 - Claude Code の入口（規則は `AGENTS.md` を参照）: [`CLAUDE.md`](../CLAUDE.md)
