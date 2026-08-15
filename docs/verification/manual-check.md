@@ -2,7 +2,7 @@
 
 - 状態: 草案（Draft）
 - 管理責任者: 未定（TBD）
-- 最終更新日: 2026-08-02
+- 最終更新日: 2026-08-15
 
 ## 位置づけ
 
@@ -26,7 +26,25 @@
 
 ## 2. サンプルログの生成
 
-[`scripts/generate-sample-logs.ps1`](../../scripts/generate-sample-logs.ps1) が、本書の各項目に必要なサンプルを決まった名前で一度に生成します。
+[`scripts/start-manual-check.ps1`](../../scripts/start-manual-check.ps1) を使うと、本章のサンプル生成から[3章](#3-アプリの起動と設定ファイルの配置)のアプリ起動までを1コマンドでまとめて済ませられます（実行ファイルが無ければビルドも行います）。
+
+```powershell
+./scripts/start-manual-check.ps1
+```
+
+主な引数は次のとおりです（詳細は同スクリプトのコメントベースヘルプを参照）。
+
+| 引数 | 用途 |
+| --- | --- |
+| `-ConfigMode normal\|invalid\|none` | 実行ファイル直下に配置する `hakutaku.yaml` の状態を選ぶ（既定は `normal`） |
+| `-SkipBuild` | ビルドを省略する |
+| `-NoLaunch` | 準備だけ行い、アプリを起動しない |
+| `-SampleDir <パス>` | サンプル一式の置き場所を変える（既定は `%TEMP%\hakutaku-samples`） |
+| `-LargeLineCount <行数>` | `generate-sample-logs.ps1` の同名引数へそのまま渡す（省略時は既定 300,000）。`0` で `08-large.log` を生成しない |
+| `-RegenerateSamples` | サンプルが既にあっても生成し直す |
+| `-CleanUp` | 後片付けだけを行う（[5章](#5-後片付け)） |
+
+サンプル生成そのものの詳細は次のとおりです。[`scripts/generate-sample-logs.ps1`](../../scripts/generate-sample-logs.ps1) が、本書の各項目に必要なサンプルを決まった名前で一度に生成します。
 
 ```powershell
 ./scripts/generate-sample-logs.ps1
@@ -75,6 +93,8 @@ Copy-Item "$env:TEMP\hakutaku-samples\hakutaku.yaml" target/x86_64-pc-windows-ms
 ```
 
 設定の変更は再起動時に反映されます（`CFG-006`）。確認中は、アプリを終了してからコピーし直してください。
+
+[`scripts/start-manual-check.ps1`](../../scripts/start-manual-check.ps1) を使っている場合は、アプリを終了してから `-ConfigMode invalid -SkipBuild -NoLaunch` のように再実行すると、同じ配置をコマンド1つで行えます（[2章](#2-サンプルログの生成)）。
 
 ## 4. 確認手順
 
@@ -134,6 +154,8 @@ Copy-Item "$env:TEMP\hakutaku-samples\hakutaku.yaml" target/x86_64-pc-windows-ms
 | 9 | この対象を閉じ、`02-dt-004.log` を開き直してから「日時書式」で `LOG-DT-005（YYYY/MM/DD HH:mm:ss）` を選び、「再解析」を押す | 日時列が `2026-07-28T09:00:00`（秒まで）になる。選んだ書式がそのまま使われ、内容からの自動判定へ戻らないことの確認 | `LOG-022` |
 | 10 | `hakutaku.yaml` を戻して開き直す | 手順4の表示（日時列が `2026-07-28T09:00:00.00`）に戻る | `CFG-008` |
 
+手順7の退避は、アプリを終了してから `./scripts/start-manual-check.ps1 -ConfigMode none -SkipBuild -NoLaunch` を実行しても同じ状態を作れます。
+
 手順8・9の「日時書式」は、`log_profiles` の定義とは独立した指定です。**設定ファイルを書かずに開いたファイルでも、UI の操作だけで日時付き表示へ再解析できます。** 手動で選んだ書式は、プロファイルの `datetime_format` 設定より優先されます。
 
 2つのセレクトはどちらか一方だけでも、両方同時でも指定できます。どちらも既定（「指定しない」「自動判定」）のまま「再解析」を押した場合は、結果が変わらないため何も起きません。
@@ -152,6 +174,8 @@ Copy-Item "$env:TEMP\hakutaku-samples\hakutaku.yaml" target/x86_64-pc-windows-ms
 | 4 | 設定を外して（`hakutaku.yaml` を退避して）手順2・3をやり直す | 実行環境の Windows ANSI コードページが使われるため、**環境によっては文字化けし得る**。これは `ENC-005` の判定順どおりの挙動であり、明示指定が優先されることの裏返し | `ENC-004`、`ENC-005` |
 
 手順4は、日本語環境（コードページ 932）で確認すると CP932 側は化けず、CP1252 側だけが化けます。確認した実行環境のコードページを記録してください。
+
+手順4の設定を外す操作は、アプリを終了してから `./scripts/start-manual-check.ps1 -ConfigMode none -SkipBuild -NoLaunch` を実行しても行えます。
 
 ### 4.6 継続行
 
@@ -268,6 +292,14 @@ Copy-Item "$env:TEMP\hakutaku-samples\hakutaku.yaml" target/x86_64-pc-windows-ms
 診断ログと画面表示は仕様によりフルパス等の実値をマスキングしません（`DIAG-003`／`DIAG-004`、`ERR-002`）。確認に使ったログの取り扱いは利用者・導入組織の責任範囲です（`SEC-005`）。
 
 ## 5. 後片付け
+
+[`scripts/start-manual-check.ps1`](../../scripts/start-manual-check.ps1) を使っている場合は、`-CleanUp` でサンプルフォルダと配置した設定ファイルの削除をまとめて行えます（既定以外の場所へサンプルを生成していた場合は、同じ `-SampleDir` を付けて実行します）。
+
+```powershell
+./scripts/start-manual-check.ps1 -CleanUp
+```
+
+手動で後片付けする場合は次の手順です。
 
 1. Hakutaku を終了する
 2. [4.12](#412-共有違反と再試行)・[4.13](#413-追記と再読み込み)で起動した `append-log-writer.ps1` が残っていないか確認する

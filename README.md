@@ -78,7 +78,13 @@ Windows の生成物は `target/x86_64-pc-windows-msvc/release/Hakutaku.exe` で
 
 変更を送る前に実行する標準の検査コマンドは、[開発ワークフローの「段階0の標準検査」](docs/development/workflow.md#段階0の標準検査)にまとめています。
 
-画面と操作を通して実装済みの機能を確認する場合は、[手動での動作確認手順](docs/verification/manual-check.md)に従ってください。確認に使うサンプルログと設定ファイルは、次のコマンドで一式を生成できます（生成先は既定で `%TEMP%\hakutaku-samples`。リポジトリ内には生成できません）。
+画面と操作を通して実装済みの機能を確認する場合は、[手動での動作確認手順](docs/verification/manual-check.md)に従ってください。動作確認の環境（ビルド、サンプル生成、設定ファイルの配置、起動）は、まず次の1コマンドでまとめて準備できます。
+
+```powershell
+./scripts/start-manual-check.ps1
+```
+
+サンプルログと設定ファイルの生成だけを行う場合は、次のコマンドを使います（生成先は既定で `%TEMP%\hakutaku-samples`。リポジトリ内には生成できません）。
 
 ```powershell
 ./scripts/generate-sample-logs.ps1
@@ -109,7 +115,7 @@ Windows の生成物は `target/x86_64-pc-windows-msvc/release/Hakutaku.exe` で
 | [`crates/`](crates/) | GUI に依存しないコアクレート群（設定、データソース、形式判定、パーサー、メモリ会計、診断、共通サービス） |
 | [`src-tauri/`](src-tauri/) | Tauri コマンドの薄い GUI 層、Tauri 設定（`Tauri.toml`）、Capability と個別 Permission の定義 |
 | [`src/`](src/) | フロントエンドの静的資産（HTML、CSS、素の ES モジュール） |
-| [`scripts/`](scripts/) | 開発・検証用の PowerShell スクリプト（Runtime の配置、試験データ生成、動作確認用サンプル一式の生成、追記テスト、配布 ZIP の組み立て） |
+| [`scripts/`](scripts/) | 開発・検証用の PowerShell スクリプト（Runtime の配置、試験データ生成、動作確認用サンプル一式の生成、動作確認環境の一括準備、追記テスト、配布 ZIP の組み立て） |
 | [`tasks/`](tasks/README.md) | 実装計画（フェーズ一覧）。配置の例外判断は同ディレクトリの README を参照 |
 
 試験データは合成データだけを使い、実データ（個人情報等の機密データを含み得るログ）をリポジトリへ置きません。生成手段は [`scripts/generate-test-log.ps1`](scripts/generate-test-log.ps1)（任意の行数・書式・文字コードのログを1本生成）と [`scripts/generate-sample-logs.ps1`](scripts/generate-sample-logs.ps1)（動作確認用のサンプル一式と設定ファイルを生成）です。いずれも生成先はリポジトリ外に限ります。
