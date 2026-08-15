@@ -2,7 +2,7 @@
 
 - 状態: 採用済み（Accepted）
 - 管理責任者: リポジトリメンテナー
-- 最終更新日: 2026-08-15
+- 最終更新日: 2026-08-16
 
 このディレクトリは、人間と AI エージェントが Hakutaku を開発、レビュー、統合するための運用規則の正本です。
 
@@ -42,7 +42,7 @@ GitHub Projects を将来導入する場合は、集約する状態の正本を 
 
 - 正式リリース前であり、`main` は開発版。詳細は[リポジトリ運用規則の「正式リリース前の方針」](repository-operations.md#正式リリース前の方針)を参照
 - 実装技術（Rust + Tauri 2系）は [ADR-0001](../architecture/decisions/0001-rust-tauri-provisional-adoption.md) により暫定決定済み。確定は段階1（P13）の完了時
-- ビルド、テスト、静的解析、整形の標準コマンドは[開発ワークフローの「段階0の標準検査」](workflow.md#段階0の標準検査)で確定済み。CI（`.github/workflows/ci.yml`）でも自動実行される
+- ビルド、テスト、静的解析、整形の標準コマンドは[開発ワークフローの「段階0の標準検査」](workflow.md#段階0の標準検査)で確定済み。CI（`.github/workflows/ci.yml`）でも自動実行され、[`main` のブランチ保護](repository-operations.md#main-のブランチ保護)で必須化されている
 
 利用可能な検査と手動確認を PR に記録し、未実施項目とリスクを明示します。
 
