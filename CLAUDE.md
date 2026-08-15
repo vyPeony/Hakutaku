@@ -6,12 +6,11 @@
 
 ## 最初に行うこと
 
-[`AGENTS.md`](AGENTS.md) を全文読み、そのとおりに従ってください（必読文書、権限の境界、セッションの流れ、停止条件を含む）。
+[`AGENTS.md`](AGENTS.md) を全文読み、そのとおりに従ってください（必読文書、セッションの流れ、停止条件を含む）。
 
 ## Claude Code 固有の注意
 
 - 応答、コミットメッセージ、Issue / PR、文書は、[使用言語と文章の規則](docs/development/repository-operations.md#使用言語と文章)に従い、原則として分かりやすい日本語で書く
-- コミット、リモート送信、Issue / PR の操作、破壊的操作は、[`AGENTS.md` の「権限の境界」](AGENTS.md#権限の境界)に従い、利用者の明示的な依頼がある場合だけ行う
 - サブエージェント（Task ツール）は、[`AGENTS.md` の「サブエージェントの手順」](AGENTS.md#サブエージェントの手順)に従い、書き込み範囲をファイル単位で一意に割り当てる
 - 並行作業と worktree は[並行セッション](docs/development/concurrent-sessions.md)に従う。Codex を含む他セッションの worktree、ブランチ、未コミット変更を操作しない
 - リポジトリ共通の Claude Code 設定は `.claude/settings.json` に置き、個人設定は `.claude/settings.local.json`（Git 管理外）に置く。認証情報、個人のモデル・承認設定、MCP の秘密情報をコミットしない
