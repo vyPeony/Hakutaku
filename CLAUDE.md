@@ -6,10 +6,7 @@
 
 ## 最初に行うこと
 
-1. [`AGENTS.md`](AGENTS.md) を全文読む（必読文書、権限の境界、セッションの流れ、停止条件を含む）
-2. [`README.md`](README.md) でプロジェクトの現在状態を確認する
-3. [`docs/README.md`](docs/README.md) でタスクに対応する正本を選ぶ
-4. 変更作業では [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md) と [`docs/development/README.md`](docs/development/README.md) を読む
+[`AGENTS.md`](AGENTS.md) を全文読み、そのとおりに従ってください（必読文書、権限の境界、セッションの流れ、停止条件を含む）。
 
 ## Claude Code 固有の注意
 
