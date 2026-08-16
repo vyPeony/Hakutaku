@@ -16,6 +16,11 @@
 // 原因調査に必要であればフルパスを表示してよい」と定めている。このモジュールは
 // いずれのフィールドもマスキング・切り詰めしない。
 //
+// `showTargetError` の見出しは既定で「対象を開けませんでした」だが、対象が
+// Error へ遷移せず閲覧を継続できる失敗（例: 再読み込みの上限超過拒否）では
+// 実態と食い違うため、呼び出し側（`src/shell.js`）が `headingText` で
+// 差し替えられる（Issue #11）。
+//
 // ADR-0006 に従い、フレームワーク・バンドラーを使わない素の ES モジュール。
 
 /**
@@ -176,12 +181,20 @@ function buildDefinitionRow(term, description) {
  * いずれもマスキングしない（フルパスを含んでよい）。別の通知を表示中の
  * 場合は、それが閉じられた後に順に表示される。
  *
+ * 見出しは既定で「対象を開けませんでした」。対象が Error へ遷移せず、
+ * 旧スナップショットの閲覧を継続できる失敗（例: 再読み込みの上限超過拒否）
+ * では既定の見出しが実態と食い違うため、`options.headingText` で呼び出し側
+ * が差し替えられる（Issue #11）。省略時は従来どおりの挙動を保つ。
+ *
  * @param {UserFacingErrorDto} error
+ * @param {{ headingText?: string }} [options] `headingText` を指定すると
+ *   既定の見出しを置き換える（aria-label にも同じ文が使われる）。
  */
-export function showTargetError(error) {
+export function showTargetError(error, options = {}) {
+  const headingText = options.headingText ?? "対象を開けませんでした";
   requestNotice({
     className: "status-dialog",
-    headingText: "対象を開けませんでした",
+    headingText,
     buildBody: () => {
       const list = document.createElement("dl");
       list.className = "status-dialog__fields";
