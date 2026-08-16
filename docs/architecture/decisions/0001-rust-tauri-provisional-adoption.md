@@ -87,5 +87,4 @@ P13 の完了ゲートを満たさない場合は、本 ADR を確定しませ�
 
 - 初期仕様 版1.10: `DEC-002`、`TECH-001`～`TECH-006`、`VER-001`～`VER-007`
 - [アーキテクチャ概要](../overview.md)
-- [P00 開発基盤と層境界](../../../tasks/phase-00-foundation.md)
-- [P13 段階1検証（LTSC 実機）と技術選定の確定](../../../tasks/phase-13-stage1-ltsc.md)
+- 段階1検証（LTSC 実機）と技術選定の確定: [Issue #12](https://github.com/vyPeony/Hakutaku/issues/12)

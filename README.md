@@ -31,9 +31,9 @@ Hakutaku は、ログ、データベース、Web API、構造化ファイルな�
 
 初期リリース（テキストログのビューア）に必要な機能は、段階0での実装と検証を終えています。段階1（LTSC 実機での検証と技術選定の確定）は未着手です。
 
-- 実装計画とフェーズ間の依存: [`tasks/README.md`](tasks/README.md)
 - 段階0の検証結果と、未実施項目の引き継ぎ: [段階0検証記録](docs/verification/stage0-results.md)
-- フェーズごとの進捗、受け入れ条件、担当: GitHub Issue / PR で管理
+- 段階0から段階1、初期リリース後までの順序とゲート: [ロードマップ](docs/roadmap.md)
+- 進捗、受け入れ条件、担当: GitHub Issue / PR で管理
 
 **段階0で計測した性能値は参考値です。** `VER-005` により合否判定へ使いません。機能の判定には、プロセスのメモリ量ではなく内部状態（保持行数・保持バイト数、破棄と再取得の回数、ヒープ会計値）を使っています。
 
@@ -51,7 +51,7 @@ Hakutaku は、ログ、データベース、Web API、構造化ファイルな�
 | コピー | 行・列範囲の選択、上限判定と拒否、クリップボードへのコピー |
 | 対象端末での運用 | 非昇格での起動、アクセス拒否時の昇格経路、資源抑制の設定、安全な停止 |
 
-初期リリースに**含めない**ものは、SQLite・DICOM ビューア、検索と絞り込み、索引キャッシュ、ドラッグ＆ドロップによる追加です。これらは後続リリース（[`tasks/phase-14-post-initial-release.md`](tasks/phase-14-post-initial-release.md)）で扱います。
+初期リリースに**含めない**ものは、SQLite・DICOM ビューア、検索と絞り込み、索引キャッシュ、ドラッグ＆ドロップによる追加です。これらは後続リリースで扱います（[Issue #13](https://github.com/vyPeony/Hakutaku/issues/13)）。
 
 ## コードの構成
 
@@ -116,7 +116,6 @@ Windows の生成物は `target/x86_64-pc-windows-msvc/release/Hakutaku.exe` で
 | [`src-tauri/`](src-tauri/) | Tauri コマンドの薄い GUI 層、Tauri 設定（`Tauri.toml`）、Capability と個別 Permission の定義 |
 | [`src/`](src/) | フロントエンドの静的資産（HTML、CSS、素の ES モジュール） |
 | [`scripts/`](scripts/) | 開発・検証用の PowerShell スクリプト（Runtime の配置、試験データ生成、動作確認用サンプル一式の生成、動作確認環境の一括準備、追記テスト、配布 ZIP の組み立て） |
-| [`tasks/`](tasks/README.md) | 実装計画（フェーズ一覧）。配置の例外判断は同ディレクトリの README を参照 |
 
 試験データは合成データだけを使い、実データ（個人情報等の機密データを含み得るログ）をリポジトリへ置きません。生成手段は [`scripts/generate-test-log.ps1`](scripts/generate-test-log.ps1)（任意の行数・書式・文字コードのログを1本生成）と [`scripts/generate-sample-logs.ps1`](scripts/generate-sample-logs.ps1)（動作確認用のサンプル一式と設定ファイルを生成）です。いずれも生成先はリポジトリ外に限ります。
 
