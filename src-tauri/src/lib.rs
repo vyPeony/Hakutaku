@@ -22,6 +22,70 @@ fn core_responsibilities() -> [&'static str; 4] {
 /// 使うため、`bootstrap` モジュールの `Aborted` には含めていない。
 const EXIT_CODE_TAURI_RUN_FAILURE: i32 = 1;
 
+/// 初期ウィンドウの既定の幅（論理ピクセル）。値の正本は `Tauri.toml` の
+/// P01 実装契約コメント（width = 1024）と同期させる。
+const INITIAL_WINDOW_WIDTH: f64 = 1024.0;
+
+/// 初期ウィンドウの既定の高さ（論理ピクセル）。値の正本は `Tauri.toml` の
+/// P01 実装契約コメント（height = 768）と同期させる。
+const INITIAL_WINDOW_HEIGHT: f64 = 768.0;
+
+/// ウィンドウの最小の幅（論理ピクセル）。800×600 未満では GUI のレイアウトが
+/// 崩れる（1列に潰れて縦書きのように見える）ため、レイアウトが成立する下限
+/// （Issue #9）。値の正本は `Tauri.toml` の P01 実装契約コメント（minWidth = 800）。
+const MIN_WINDOW_WIDTH: f64 = 800.0;
+
+/// ウィンドウの最小の高さ（論理ピクセル）。[`MIN_WINDOW_WIDTH`] と対。値の正本は
+/// `Tauri.toml` の P01 実装契約コメント（minHeight = 600）。
+const MIN_WINDOW_HEIGHT: f64 = 600.0;
+
+/// 初期サイズの丸め計算で、モニタの論理幅から確保する余白（論理ピクセル）。
+/// ウィンドウ装飾（左右の枠）相当。
+const WINDOW_MARGIN_WIDTH: f64 = 16.0;
+
+/// 初期サイズの丸め計算で、モニタの論理高さから確保する余白（論理ピクセル）。
+/// タイトルバーとタスクバー相当。
+const WINDOW_MARGIN_HEIGHT: f64 = 88.0;
+
+/// 初期ウィンドウサイズ（論理ピクセル）を、モニタの論理サイズに収まるよう丸めます。
+///
+/// # なぜ丸めが必要か
+///
+/// Tauri の `WebviewWindowBuilder::inner_size` は論理ピクセルを受け取り
+/// （tauri-2.11.5/src/webview/webview_window.rs 804行目「Window size in logical
+/// pixels.」、tauri-runtime-wry-2.11.4/src/lib.rs 1008行目で `TaoLogicalSize` へ
+/// 変換）、tao 0.35.3 はウィンドウ生成時にモニタサイズへのクランプを行わない
+/// （min/max 制約の適用のみ）。そのため `ENV-005` の基準解像度 1920×1080 でも、
+/// 表示スケール 150% ではモニタの論理サイズが 1280×720 になり、既定の
+/// 1024×768 のままでは初期ウィンドウが画面からはみ出す（Issue #9）。
+///
+/// # 丸めの仕様
+///
+/// - モニタの論理サイズから、ウィンドウ装飾とタスクバー相当の余白
+///   （幅 [`WINDOW_MARGIN_WIDTH`]、高さ [`WINDOW_MARGIN_HEIGHT`]）を引いた
+///   利用可能サイズまで縮める。利用可能サイズが既定
+///   （[`INITIAL_WINDOW_WIDTH`]×[`INITIAL_WINDOW_HEIGHT`]）以上なら丸めない。
+/// - ただし最小サイズ（[`MIN_WINDOW_WIDTH`]×[`MIN_WINDOW_HEIGHT`]）は下回らない。
+///   最小サイズを優先するため、約 175% 以上の表示スケールでは画面に収まらない
+///   場合がある（レイアウトが成立する下限を優先する既知の制約）。
+///
+/// 例: モニタ論理 1280×720 → (1024.0, 632.0)、1920×1080 → (1024.0, 768.0)、
+/// 1097×617 → (1024.0, 600.0)。
+fn clamped_initial_window_size(
+    monitor_logical_width: f64,
+    monitor_logical_height: f64,
+) -> (f64, f64) {
+    let available_width = monitor_logical_width - WINDOW_MARGIN_WIDTH;
+    let available_height = monitor_logical_height - WINDOW_MARGIN_HEIGHT;
+    let width = INITIAL_WINDOW_WIDTH
+        .min(available_width)
+        .max(MIN_WINDOW_WIDTH);
+    let height = INITIAL_WINDOW_HEIGHT
+        .min(available_height)
+        .max(MIN_WINDOW_HEIGHT);
+    (width, height)
+}
+
 /// Hakutaku の起動処理。
 ///
 /// 1. [`bootstrap::run`] を実行する。失敗した場合、通知は `bootstrap::run` の内部で
@@ -271,14 +335,23 @@ pub fn run() {
         // managed state として保持する。`measurement` の3コマンドがこれを使う。
         .manage(std::sync::Arc::clone(&measurement_state))
         .setup(move |app| {
-            tauri::WebviewWindowBuilder::new(
+            let window = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .title("Hakutaku")
-            .inner_size(640.0, 420.0)
-            .min_inner_size(480.0, 320.0)
+            // Issue #9: 800×600 未満では GUI のレイアウトが崩れる（1列に潰れて
+            // 縦書きのように見える）ため、レイアウトが成立する下限として最小
+            // サイズを 800×600 とする。初期サイズ 1024×768 はその上で余裕を
+            // 持たせた値。どちらも論理ピクセルであり、初期サイズは build 後に
+            // モニタの論理サイズへ丸める（`clamped_initial_window_size`。表示
+            // スケール 150% の 1920×1080 ではモニタの論理サイズが 1280×720 に
+            // なるため）。最小サイズを下回る丸めはしないため、約 175% 以上の
+            // 表示スケールでは画面に収まらない場合がある（既知の制約）。
+            // 値の正本は Tauri.toml の P01 実装契約コメントと同期させる。
+            .inner_size(INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT)
+            .min_inner_size(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
             .resizable(true)
             .data_directory(webview2_data_dir) // DIST-013 / SEC-009。必須。
             .devtools(false) // SEC-011。多重防御（CSP・feature 無効化に加えて明示指定）。
@@ -299,6 +372,17 @@ pub fn run() {
                 false
             })
             .build()?;
+            // モニタ情報が取れた場合だけ、初期サイズをモニタの論理サイズへ
+            // 丸める（Issue #9）。取得失敗（Err / None）や set_size の失敗は
+            // 無視して既定サイズのまま起動する（丸めは表示位置の改善であり、
+            // 起動を止める理由にはしないため）。
+            if let Ok(Some(monitor)) = window.current_monitor() {
+                let logical = monitor.size().to_logical::<f64>(monitor.scale_factor());
+                let (width, height) = clamped_initial_window_size(logical.width, logical.height);
+                if (width, height) != (INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT) {
+                    let _ = window.set_size(tauri::LogicalSize::new(width, height));
+                }
+            }
             Ok(())
         })
         .build(tauri::generate_context!());
@@ -382,7 +466,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::core_responsibilities;
+    use super::{clamped_initial_window_size, core_responsibilities};
 
     #[test]
     fn tauri_command_delegates_to_the_core_layer() {
@@ -390,5 +474,34 @@ mod tests {
             core_responsibilities(),
             ["データソース", "形式判定", "パーサー", "共通サービス"]
         );
+    }
+
+    /// 表示スケール 150% の 1920×1080（モニタ論理サイズ 1280×720）では、高さを
+    /// 利用可能サイズ（720 − 88 = 632）へ丸める（Issue #9 の再現条件）。
+    #[test]
+    fn shrinks_height_to_fit_monitor_at_150_percent_scale() {
+        assert_eq!(clamped_initial_window_size(1280.0, 720.0), (1024.0, 632.0));
+    }
+
+    /// 表示スケール 100% の 1920×1080 では余白を引いても既定サイズ以上のため、
+    /// 既定の 1024×768 のまま丸めない。
+    #[test]
+    fn keeps_default_size_when_monitor_is_large_enough() {
+        assert_eq!(clamped_initial_window_size(1920.0, 1080.0), (1024.0, 768.0));
+    }
+
+    /// 利用可能サイズが最小サイズを下回る場合（1097×617 → 高さ 617 − 88 = 529）
+    /// は、最小サイズ 800×600 を優先して 600 で止める（画面に収まらないことを
+    /// 許容する既知の制約）。
+    #[test]
+    fn never_shrinks_below_minimum_size() {
+        assert_eq!(clamped_initial_window_size(1097.0, 617.0), (1024.0, 600.0));
+    }
+
+    /// 境界: 余白を引いた利用可能サイズがちょうど既定サイズ
+    /// （1040 − 16 = 1024、856 − 88 = 768）なら丸めない。
+    #[test]
+    fn keeps_default_size_at_exact_boundary() {
+        assert_eq!(clamped_initial_window_size(1040.0, 856.0), (1024.0, 768.0));
     }
 }

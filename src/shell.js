@@ -1,8 +1,9 @@
 // 共通シェル（P07-1／P07-2）。
 //
 // `tasks/phase-07-shell-ui.md` の P07-1 が定める共通画面
-// ——「参照対象一覧」「開いているビューのタブ」「状態・エラー表示領域」——
-// の描画と操作を統括する。DOM 操作と IPC 呼び出し、それらをつなぐ状態管理を
+// ——「参照対象一覧」「開いているビューのタブ」——の描画と操作、および対象を
+// 開く操作のエラー・通知のモーダルダイアログ表示（`src/error_panel.js`、
+// Issue #9）の呼び出しを統括する。DOM 操作と IPC 呼び出し、それらをつなぐ状態管理を
 // 担当し、純粋ロジック（一覧の状態モデル・タブ状態管理）は
 // src/targets.js・src/tabs.js へ切り出している（ADR-0006、AGENTS.md の
 // 指示）。
@@ -269,7 +270,9 @@ function invokeListDatetimeFormats() {
  * ではない）。
  *
  * 押した対象が現在アクティブなタブとは限らない（対象一覧の行はどれでも
- * 押せる）。タブの位置・フォーカスは常に維持し（`updateTabContent`）、
+ * 押せる）。タブの位置・フォーカスは維持し（`updateTabContent`。ただし
+ * 通知のモーダルダイアログ表示中はフォーカスがダイアログへ移り、閉じると
+ * 戻る）、
  * 対象が現在アクティブなタブだった場合にだけ、ビュー領域を即時再同期し
  * （`generation_mismatch` の自己修復に任せない）、生表示へ退避していれば
  * 通知（`showRawDisplayFallbackNotice`）を出す。バックグラウンドの対象では
@@ -324,9 +327,9 @@ async function handleReloadTargetClick(targetId) {
 
     if (response.kind === "rejected_over_limit" || response.kind === "failed") {
       // rejected_over_limit（上限超過拒否、対象は Ready のまま update_pending
-      // が立つ）・failed（LOG-023 の変更検知・LOG-027 の共有違反等、対象は
-      // Error へ遷移）のいずれも ERR-002 の5要素を持つ。下部の状態・エラー
-      // 表示領域へ既存の作法で表示する。
+      // が立つ）・failed（`LOG-023` の変更検知・`LOG-027` の共有違反等、対象は
+      // Error へ遷移）のいずれも `ERR-002` の5要素を持つ。モーダルダイアログ
+      // （`src/error_panel.js`）で表示する（同時多発時はキューで順に表示される）。
       showTargetError(/** @type {import("./targets.js").UserFacingErrorDto} */ (response.error));
       await refreshTargets();
       return;
@@ -793,9 +796,11 @@ async function applyLoadAttemptResponse(response) {
     return;
   }
 
-  // failed（対象の登録前に判明した同期的な失敗。ダイアログ操作自体の失敗、
-  // 設定に存在しない名前、フォルダ未対応など）。ERR-002 の5要素をそのまま
-  // 下部の状態・エラー表示領域へ表示する（フルパスをマスキングしない）。
+  // failed（同期的に判明した失敗）。ファイル選択ダイアログ自体の失敗や
+  // 設定に存在しない名前のように一覧へ行が残らないものと、フォルダ未対応
+  // （登録済みの行が Error へ遷移し、行に理由と「再試行」が残る）の両方が
+  // ここへ来る。`ERR-002` の5要素をそのままモーダルダイアログへ表示する
+  // （フルパスをマスキングしない）。
   showTargetError(/** @type {import("./targets.js").UserFacingErrorDto} */ (response.error));
   await refreshTargets();
 }

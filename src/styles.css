@@ -10,13 +10,13 @@
 
 /*
  * body を縦方向の flex コンテナにし、#config-banners（body 先頭に動的挿入
- * される起動時通知。P03-2・P04-2）・.app（共通シェル本体）・
- * #status-error-area（body 末尾に動的挿入される対象を開く操作のエラー領域。
- * P07-1）を縦に積む。バナーやエラー領域が表示されている間も、
- * ページ全体がビューポートの高さ（100%）に収まるようにする（.app 側で
- * height: 100vh のような固定値を使うと、他の兄弟要素の分だけ全体高さが
- * ビューポートを超え、二重スクロールや操作領域のはみ出しを起こすため、
- * .app は flex: 1 1 auto で残り高さに合わせて伸縮させる）。
+ * される起動時通知。P03-2・P04-2）と .app（共通シェル本体）を縦に積む。
+ * バナーが表示されている間も、ページ全体がビューポートの高さ（100%）に
+ * 収まるようにする（.app 側で height: 100vh のような固定値を使うと、他の
+ * 兄弟要素の分だけ全体高さがビューポートを超え、二重スクロールや操作領域の
+ * はみ出しを起こすため、.app は flex: 1 1 auto で残り高さに合わせて伸縮
+ * させる）。対象を開く操作のエラーはこの積み上げには現れない（通常フローの
+ * 領域ではなく、モーダルの <dialog> で表示する。src/error_panel.js、Issue #9）。
  */
 html,
 body {
@@ -31,7 +31,7 @@ body {
 
 /*
  * 共通シェル本体（P07-1）。左に参照対象一覧、右にタブ＋ビュー領域
- * を横並びに配置する（.app-body）。banner・状態エラー領域の有無に関わらず
+ * を横並びに配置する（.app-body）。バナーの有無に関わらず
  * 残りの高さいっぱいに広がる（flex: 1 1 auto）。画面解像度 1920×1080 を
  * 基準に、スクロールやダイアログの画面外配置なしに操作できることを狙う
  * （ENV-005）。
@@ -76,7 +76,9 @@ body {
 
 .target-pane__heading {
   margin: 0;
-  font-size: 0.95rem;
+  /* 強調は太字（h2 既定）だけで足りるため、文字サイズは本文相当へ揃える
+   * （Issue #9 の利用者フィードバック）。 */
+  font-size: 0.85rem;
 }
 
 .target-list {
@@ -108,6 +110,9 @@ body {
 
 .target-row__name {
   font-weight: bold;
+  /* 強調は太字だけで足りるため、既定（1rem）に任せず本文相当を明示する
+   * （Issue #9 の利用者フィードバック）。 */
+  font-size: 0.85rem;
   word-break: break-all;
 }
 
@@ -238,6 +243,13 @@ body {
   flex: none;
 }
 
+/* トグルのラベル（「時系列統合: OFF」等）を、狭いウィンドウでも字内で
+ * 折り返させない（Issue #9。最小 800×600 付近でラベルが1文字ずつ折り返され
+ * 縦書き状になる問題への対策）。 */
+.merged-view-toggle {
+  white-space: nowrap;
+}
+
 .merged-view-toggle[aria-pressed="true"] {
   background: #dbe9ff;
   border-color: #7aa7e8;
@@ -263,6 +275,9 @@ body {
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
+  /* 強調・識別に文字サイズを使わない方針の適用（Issue #9）。既定（1rem）の
+   * ままだと本文より大きく見えるため、本文相当へ揃える。 */
+  font-size: 0.85rem;
   border: 1px solid #ddd;
   border-bottom: none;
   border-radius: 4px 4px 0 0;
@@ -319,18 +334,34 @@ body {
 .log-toolbar {
   display: flex;
   align-items: center;
+  /* ウィンドウが狭いときはグループ単位で折り返す（Issue #9。ラベルの字内
+   * 折り返し＝縦書き状の崩れは、各ラベル側の white-space: nowrap で禁止
+   * する）。 */
+  flex-wrap: wrap;
   gap: 12px;
   padding: 8px 12px;
   border-bottom: 1px solid #ddd;
   flex: none;
+  /* ツールバーの基準文字サイズ（Issue #9）。font-size 未指定の子
+   * （.log-toolbar__label・.log-toolbar__count）が 1rem のまま本文
+   * （0.85rem）より大きく見えないよう揃える（内部の 0.8rem 指定はそのまま）。 */
+  font-size: 0.85rem;
 }
 
 .log-toolbar__label {
   font-weight: bold;
+  /* 長いソース名は字内で折り返さず省略表示する（Issue #9。字内折り返しを
+   * 許すと CJK の長い名前でツールバーが複数行に伸び、ログ表示領域を圧迫
+   * するため）。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .log-toolbar__count {
   color: #666;
+  white-space: nowrap;
 }
 
 /*
@@ -342,11 +373,15 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 折り返しは .log-toolbar の flex-wrap によるグループ単位とし、グループ
+   * 自体は縮ませて潰さない（Issue #9）。 */
+  flex: none;
 }
 
 .log-toolbar__copy-columns-label {
   font-size: 0.8rem;
   color: #555;
+  white-space: nowrap;
 }
 
 .log-toolbar__copy-columns-option {
@@ -356,6 +391,7 @@ body {
   font-size: 0.8rem;
   color: #333;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 /*
@@ -366,11 +402,15 @@ body {
   align-items: center;
   gap: 6px;
   margin-left: auto;
+  /* 折り返しは .log-toolbar の flex-wrap によるグループ単位とし、グループ
+   * 自体は縮ませて潰さない（Issue #9）。 */
+  flex: none;
 }
 
 .log-toolbar__jump-label {
   font-size: 0.8rem;
   color: #555;
+  white-space: nowrap;
 }
 
 .log-toolbar__jump-input {
@@ -685,67 +725,50 @@ body {
 }
 
 /*
- * 下部の状態・エラー表示領域（ERR-002、P07-1）。src/error_panel.js
- * のヘルパーが body 末尾へ動的に挿入する。#config-banners（画面上部、起動時の
- * 非致命的通知）とは意図的に別領域にしている。body（flex column）内で
- * 内容分の高さだけを取り、.app 側へ残りの高さを譲る（#config-banners と
- * 同じ考え方）。
+ * 対象を開く操作のエラー・通知のモーダルダイアログ（ERR-002、Issue #9）。
+ * src/error_panel.js が body 末尾へ遅延生成する <dialog> を showModal() で
+ * 1件ずつ表示し、画面へ累積させない（同時多発時は src/error_panel.js の
+ * キューで順に表示する）。#config-banners（画面上部、起動時の非致命的通知）
+ * は別機構であり、ここでは扱わない。
  */
-#status-error-area {
-  display: flex;
-  flex-direction: column;
-  flex: none;
-  max-height: 35vh;
+.status-dialog {
+  max-width: min(560px, 90vw);
+  /* 内容が多い場合は画面外へはみ出させず、ダイアログ内部でスクロールする。 */
+  max-height: 80vh;
   overflow-y: auto;
-}
-
-.status-error-panel {
-  padding: 10px 16px;
+  padding: 14px 18px;
+  border: 1px solid #c0341f;
+  border-radius: 6px;
   font-size: 0.85rem;
-  text-align: left;
   line-height: 1.5;
   background: #fdeaea;
   color: #7a1212;
-  border-bottom: 3px solid #c0341f;
 }
 
 /* LOG-022 の生表示への退避通知（エラーではない、非致命的な案内）。 */
-.status-error-panel--info {
+.status-dialog--info {
+  border-color: #b7d0f5;
   background: #e8f1ff;
   color: #1a3d7c;
-  border-bottom: 1px solid #b7d0f5;
 }
 
-.status-error-panel__header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
+/* モーダルの背面。下の画面が読める程度の薄い半透明に留める。 */
+.status-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.25);
 }
 
-.status-error-panel__heading {
+.status-dialog__heading {
   margin: 0;
   font-weight: bold;
   word-break: break-all;
+  /* showModal() の自動フォーカスをプログラムで当てる先（tabindex="-1"）で
+   * あり、クリック・Tab で操作する対象ではないため、フォーカスリングは
+   * 表示しない。 */
+  outline: none;
 }
 
-.status-error-panel__text {
+.status-dialog__text {
   margin: 8px 0 0;
-}
-
-.status-error-panel__close {
-  flex: none;
-  border: none;
-  background: transparent;
-  font-size: 1.1rem;
-  line-height: 1;
-  padding: 0 0 0 8px;
-  cursor: pointer;
-  color: inherit;
-}
-
-.status-error-panel__close:hover {
-  opacity: 0.7;
 }
 
 /*
@@ -753,20 +776,33 @@ body {
  * 表示する。フルパスを含み得るため word-break で折り返す（マスキングしない。
  * DIAG-004）。
  */
-.status-error-panel__fields {
+.status-dialog__fields {
   margin: 8px 0 0;
   display: grid;
   grid-template-columns: max-content 1fr;
   gap: 4px 12px;
 }
 
-.status-error-panel__term {
+.status-dialog__term {
   font-weight: bold;
   white-space: nowrap;
 }
 
-.status-error-panel__description {
+.status-dialog__description {
   margin: 0;
   word-break: break-all;
   font-family: "Consolas", "Yu Gothic UI", monospace;
+}
+
+/* 「閉じる」ボタンの行。ボタン自体は他の操作ボタンと同じ既定の見た目にする。
+ * 内容が長く .status-dialog 内部がスクロールする場合でも「閉じる」が常に
+ * 見えるよう、ダイアログの下端へ張り付ける。 */
+.status-dialog__footer {
+  margin: 14px 0 0;
+  display: flex;
+  justify-content: flex-end;
+  position: sticky;
+  bottom: 0;
+  padding-top: 8px;
+  background: inherit;
 }

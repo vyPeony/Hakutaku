@@ -30,12 +30,16 @@ frontendDist = "../src"
 #
 #   label      = "main"
 #   title      = "Hakutaku"
-#   width      = 640
-#   height     = 420
-#   minWidth   = 480
-#   minHeight  = 320
+#   width      = 1024
+#   height     = 768
+#   minWidth   = 800
+#   minHeight  = 600
 #   resizable  = true
 #   fullscreen = false
+#
+# width / height / minWidth / minHeight は論理ピクセルです。初期サイズ
+# （width / height）は起動時にモニタの論理サイズへ丸めます
+# （実装は src-tauri/src/lib.rs の clamped_initial_window_size）。
 #
 # devtools（SEC-011）: WindowConfig / WebviewWindowBuilder には `devtools: Option<bool>`
 # があります（tauri-utils-2.9.3/src/config.rs 2173行目、
