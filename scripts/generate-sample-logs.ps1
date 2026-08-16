@@ -34,7 +34,9 @@
     | `06-unconfirmed-tail.log` | 末尾が行の途中で終わる未確定行（`LOG-026`） |
     | `07-leading-no-datetime.log` | 先頭の日時なし行が破棄されないこと（`LOG-014`） |
     | `08-large.log` | 仮想スクロール、行番号ジャンプ、コピー上限（`PERF-007`、`COPY-004`／`005`） |
-    | `hakutaku.yaml` | 正常起動と事前定義データソース・解析プロファイル（`CFG-003`、`CFG-008`、`CFG-014`） |
+    | `09-mixed-app/service/legacy/western.log` | 書式・文字コードが異なる4ファイルの時系列統合（`LOG-006`〜`008`、`LOG-015`、`LOG-016`、`CFG-008`） |
+    | `10-medium-100k.log` | 10万行、事前定義データソースから常に開ける（`-LargeLineCount 0` の影響を受けない。`PERF-007`） |
+    | `hakutaku.yaml` | 正常起動と事前定義データソース・解析プロファイル（`CFG-003`、`CFG-008`、`CFG-014`）。事前定義データソースはすべて正常に開けるものだけで構成し、エラー確認用の項目は含めない |
     | `hakutaku-invalid.yaml` | 安全モード起動（`CFG-016`） |
 
     `02-dt-004.log`（`YYYY/MM/DD HH:mm:ss:SS`）は、自動判定では必ず
@@ -246,6 +248,36 @@ else {
     Write-Host "08-large.log は -LargeLineCount 0 のため生成しません。"
 }
 
+# --- 09: 異種ログ4ファイル（書式・文字コードの異なる時系列統合） ------------
+# 05 節（同形式・3ファイル）に対し、書式・文字コードが異なる複数ログの統合
+# 表示を確認するためのセット（LOG-006〜008、LOG-015、LOG-016、CFG-008）。
+# 05 節と同じ理由で、開始時刻を数ミリ秒ずつずらし、統合表示で4ファイルの
+# 行が交互に並ぶようにする（同時刻だと日時だけでは順序が決まらない）。
+New-Sample -FileName "09-mixed-app.log" -LineCount 300 `
+    -Purpose "異種ログの時系列統合／アプリ（LOG-DT-001、UTF-8、継続行あり。LOG-006〜008、LOG-015、LOG-016、CFG-008）" `
+    -Start $StartTimestamp.AddMilliseconds(0) `
+    -ExtraParameters @{ Format = 'LOG-DT-001'; Encoding = 'Utf8NoBom'; ContinuationLineRate = 0.15; Seed = 7 } | Out-Null
+New-Sample -FileName "09-mixed-service.log" -LineCount 300 `
+    -Purpose "異種ログの時系列統合／サービス（LOG-DT-002、UTF-8 BOM。LOG-006〜008、LOG-015、LOG-016、CFG-008）" `
+    -Start $StartTimestamp.AddMilliseconds(3) `
+    -ExtraParameters @{ Format = 'LOG-DT-002'; Encoding = 'Utf8Bom' } | Out-Null
+New-Sample -FileName "09-mixed-legacy.log" -LineCount 300 `
+    -Purpose "異種ログの時系列統合／旧システム（LOG-DT-005、CP932。LOG-006〜008、LOG-015、LOG-016、CFG-008）" `
+    -Start $StartTimestamp.AddMilliseconds(5) `
+    -ExtraParameters @{ Format = 'LOG-DT-005'; Encoding = 'CP932' } | Out-Null
+New-Sample -FileName "09-mixed-western.log" -LineCount 300 `
+    -Purpose "異種ログの時系列統合／海外拠点（LOG-DT-003、CP1252。LOG-006〜008、LOG-015、LOG-016、CFG-008）" `
+    -Start $StartTimestamp.AddMilliseconds(9) `
+    -ExtraParameters @{ Format = 'LOG-DT-003'; Encoding = 'CP1252' } | Out-Null
+
+# --- 10: 10万行のログ（データソースから常に開けるようにする） -------------
+# -LargeLineCount 0 で 08-large.log を省略した場合でも、事前定義データソース
+# の「サンプル: 大きめのログ（100,000行）」は常に開けるようにするため、行数を
+# 固定（-LargeLineCount の影響を受けない）で生成する（PERF-007）。
+New-Sample -FileName "10-medium-100k.log" -LineCount 100000 `
+    -Purpose "大きめのログ、事前定義データソースから常に開ける（PERF-007）" `
+    -ExtraParameters @{ ProgressEveryLines = 50000 } | Out-Null
+
 # --- 設定ファイル --------------------------------------------------------
 
 function Format-YamlSingleQuoted {
@@ -258,9 +290,15 @@ function Format-YamlSingleQuoted {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
-$sampleDirYaml = Format-YamlSingleQuoted -Value ($OutputDir.TrimEnd('\'))
 $basicYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "01-basic-utf8.log")
-$missingYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "99-missing.log")
+$mergeAYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "05-merge-a.log")
+$mergeBYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "05-merge-b.log")
+$mergeCYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "05-merge-c.log")
+$mixedAppYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "09-mixed-app.log")
+$mixedServiceYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "09-mixed-service.log")
+$mixedLegacyYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "09-mixed-legacy.log")
+$mixedWesternYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "09-mixed-western.log")
+$mediumYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "10-medium-100k.log")
 $cp932Yaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "03-encoding-cp932.log")
 $cp1252Yaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "03-encoding-cp1252.log")
 $dt004Yaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "02-dt-004.log")
@@ -278,12 +316,24 @@ config_version: 1
 # 事前定義データソース（CFG-003、PROD-006）。左ペインの「参照対象」一覧に
 # 名前で並び、クリックで開けます。パスはフロントエンドへ渡しません（SEC-012）。
 data_sources:
-  - name: 'サンプル: 基本のログ'
+  - name: 'サンプル: 基本のログ（2,000行）'
     path: $basicYaml
-  - name: 'サンプル: フォルダ（未対応の確認用）'
-    path: $sampleDirYaml
-  - name: 'サンプル: 存在しないファイル（エラー表示の確認用）'
-    path: $missingYaml
+  - name: 'サンプル: 統合 a（同形式・+0ms）'
+    path: $mergeAYaml
+  - name: 'サンプル: 統合 b（同形式・+7ms）'
+    path: $mergeBYaml
+  - name: 'サンプル: 統合 c（同形式・+13ms）'
+    path: $mergeCYaml
+  - name: 'サンプル: 異種 アプリ（LOG-DT-001／UTF-8／継続行あり）'
+    path: $mixedAppYaml
+  - name: 'サンプル: 異種 サービス（LOG-DT-002／UTF-8 BOM）'
+    path: $mixedServiceYaml
+  - name: 'サンプル: 異種 旧システム（LOG-DT-005／CP932）'
+    path: $mixedLegacyYaml
+  - name: 'サンプル: 異種 海外拠点（LOG-DT-003／CP1252）'
+    path: $mixedWesternYaml
+  - name: 'サンプル: 大きめのログ（100,000行）'
+    path: $mediumYaml
 
 # ログ解析プロファイル（CFG-008、LOG-021）。glob 記号を含まない path_pattern は
 # 絶対パス完全一致として扱われます。encoding に指定できるのは auto または
@@ -306,6 +356,18 @@ log_profiles:
     path_pattern: $dt004Yaml
     priority: 0
     datetime_format: LOG-DT-004
+  # 異種ログの文字コードを実行環境の ANSI コードページに左右されず確定させる
+  # ため（統合表示の期待結果を環境非依存にするため）、09-mixed-legacy.log／
+  # 09-mixed-western.log にも明示のプロファイルを与える。
+  - name: 'サンプル: 異種 旧システム（CP932）'
+    path_pattern: $mixedLegacyYaml
+    priority: 0
+    encoding: auto
+    ansi_codepage: 932
+  - name: 'サンプル: 異種 海外拠点（CP1252）'
+    path_pattern: $mixedWesternYaml
+    priority: 0
+    encoding: windows-1252
 "@
 
 $configPath = Join-Path $OutputDir "hakutaku.yaml"
