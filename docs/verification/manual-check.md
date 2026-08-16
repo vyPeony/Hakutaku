@@ -26,7 +26,7 @@
 
 ## 2. サンプルログの生成
 
-[`scripts/start-manual-check.ps1`](../../scripts/start-manual-check.ps1) を使うと、本章のサンプル生成から[3章](#3-アプリの起動と設定ファイルの配置)のアプリ起動までを1コマンドでまとめて済ませられます（実行ファイルが無ければビルドも行います）。
+[`scripts/start-manual-check.ps1`](../../scripts/start-manual-check.ps1) を使うと、本章のサンプル生成から[3章](#3-アプリの起動と設定ファイルの配置)のアプリ起動までを1コマンドでまとめて済ませられます（既定で毎回ビルドします。変更が無ければ数秒で終わります）。
 
 ```powershell
 ./scripts/start-manual-check.ps1
@@ -37,7 +37,7 @@
 | 引数 | 用途 |
 | --- | --- |
 | `-ConfigMode normal\|invalid\|none` | 実行ファイル直下に配置する `hakutaku.yaml` の状態を選ぶ（既定は `normal`） |
-| `-SkipBuild` | ビルドを省略する |
+| `-SkipBuild` | ビルドを省略し、既にある実行ファイルのまま進める（既定は毎回ビルド。省略した結果、実行ファイルより新しい変更が `src/`・`crates/`・`src-tauri/` にある場合は警告します） |
 | `-NoLaunch` | 準備だけ行い、アプリを起動しない |
 | `-SampleDir <パス>` | サンプル一式の置き場所を変える（既定は `%TEMP%\hakutaku-samples`） |
 | `-LargeLineCount <行数>` | `generate-sample-logs.ps1` の同名引数へそのまま渡す（省略時は既定 300,000）。`0` で `08-large.log` を生成しない |
@@ -92,6 +92,8 @@
 | --- | --- |
 | `npm run tauri dev` | `target/x86_64-pc-windows-msvc/debug/` |
 | `npm run tauri build -- --no-bundle` | `target/x86_64-pc-windows-msvc/release/` |
+
+**画面（`src/` の HTML・CSS・JS）を直した場合も、再ビルドしないと反映されません。** フロントエンド一式は `src-tauri/Tauri.toml` の `frontendDist = "../src"` により実行ファイルへ埋め込まれるためです。[`scripts/start-manual-check.ps1`](../../scripts/start-manual-check.ps1) は既定で毎回ビルドするので、通常は意識する必要はありません（変更が無ければ数秒で終わります）。`-SkipBuild` を付けた場合だけ、実行ファイルより新しい変更があると警告が出ます（[Issue #24](https://github.com/vyPeony/Hakutaku/issues/24)）。
 
 設定を差し替えるには、生成した YAML をその位置へコピーします（アプリは `hakutaku.yaml` を自動生成・上書きしません）。
 
