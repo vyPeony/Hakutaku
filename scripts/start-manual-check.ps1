@@ -14,7 +14,11 @@
        （`target/x86_64-pc-windows-msvc/release/Hakutaku.exe`）を用意する
        （既にあればビルドしない。`node_modules` が無ければ先に `npm ci`）
     2. サンプル一式を `-SampleDir` へ用意する
-       （生成そのものは `scripts/generate-sample-logs.ps1` に委ねる）
+       （生成そのものは `scripts/generate-sample-logs.ps1` に委ねる）。既存の
+       `hakutaku.yaml` があっても、それが指すファイルが1件でも見つからない
+       場合（新しいサンプルが追加された後に、それより前の一式が残っている
+       場合など）は古い一式とみなし、`-RegenerateSamples` を付けなくても
+       自動で作り直す（後述の `-RegenerateSamples` を参照）
     3. `-ConfigMode` に従い、実行ファイル直下の `hakutaku.yaml` を配置・削除する
        （設定ファイルは実行ファイルと同じフォルダの `hakutaku.yaml` 固定。`CFG-014`）
     4. 実行ファイルを起動する（`-NoLaunch` で省略）
@@ -57,12 +61,25 @@
 .PARAMETER LargeLineCount
     `generate-sample-logs.ps1` の同名パラメーターへそのまま渡します（指定した
     ときだけ渡すため、省略時は生成側の既定 300000 が使われます）。`0` を指定
-    すると `08-large.log` を生成しません（手順書 4.9・4.10 は実施できなく
-    なります）。
+    すると `08-large.log` を生成せず、事前定義データソースにも含めません
+    （手順書 4.9・4.10 は実施できなくなります）。`10-medium-100k.log`
+    （10万行）は `0` を指定しても常に生成されます。事前定義データソースの
+    「10 大きめのログ（100,000行）」から常に開けるようにするためです。
+
+    以前に `-LargeLineCount 0` で生成した一式が `-SampleDir` に残っている
+    場合、その `hakutaku.yaml` が指すファイルはすべて存在するため（後述の
+    自動判定は「指すファイルが存在するか」だけを見て、行数や引数の変化までは
+    追わない）、生成は省略され続け `08-large.log` は事前定義データソースに
+    含まれないままになります。行数を変えたい場合は `-RegenerateSamples` を
+    付けてください。
 
 .PARAMETER RegenerateSamples
-    サンプルが既にある場合でも `-Force` 付きで生成し直します。指定しない場合、
-    `-SampleDir` に `hakutaku.yaml` があれば生成を省略します。
+    サンプルが既にある場合でも `-Force` 付きで生成し直します。指定しない
+    場合、`-SampleDir` に `hakutaku.yaml` があり、かつそれが指すファイルが
+    すべて存在すれば生成を省略します。1件でも見つからない場合は、サンプル
+    一式が古い（または壊れている）と判断し、`-RegenerateSamples` を指定
+    しなくても自動で `-Force` 付きの生成し直しへ切り替わります（何が
+    足りなかったかを実行時に表示します）。
 
 .PARAMETER CleanUp
     後片付けだけを行います（手順書 5章）。サンプルフォルダと、実行ファイル直下
@@ -224,7 +241,54 @@ $invalidConfigPath = Join-Path $SampleDir "hakutaku-invalid.yaml"
 # 生成の完了は hakutaku.yaml の有無で判定する。設定ファイルは
 # generate-sample-logs.ps1 が最後に書くもののひとつであり、途中で中断した
 # フォルダを「生成済み」と誤認しにくいため。
-if ($RegenerateSamples -or -not (Test-Path -LiteralPath $sampleConfigPath)) {
+#
+# それだけでは不十分なため、既存の hakutaku.yaml が指すファイルが実際に
+# 存在するかも確認する（P12 で追加したサンプルより前に作られた一式が
+# 残っている場合、hakutaku.yaml 自体は存在していても中身は古いままであり、
+# 新しいデータソース（09-mixed-*.log、10-medium-100k.log 等）が一切出てこ
+# ない。「1回実行すれば概ねのパターンを網羅した状態でアプリが起動する」を
+# 満たすには、利用者が -RegenerateSamples を手で付けなくてもこの状態を
+# 検出して作り直す必要がある）。
+$needsRegenerate = -not (Test-Path -LiteralPath $sampleConfigPath)
+if (-not $needsRegenerate) {
+    try {
+        $sampleConfigLines = Get-Content -LiteralPath $sampleConfigPath -ErrorAction Stop
+        $missingSampleFiles = [System.Collections.Generic.List[string]]::new()
+        $sawDataSourcePath = $false
+        foreach ($configLine in $sampleConfigLines) {
+            # 生成する YAML は「- name: '…'」の次行が「    path: '…'」という
+            # 固定の形式（log_profiles 側は path_pattern のため混ざらない。
+            # generate-sample-logs.ps1 の Format-YamlSingleQuoted 参照）。
+            # 単一引用符スカラーの規則どおり '' を ' へ戻して読み取る。
+            if ($configLine -match "^\s*path:\s*'(.*)'\s*$") {
+                $sawDataSourcePath = $true
+                $rawSamplePath = $Matches[1] -replace "''", "'"
+                if (-not (Test-Path -LiteralPath $rawSamplePath)) {
+                    $missingSampleFiles.Add($rawSamplePath)
+                }
+            }
+        }
+        if (-not $sawDataSourcePath) {
+            # 想定した path: 行が1件も見つからない場合は、想定外の内容の
+            # hakutaku.yaml が置かれていたとみなし、安全側に倒して作り直す。
+            throw "data_sources の path: 行が見つかりませんでした。"
+        }
+        if ($missingSampleFiles.Count -gt 0) {
+            $needsRegenerate = $true
+            Write-Host "既存のサンプルが古いため作り直します: $sampleConfigPath"
+            Write-Host "  設定が指すファイルのうち $($missingSampleFiles.Count) 件が見つかりません:"
+            foreach ($missingSampleFile in $missingSampleFiles) {
+                Write-Host "    $missingSampleFile"
+            }
+        }
+    }
+    catch {
+        $needsRegenerate = $true
+        Write-Host "既存のサンプルの設定を解析できなかったため作り直します: $sampleConfigPath （$($_.Exception.Message)）"
+    }
+}
+
+if ($RegenerateSamples -or $needsRegenerate) {
     $generatorPath = Join-Path $PSScriptRoot "generate-sample-logs.ps1"
     if (-not (Test-Path -LiteralPath $generatorPath)) {
         throw "サンプル生成スクリプトが見つかりません: $generatorPath"

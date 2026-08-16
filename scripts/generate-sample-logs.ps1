@@ -34,7 +34,9 @@
     | `06-unconfirmed-tail.log` | 末尾が行の途中で終わる未確定行（`LOG-026`） |
     | `07-leading-no-datetime.log` | 先頭の日時なし行が破棄されないこと（`LOG-014`） |
     | `08-large.log` | 仮想スクロール、行番号ジャンプ、コピー上限（`PERF-007`、`COPY-004`／`005`） |
-    | `hakutaku.yaml` | 正常起動と事前定義データソース・解析プロファイル（`CFG-003`、`CFG-008`、`CFG-014`） |
+    | `09-mixed-app/service/legacy/western.log` | 書式・文字コードが異なる4ファイルの時系列統合（`LOG-006`〜`008`、`LOG-015`、`LOG-016`、`CFG-008`） |
+    | `10-medium-100k.log` | 10万行、事前定義データソースから常に開ける（`-LargeLineCount 0` の影響を受けない。`PERF-007`） |
+    | `hakutaku.yaml` | 正常起動と事前定義データソース・解析プロファイル（`CFG-003`、`CFG-008`、`CFG-014`）。事前定義データソースは、生成した通常のログファイルすべて（`hakutaku-invalid.yaml` と、このスクリプトが生成しない `90-locked.log`／`91-append.log` を除く）を指し、1回の起動で概ねのパターンを網羅する。すべて正常に開けるものだけで構成し、エラー確認用の項目は含めない |
     | `hakutaku-invalid.yaml` | 安全モード起動（`CFG-016`） |
 
     `02-dt-004.log`（`YYYY/MM/DD HH:mm:ss:SS`）は、自動判定では必ず
@@ -246,6 +248,36 @@ else {
     Write-Host "08-large.log は -LargeLineCount 0 のため生成しません。"
 }
 
+# --- 09: 異種ログ4ファイル（書式・文字コードの異なる時系列統合） ------------
+# 05 節（同形式・3ファイル）に対し、書式・文字コードが異なる複数ログの統合
+# 表示を確認するためのセット（LOG-006〜008、LOG-015、LOG-016、CFG-008）。
+# 05 節と同じ理由で、開始時刻を数ミリ秒ずつずらし、統合表示で4ファイルの
+# 行が交互に並ぶようにする（同時刻だと日時だけでは順序が決まらない）。
+New-Sample -FileName "09-mixed-app.log" -LineCount 300 `
+    -Purpose "異種ログの時系列統合／アプリ（LOG-DT-001、UTF-8、継続行あり。LOG-006〜008、LOG-015、LOG-016、CFG-008）" `
+    -Start $StartTimestamp.AddMilliseconds(0) `
+    -ExtraParameters @{ Format = 'LOG-DT-001'; Encoding = 'Utf8NoBom'; ContinuationLineRate = 0.15; Seed = 7 } | Out-Null
+New-Sample -FileName "09-mixed-service.log" -LineCount 300 `
+    -Purpose "異種ログの時系列統合／サービス（LOG-DT-002、UTF-8 BOM。LOG-006〜008、LOG-015、LOG-016、CFG-008）" `
+    -Start $StartTimestamp.AddMilliseconds(3) `
+    -ExtraParameters @{ Format = 'LOG-DT-002'; Encoding = 'Utf8Bom' } | Out-Null
+New-Sample -FileName "09-mixed-legacy.log" -LineCount 300 `
+    -Purpose "異種ログの時系列統合／旧システム（LOG-DT-005、CP932。LOG-006〜008、LOG-015、LOG-016、CFG-008）" `
+    -Start $StartTimestamp.AddMilliseconds(5) `
+    -ExtraParameters @{ Format = 'LOG-DT-005'; Encoding = 'CP932' } | Out-Null
+New-Sample -FileName "09-mixed-western.log" -LineCount 300 `
+    -Purpose "異種ログの時系列統合／海外拠点（LOG-DT-003、CP1252。LOG-006〜008、LOG-015、LOG-016、CFG-008）" `
+    -Start $StartTimestamp.AddMilliseconds(9) `
+    -ExtraParameters @{ Format = 'LOG-DT-003'; Encoding = 'CP1252' } | Out-Null
+
+# --- 10: 10万行のログ（データソースから常に開けるようにする） -------------
+# -LargeLineCount 0 で 08-large.log を省略した場合でも、事前定義データソース
+# の「10 大きめのログ（100,000行）」は常に開けるようにするため、行数を
+# 固定（-LargeLineCount の影響を受けない）で生成する（PERF-007）。
+New-Sample -FileName "10-medium-100k.log" -LineCount 100000 `
+    -Purpose "大きめのログ、事前定義データソースから常に開ける（PERF-007）" `
+    -ExtraParameters @{ ProgressEveryLines = 50000 } | Out-Null
+
 # --- 設定ファイル --------------------------------------------------------
 
 function Format-YamlSingleQuoted {
@@ -258,12 +290,69 @@ function Format-YamlSingleQuoted {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
-$sampleDirYaml = Format-YamlSingleQuoted -Value ($OutputDir.TrimEnd('\'))
-$basicYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "01-basic-utf8.log")
-$missingYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "99-missing.log")
 $cp932Yaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "03-encoding-cp932.log")
 $cp1252Yaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "03-encoding-cp1252.log")
 $dt004Yaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "02-dt-004.log")
+$mixedLegacyYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "09-mixed-legacy.log")
+$mixedWesternYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir "09-mixed-western.log")
+
+# 事前定義データソースの一覧（ファイル名 → 表示名の対応表）。「1回実行すれば
+# 概ねのパターンを網羅した状態でアプリが起動する」ようにするため、生成した
+# 通常のログファイルすべて（hakutaku-invalid.yaml と、このスクリプトが生成
+# しない 90-locked.log／91-append.log を除く）を data_sources へ登録する。
+# 順序はファイル名の昇順（このスクリプトの生成順）に揃えている。ADR-0008に
+# より data_sources の記載順がそのまま source_ordinal（時系列統合表示の並び
+# 順）になるため、順序を変えると 4.8 節の期待結果も変わる。ファイルが増える
+# たびに変数を1つずつ増やす代わりにこの対応表を foreach で回すことで、
+# 20件超の記述の重複を避けている（08-large.log の条件付き追加も同じ仕組み）。
+$dataSourceFiles = [System.Collections.Generic.List[object]]::new()
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "01-basic-utf8.log"; DisplayName = "01 基本のログ（2,000行）" })
+$dtDisplayNames = @(
+    "02 日時書式 LOG-DT-001（ミリ秒3桁）",
+    "02 日時書式 LOG-DT-002（ハイフン区切り・ミリ秒3桁）",
+    "02 日時書式 LOG-DT-003（1/100秒2桁）",
+    "02 日時書式 LOG-DT-004（1/100秒2桁・コロン区切り）",
+    "02 日時書式 LOG-DT-005（秒精度）",
+    "02 日時書式 LOG-DT-006（分精度）"
+)
+foreach ($index in 1..6) {
+    $dataSourceFiles.Add([PSCustomObject]@{
+            FileName    = ("02-dt-00{0}.log" -f $index)
+            DisplayName = $dtDisplayNames[$index - 1]
+        })
+}
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "03-encoding-utf8-bom.log"; DisplayName = "03 文字コード UTF-8 BOM あり" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "03-encoding-cp932.log"; DisplayName = "03 文字コード CP932" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "03-encoding-cp1252.log"; DisplayName = "03 文字コード CP1252（西欧言語）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "04-continuation.log"; DisplayName = "04 継続行（約2割が日時なし）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "05-merge-a.log"; DisplayName = "05 統合 a（同形式・+0ms）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "05-merge-b.log"; DisplayName = "05 統合 b（同形式・+7ms）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "05-merge-c.log"; DisplayName = "05 統合 c（同形式・+13ms）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "06-unconfirmed-tail.log"; DisplayName = "06 未確定行（末尾が改行で終わらない）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "07-leading-no-datetime.log"; DisplayName = "07 先頭の日時なし行" })
+if ($LargeLineCount -gt 0) {
+    # 08-large.log は実際に生成したときだけ登録する（存在しないファイルを指す
+    # データソースを作らないため。事前定義データソースはすべて正常に開ける
+    # ものだけで構成する方針は DESCRIPTION のとおり）。行数表記は実際に生成
+    # した値へ合わせる（既定の 300000 以外を指定した場合も追従する）。
+    $largeLineCountText = $LargeLineCount.ToString("N0", [System.Globalization.CultureInfo]::InvariantCulture)
+    $largeDisplayName = "08 大きいログ（{0}行）" -f $largeLineCountText
+    $dataSourceFiles.Add([PSCustomObject]@{ FileName = "08-large.log"; DisplayName = $largeDisplayName })
+}
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "09-mixed-app.log"; DisplayName = "09 異種 アプリ（LOG-DT-001／UTF-8／継続行あり）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "09-mixed-service.log"; DisplayName = "09 異種 サービス（LOG-DT-002／UTF-8 BOM）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "09-mixed-legacy.log"; DisplayName = "09 異種 旧システム（LOG-DT-005／CP932）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "09-mixed-western.log"; DisplayName = "09 異種 海外拠点（LOG-DT-003／CP1252）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "10-medium-100k.log"; DisplayName = "10 大きめのログ（100,000行）" })
+
+$dataSourceLines = [System.Collections.Generic.List[string]]::new()
+foreach ($entry in $dataSourceFiles) {
+    $entryPathYaml = Format-YamlSingleQuoted -Value (Join-Path $OutputDir $entry.FileName)
+    $entryNameYaml = Format-YamlSingleQuoted -Value $entry.DisplayName
+    $dataSourceLines.Add("  - name: $entryNameYaml")
+    $dataSourceLines.Add("    path: $entryPathYaml")
+}
+$dataSourceBlock = $dataSourceLines -join "`n"
 
 # 値の正本は crates/config/src/load.rs のバリデータ。ここでは省略可能な項目を
 # 省き、動作確認に必要な data_sources と log_profiles だけを明示する
@@ -277,13 +366,10 @@ config_version: 1
 
 # 事前定義データソース（CFG-003、PROD-006）。左ペインの「参照対象」一覧に
 # 名前で並び、クリックで開けます。パスはフロントエンドへ渡しません（SEC-012）。
+# 生成した通常のログファイルすべてを指すため、この設定だけで概ねのパターンを
+# 開けます（-LargeLineCount 0 のときは 08-large.log の分だけ1件減ります）。
 data_sources:
-  - name: 'サンプル: 基本のログ'
-    path: $basicYaml
-  - name: 'サンプル: フォルダ（未対応の確認用）'
-    path: $sampleDirYaml
-  - name: 'サンプル: 存在しないファイル（エラー表示の確認用）'
-    path: $missingYaml
+$dataSourceBlock
 
 # ログ解析プロファイル（CFG-008、LOG-021）。glob 記号を含まない path_pattern は
 # 絶対パス完全一致として扱われます。encoding に指定できるのは auto または
@@ -306,7 +392,27 @@ log_profiles:
     path_pattern: $dt004Yaml
     priority: 0
     datetime_format: LOG-DT-004
+  # 異種ログの文字コードを実行環境の ANSI コードページに左右されず確定させる
+  # ため（統合表示の期待結果を環境非依存にするため）、09-mixed-legacy.log／
+  # 09-mixed-western.log にも明示のプロファイルを与える。
+  - name: 'サンプル: 異種 旧システム（CP932）'
+    path_pattern: $mixedLegacyYaml
+    priority: 0
+    encoding: auto
+    ansi_codepage: 932
+  - name: 'サンプル: 異種 海外拠点（CP1252）'
+    path_pattern: $mixedWesternYaml
+    priority: 0
+    encoding: windows-1252
 "@
+
+# here-string 部分はスクリプトファイル自身の改行（既定 CRLF）で書き出される
+# が、$dataSourceBlock は -join "`n" で組み立てているため LF のみになり、
+# そのまま書き出すと1ファイル内で改行コードが混在する。利用者が実行ファイル
+# 直下へコピーして編集する設定ファイルのため、混在は避けたい。スクリプト
+# ファイル自身が LF で取得された環境（改行コード変換を伴うチェックアウト設定
+# など）でも結果が変わらないよう、一度 LF へ正規化してから CRLF へ揃える。
+$configText = ($configText -replace "`r`n", "`n") -replace "`n", "`r`n"
 
 $configPath = Join-Path $OutputDir "hakutaku.yaml"
 Set-Content -LiteralPath $configPath -Value $configText -Encoding utf8NoBOM
