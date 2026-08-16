@@ -275,6 +275,9 @@ body {
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
+  /* 強調・識別に文字サイズを使わない方針の適用（Issue #9）。既定（1rem）の
+   * ままだと本文より大きく見えるため、本文相当へ揃える。 */
+  font-size: 0.85rem;
   border: 1px solid #ddd;
   border-bottom: none;
   border-radius: 4px 4px 0 0;
@@ -347,10 +350,18 @@ body {
 
 .log-toolbar__label {
   font-weight: bold;
+  /* 長いソース名は字内で折り返さず省略表示する（Issue #9。字内折り返しを
+   * 許すと CJK の長い名前でツールバーが複数行に伸び、ログ表示領域を圧迫
+   * するため）。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .log-toolbar__count {
   color: #666;
+  white-space: nowrap;
 }
 
 /*
@@ -716,10 +727,9 @@ body {
 /*
  * 対象を開く操作のエラー・通知のモーダルダイアログ（ERR-002、Issue #9）。
  * src/error_panel.js が body 末尾へ遅延生成する <dialog> を showModal() で
- * 表示する。P07-1 の下部累積表示領域は、エラーのたびにパネルが積み重なる
- * 違和感への利用者フィードバックを受け、Issue #9 でこのダイアログへ
- * 置き換えた。#config-banners（画面上部、起動時の非致命的通知）は従来
- * どおり別機構のまま変更しない。
+ * 1件ずつ表示し、画面へ累積させない（同時多発時は src/error_panel.js の
+ * キューで順に表示する）。#config-banners（画面上部、起動時の非致命的通知）
+ * は別機構であり、ここでは扱わない。
  */
 .status-dialog {
   max-width: min(560px, 90vw);
@@ -730,7 +740,6 @@ body {
   border: 1px solid #c0341f;
   border-radius: 6px;
   font-size: 0.85rem;
-  text-align: left;
   line-height: 1.5;
   background: #fdeaea;
   color: #7a1212;
@@ -752,6 +761,10 @@ body {
   margin: 0;
   font-weight: bold;
   word-break: break-all;
+  /* showModal() の自動フォーカスをプログラムで当てる先（tabindex="-1"）で
+   * あり、クリック・Tab で操作する対象ではないため、フォーカスリングは
+   * 表示しない。 */
+  outline: none;
 }
 
 .status-dialog__text {
@@ -781,9 +794,15 @@ body {
   font-family: "Consolas", "Yu Gothic UI", monospace;
 }
 
-/* 「閉じる」ボタンの行。ボタン自体は他の操作ボタンと同じ既定の見た目にする。 */
+/* 「閉じる」ボタンの行。ボタン自体は他の操作ボタンと同じ既定の見た目にする。
+ * 内容が長く .status-dialog 内部がスクロールする場合でも「閉じる」が常に
+ * 見えるよう、ダイアログの下端へ張り付ける。 */
 .status-dialog__footer {
   margin: 14px 0 0;
   display: flex;
   justify-content: flex-end;
+  position: sticky;
+  bottom: 0;
+  padding-top: 8px;
+  background: inherit;
 }

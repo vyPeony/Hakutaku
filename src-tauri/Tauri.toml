@@ -37,6 +37,10 @@ frontendDist = "../src"
 #   resizable  = true
 #   fullscreen = false
 #
+# width / height / minWidth / minHeight は論理ピクセルです。初期サイズ
+# （width / height）は起動時にモニタの論理サイズへ丸めます
+# （実装は src-tauri/src/lib.rs の clamped_initial_window_size）。
+#
 # devtools（SEC-011）: WindowConfig / WebviewWindowBuilder には `devtools: Option<bool>`
 # があります（tauri-utils-2.9.3/src/config.rs 2173行目、
 # tauri-2.11.5/src/webview/webview_window.rs 1167行目の `.devtools(bool)`）。

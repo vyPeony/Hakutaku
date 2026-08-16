@@ -2,20 +2,17 @@
 //
 // `ERR-002` の5要素（対象・発生位置・理由・継続可否・次操作）を構造化して
 // 表示する共通コンポーネント。`src/banner.js`（#config-banners、画面上部）が
-// 扱う CFG-015／CFG-016 の起動時通知とは別の機構で、対象を開く・再試行する
+// 扱う `CFG-015`、`CFG-016` の起動時通知とは別の機構で、対象を開く・再試行する
 // 操作（src/shell.js）から呼ばれる。
 //
-// 表示方式: P07-1 の旧裁定「操作をブロックしない・モーダルにしない」のもとでは
-// 画面下部の累積表示領域へパネルを積み重ねていたが、エラーのたびにパネルが
-// 増えていく違和感への利用者フィードバックを受け、Issue #9 の裁定で
-// 「モーダルダイアログで1回表示」へ変更した。`ERR-002` が規定するのは5要素の
-// 内容であり、表示の方式・領域は規定していないため、この変更で要件との対応は
-// 変わらない。HTML ネイティブの <dialog> を遅延生成して `showModal()` で
-// 表示し、閉じる手段はダイアログ内の「閉じる」ボタンと <dialog> ネイティブの
-// Esc の2つ。連続して呼ばれた場合は、開いているダイアログの内容を最新の
-// 1件へ置き換える（積み重ねない）。
+// 表示方式: モーダルダイアログで1件ずつ表示し、画面へ累積させない
+// （Issue #9 の裁定）。同時期に複数のエラー・通知が発生した場合は表示待ち
+// キューへ積み、利用者が1件閉じるたびに次の1件を表示する（取りこぼさない）。
+// `ERR-002` が規定するのは5要素の内容であり、表示の方式・領域は規定していない。
+// HTML ネイティブの <dialog> を遅延生成して `showModal()` で表示し、閉じる
+// 手段はダイアログ内の「閉じる」ボタンと <dialog> ネイティブの Esc の2つ。
 //
-// `ERR-002` は「`DIAG-003`／`DIAG-004` により実値の表示を制限しないため、
+// `ERR-002` は「`DIAG-003`、`DIAG-004` により実値の表示を制限しないため、
 // 原因調査に必要であればフルパスを表示してよい」と定めている。このモジュールは
 // いずれのフィールドもマスキング・切り詰めしない。
 //
@@ -26,25 +23,55 @@
  */
 
 /**
- * モジュール全体で使い回す単一の <dialog>（遅延生成）。表示のたびに内容を
- * 丸ごと作り直すため、画面に出るのは常に最新の1件だけになる。
+ * 表示待ちの通知1件分。
+ *
+ * - `className`: <dialog> に設定するクラス（基本の `status-dialog`、情報
+ *   バリアントは `status-dialog--info` を追加）
+ * - `headingText`: 見出しの文。aria-label にも同じ文を使う
+ * - `buildBody`: 見出しと「閉じる」フッターの間に入る本文要素を組み立てる。
+ *   キューから取り出されて表示される瞬間に呼ばれる
+ *
+ * @typedef {{
+ *   className: string,
+ *   headingText: string,
+ *   buildBody: () => Node[],
+ * }} PendingNotice
+ */
+
+/**
+ * モジュール全体で使い回す単一の <dialog>（遅延生成）。
  *
  * @type {HTMLDialogElement | null}
  */
 let sharedDialog = null;
+
+/**
+ * 表示待ちの通知キュー（FIFO）。ダイアログが開いている間に届いた表示要求を
+ * ここへ積み、利用者が1件閉じるたびに先頭から取り出して表示する。
+ *
+ * @type {PendingNotice[]}
+ */
+const pendingNotices = [];
 
 /** 共有の <dialog> を body の末尾に用意する（無ければ作る）。 */
 function ensureDialog() {
   if (!sharedDialog) {
     const dialog = document.createElement("dialog");
     // 「閉じる」ボタンでも Esc（<dialog> ネイティブ）でも close イベントを
-    // 通るため、閉じ方によらずここで内容を空にし、古い表示を残さない。
-    // close イベントは close() から同期では呼ばれず、キューされたタスクとして
-    // 遅れて発火する（HTML 仕様）。発火時点で次の表示が既に開き直していた
-    // 場合に、その表示中の内容まで消してしまわないよう、閉じたままのとき
-    // だけ空にする。
+    // 通るため、閉じ方によらずここでキューの次の1件へ進める。close イベントは
+    // close() から同期では呼ばれず、キューされたタスクとして遅れて発火する
+    // （HTML 仕様）。close() 直後の閉じた状態を見た新しい表示要求が、発火
+    // までの間に直接開き直している場合があるため、閉じたままのときだけ
+    // 次を取り出し、表示中の内容を上書きしない。
     dialog.addEventListener("close", () => {
-      if (!dialog.open) {
+      if (dialog.open) {
+        return;
+      }
+      const next = pendingNotices.shift();
+      if (next) {
+        renderNotice(dialog, next);
+      } else {
+        // 表示待ちが無ければ内容を空にし、閉じたダイアログへ古い表示を残さない。
         dialog.textContent = "";
       }
     });
@@ -55,21 +82,60 @@ function ensureDialog() {
 }
 
 /**
- * 組み立て済みのダイアログをモーダル表示する。既に開いている場合は何も
- * しない（`dialog.open` のまま `showModal()` を再呼び出しすると
- * InvalidStateError になるため必ずガードする。その場合、呼び出し側が
- * 内容を最新の1件へ置き換え済みで、開いたままのダイアログにそのまま映る）。
+ * 表示要求の共通入口。ダイアログが閉じていればすぐ表示し、開いていれば
+ * キューへ積んで、利用者が現在の1件を閉じたときに順に表示する。
  *
- * @param {HTMLDialogElement} dialog
+ * 開いているダイアログの内容をその場で差し替える経路は持たない。差し替えると
+ * フォーカスの当たっていた要素が消えてフォーカスが body へ落ち、支援技術へ
+ * 新しい内容が通知されず、読み終える前のエラーが黙って消えるため、表示は
+ * 常に「閉じた状態からの showModal()」だけにする。
+ *
+ * @param {PendingNotice} notice
  */
-function presentDialog(dialog) {
-  if (!dialog.open) {
-    dialog.showModal();
+function requestNotice(notice) {
+  const dialog = ensureDialog();
+  if (dialog.open) {
+    pendingNotices.push(notice);
+    return;
   }
+  renderNotice(dialog, notice);
 }
 
 /**
- * ダイアログ末尾の「閉じる」ボタン行を作る。
+ * 通知1件をダイアログへ描画してモーダル表示する。閉じた状態のダイアログに
+ * 対してだけ呼ぶ（開いたままの差し替えはしない。`requestNotice` 参照）。
+ *
+ * @param {HTMLDialogElement} dialog
+ * @param {PendingNotice} notice
+ */
+function renderNotice(dialog, notice) {
+  dialog.textContent = "";
+  dialog.className = notice.className;
+  dialog.setAttribute("aria-label", notice.headingText);
+
+  const heading = document.createElement("p");
+  heading.className = "status-dialog__heading";
+  heading.textContent = notice.headingText;
+  // showModal() の自動フォーカスは、既定では最初のフォーカス可能要素＝末尾の
+  // 「閉じる」ボタンに当たる。それだと内容が長いときに末尾までスクロール
+  // した状態で開き、非同期表示の瞬間に打鍵中だった Enter がそのまま
+  // 「閉じる」を押して即閉じし得る。tabindex="-1" と autofocus で自動
+  // フォーカスを見出しへ向け、先頭から読める状態で開くようにする。
+  heading.tabIndex = -1;
+  heading.setAttribute("autofocus", "");
+  dialog.appendChild(heading);
+
+  for (const node of notice.buildBody()) {
+    dialog.appendChild(node);
+  }
+
+  dialog.appendChild(buildCloseFooter(dialog));
+  dialog.showModal();
+}
+
+/**
+ * ダイアログ末尾の「閉じる」ボタン行を作る。ボタンは他の操作ボタンと同じ
+ * 既定の見た目のため、ボタン専用のクラスは付けない。
  *
  * @param {HTMLDialogElement} dialog
  */
@@ -79,7 +145,6 @@ function buildCloseFooter(dialog) {
 
   const closeButton = document.createElement("button");
   closeButton.type = "button";
-  closeButton.className = "status-dialog__close";
   closeButton.textContent = "閉じる";
   closeButton.addEventListener("click", () => dialog.close());
   footer.appendChild(closeButton);
@@ -108,49 +173,45 @@ function buildDefinitionRow(term, description) {
 /**
  * `ERR-002` の5要素を持つ利用者向けエラーを、モーダルダイアログで表示する。
  * 対象・発生位置・理由・継続可否・次操作のすべてを構造化して表示し、
- * いずれもマスキングしない（フルパスを含んでよい）。
+ * いずれもマスキングしない（フルパスを含んでよい）。別の通知を表示中の
+ * 場合は、それが閉じられた後に順に表示される。
  *
  * @param {UserFacingErrorDto} error
  */
 export function showTargetError(error) {
-  const dialog = ensureDialog();
-  dialog.textContent = "";
-  dialog.className = "status-dialog";
-  dialog.setAttribute("aria-label", "対象を開けませんでした");
+  requestNotice({
+    className: "status-dialog",
+    headingText: "対象を開けませんでした",
+    buildBody: () => {
+      const list = document.createElement("dl");
+      list.className = "status-dialog__fields";
 
-  const heading = document.createElement("p");
-  heading.className = "status-dialog__heading";
-  heading.textContent = "対象を開けませんでした";
-  dialog.appendChild(heading);
+      const rows = [
+        ["対象", error.target],
+        ["発生位置", error.location ?? "（特定できません）"],
+        ["理由", error.reason],
+        ["継続可否", error.continuable ? "継続可能（他の対象は引き続き閲覧できます）" : "続行不可"],
+        ["次の操作", error.next_action],
+      ];
+      if (error.error_code) {
+        rows.push(["エラーコード", error.error_code]);
+      }
+      for (const [term, description] of rows) {
+        const [dt, dd] = buildDefinitionRow(term, description);
+        list.appendChild(dt);
+        list.appendChild(dd);
+      }
 
-  const list = document.createElement("dl");
-  list.className = "status-dialog__fields";
-
-  const rows = [
-    ["対象", error.target],
-    ["発生位置", error.location ?? "（特定できません）"],
-    ["理由", error.reason],
-    ["継続可否", error.continuable ? "継続可能（他の対象は引き続き閲覧できます）" : "続行不可"],
-    ["次の操作", error.next_action],
-  ];
-  if (error.error_code) {
-    rows.push(["エラーコード", error.error_code]);
-  }
-  for (const [term, description] of rows) {
-    const [dt, dd] = buildDefinitionRow(term, description);
-    list.appendChild(dt);
-    list.appendChild(dd);
-  }
-  dialog.appendChild(list);
-
-  dialog.appendChild(buildCloseFooter(dialog));
-  presentDialog(dialog);
+      return [list];
+    },
+  });
 }
 
 /**
  * `LOG-022` の非致命的な通知（日時未解析の生表示へ退避したことの案内）を、
  * 同じダイアログ機構の情報バリアント（青系）で表示する。エラーではないため
- * `showTargetError` の赤系とは区別できる控えめな配色にする。
+ * `showTargetError` の赤系とは区別できる控えめな配色にする。別の通知を
+ * 表示中の場合は、それが閉じられた後に順に表示される。
  *
  * 手動でのログ解析プロファイル選択（P07-2）と日時書式選択は、
  * 対象一覧（`src/shell.js`）の行内に常設される
@@ -161,27 +222,20 @@ export function showTargetError(error) {
  * @param {string} targetLabel 対象の表示名。
  */
 export function showRawDisplayFallbackNotice(targetLabel) {
-  const dialog = ensureDialog();
-  dialog.textContent = "";
-  dialog.className = "status-dialog status-dialog--info";
   const headingText = `${targetLabel}: 日時未解析の生表示で開きました`;
-  dialog.setAttribute("aria-label", headingText);
-
-  const heading = document.createElement("p");
-  heading.className = "status-dialog__heading";
-  heading.textContent = headingText;
-  dialog.appendChild(heading);
-
-  const text = document.createElement("p");
-  text.className = "status-dialog__text";
-  text.textContent =
-    "日時書式またはログ解析プロファイルを一意に決定できなかったため、" +
-    "全行を日時未解析のまま表示しています（LOG-022）。参照対象一覧のこの対象の" +
-    "行から、ログ解析プロファイルと日時書式のいずれか、または両方を指定して" +
-    "開き直すことができます。設定ファイルに書いていないファイルでも、" +
-    "日時書式（LOG-DT-001〜006）を選べばその書式で解析できます。";
-  dialog.appendChild(text);
-
-  dialog.appendChild(buildCloseFooter(dialog));
-  presentDialog(dialog);
+  requestNotice({
+    className: "status-dialog status-dialog--info",
+    headingText,
+    buildBody: () => {
+      const text = document.createElement("p");
+      text.className = "status-dialog__text";
+      text.textContent =
+        "日時書式またはログ解析プロファイルを一意に決定できなかったため、" +
+        "全行を日時未解析のまま表示しています（LOG-022）。参照対象一覧のこの対象の" +
+        "行から、ログ解析プロファイルと日時書式のいずれか、または両方を指定して" +
+        "開き直すことができます。設定ファイルに書いていないファイルでも、" +
+        "日時書式（LOG-DT-001〜006）を選べばその書式で解析できます。";
+      return [text];
+    },
+  });
 }
