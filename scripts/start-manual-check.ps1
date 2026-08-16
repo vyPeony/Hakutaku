@@ -11,8 +11,10 @@
     行うこと:
 
     1. release ビルドの実行ファイル
-       （`target/x86_64-pc-windows-msvc/release/Hakutaku.exe`）を用意する
-       （既にあればビルドしない。`node_modules` が無ければ先に `npm ci`）
+       （`target/x86_64-pc-windows-msvc/release/Hakutaku.exe`）を毎回ビルド
+       して用意する（`node_modules` が無ければ先に `npm ci`）。変更が無い
+       ときのビルドは数秒で終わるため、既定では省略しません（Issue #24）。
+       前回のビルドのまま進めたい場合は `-SkipBuild` を使います
     2. サンプル一式を `-SampleDir` へ用意する
        （生成そのものは `scripts/generate-sample-logs.ps1` に委ねる）。既存の
        `hakutaku.yaml` があっても、それが指すファイルが1件でも見つからない
@@ -46,8 +48,14 @@
     | `none` | 実行ファイル直下の `hakutaku.yaml` を削除（無ければ何もしない） | 4.1 手順1、4.4 手順7、4.5 手順4 |
 
 .PARAMETER SkipBuild
-    ビルドを省略します。実行ファイルが無い場合は、実行すべきコマンドを示して
-    エラーで停止します（黙って古い状態のまま進めないため）。
+    ビルドを省略し、既にある実行ファイルのまま進めます。設定ファイルを
+    差し替えるだけの用途（手順書 4.1、4.4 手順7・10、4.5 手順4）で使います。
+
+    実行ファイルが無い場合は、実行すべきコマンドを示してエラーで停止します
+    （黙って古い状態のまま進めないため）。実行ファイルより後に変更された
+    ビルド入力（`src/`、`crates/`、`src-tauri/`）がある場合は、どのファイルが
+    新しいかを添えて警告します（Issue #24。古い実行ファイルで確認して
+    「直っていない」と誤判定する事故を防ぐため）。
 
 .PARAMETER NoLaunch
     準備だけ行い、アプリを起動しません。確認の途中で設定だけ差し替えたい場合に
@@ -193,12 +201,69 @@ if ($CleanUp) {
 }
 
 # --- 1. 実行ファイルの用意 -----------------------------------------------
-if (Test-Path -LiteralPath $exePath) {
-    Write-Host "実行ファイルがあるためビルドを省略します: $exePath"
-    Write-Host "  （コードを変更した場合は古い可能性があります。作り直すには 'npm run tauri -- build --no-bundle'）"
+
+# 実行ファイルより後に変更されたビルド入力を、新しい順に返す（`-SkipBuild`
+# のときだけ使う）。
+#
+# ここでいうビルド入力は、実行ファイルの中身を変えるものに限る。`src/` は
+# フロントエンド一式で、`src-tauri/Tauri.toml` の frontendDist = "../src" に
+# より実行ファイルへ埋め込まれる（そのため CSS や JS だけの変更でも作り直しが
+# 要る）。`crates/`・`src-tauri/` は Rust 側の実装。`src-tauri/gen/` は
+# tauri-build がビルド中に生成する出力であって入力ではないため除く。
+function Get-BuildInputsNewerThan {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][datetime]$Since
+    )
+
+    $generatedPrefix = (Join-Path $RepoRoot "src-tauri\gen").TrimEnd('\') + '\'
+    $newerInputs = foreach ($inputRoot in @('src', 'crates', 'src-tauri')) {
+        $inputRootPath = Join-Path $RepoRoot $inputRoot
+        if (-not (Test-Path -LiteralPath $inputRootPath)) {
+            continue
+        }
+        Get-ChildItem -LiteralPath $inputRootPath -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.LastWriteTime -gt $Since -and
+                -not $_.FullName.StartsWith($generatedPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+            }
+    }
+
+    $newerInputs | Sort-Object LastWriteTime -Descending
 }
-elseif ($SkipBuild) {
-    throw "実行ファイルが見つかりません: $exePath`n-SkipBuild を外して実行するか、先に 'npm run tauri -- build --no-bundle' を実行してください。"
+
+# 5章「次にやること」でも古さを繰り返し示すために保持する（0 は「古くない」）。
+$staleBuildInputCount = 0
+
+if ($SkipBuild) {
+    if (-not (Test-Path -LiteralPath $exePath)) {
+        throw "実行ファイルが見つかりません: $exePath`n-SkipBuild を外して実行するか、先に 'npm run tauri -- build --no-bundle' を実行してください。"
+    }
+
+    # 既定を毎回ビルドにしたため、古い実行ファイルを掴む事故はこの経路でしか
+    # 起こらない（Issue #24）。常に出る注意書きは見落とされるので、実際に
+    # 実行ファイルより新しいビルド入力があるときだけ、何が新しいかを添えて
+    # 警告する（変更していないときに警告を出すと、同じ理由で効かなくなる）。
+    $exeWriteTime = (Get-Item -LiteralPath $exePath).LastWriteTime
+    $newerBuildInputs = @(Get-BuildInputsNewerThan -RepoRoot $repoRoot -Since $exeWriteTime)
+    $staleBuildInputCount = $newerBuildInputs.Count
+    if ($newerBuildInputs.Count -gt 0) {
+        Write-Warning "実行ファイルは変更より古いままです（-SkipBuild のためビルドしません）。このまま起動すると、変更前の実行ファイルで確認することになります。"
+        Write-Host "  実行ファイル: $exePath （$($exeWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))）"
+        Write-Host "  実行ファイルより新しいビルド入力: $($newerBuildInputs.Count) 件"
+        foreach ($newerBuildInput in ($newerBuildInputs | Select-Object -First 5)) {
+            $relativeInputPath = $newerBuildInput.FullName.Substring($repoRoot.Length).TrimStart('\')
+            Write-Host "    $relativeInputPath （$($newerBuildInput.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))）"
+        }
+        if ($newerBuildInputs.Count -gt 5) {
+            Write-Host "    ほか $($newerBuildInputs.Count - 5) 件"
+        }
+        Write-Host "  最新の状態で確認するには、-SkipBuild を外して実行し直してください。"
+    }
+    else {
+        Write-Host "ビルドを省略します（-SkipBuild）: $exePath"
+        Write-Host "  実行ファイルより新しいビルド入力はありません。"
+    }
 }
 else {
     # 依存が未取得のままでは tauri CLI 自体が起動できないため、ビルドより先に
@@ -217,7 +282,8 @@ else {
         }
     }
 
-    Write-Host "release ビルドを実行します（数分かかります）: npm run tauri -- build --no-bundle"
+    Write-Host "release ビルドを実行します: npm run tauri -- build --no-bundle"
+    Write-Host "  （変更が無ければ数秒で終わります。src/ のフロントエンドまたは Rust 側を変更した場合は数分かかります）"
     Push-Location $repoRoot
     try {
         & npm run tauri -- build --no-bundle
@@ -361,7 +427,14 @@ Write-Host ""
 Write-Host "次にやること"
 Write-Host "  確認手順: $manualCheckPath"
 Write-Host "  サンプル: $SampleDir"
-Write-Host "  実行ファイル: $exePath"
+if ($staleBuildInputCount -gt 0) {
+    # 冒頭の警告は、この一覧まで読み進める間に流れてしまう。確認を始める直前に
+    # もう一度、実行ファイルが古いままであることを示す（Issue #24）。
+    Write-Host "  実行ファイル: $exePath （古いままです。$staleBuildInputCount 件の変更が反映されていません）"
+}
+else {
+    Write-Host "  実行ファイル: $exePath"
+}
 Write-Host "  現在の設定: $ConfigMode （$exeConfigPath）"
 Write-Host ""
 Write-Host "  設定を差し替える（手順書 4.1、4.4 手順7・10、4.5 手順4）。アプリを終了してから実行してください:"

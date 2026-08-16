@@ -6,6 +6,10 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 *.json text eol=lf
+# Tauri CLI（tauri build）は src-tauri/Cargo.toml を読み書きし、CRLF の場合は
+# LF へ書き換える。作業ツリーを CRLF のままにすると、ビルドのたびに
+# 'M src-tauri/Cargo.toml'（内容の差分は0行）が現れる（Issue #24）。
+*.toml text eol=lf
 *.sh text eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
