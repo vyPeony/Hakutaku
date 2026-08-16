@@ -113,6 +113,15 @@ if !ok {
 
 要件 ID・ADR の対応は、実装が正しいことの証明ではなく、読み手が正本文書へたどり着くための道しるべです。要件そのものの内容はコメントへ複製せず、要件文書側を参照します。
 
+### 既存コードにある `tasks/...` への参照
+
+既存のコメント（本書の例を含む）には、`tasks/phase-03-configuration.md` のようなフェーズ計画への参照が残っています。**`tasks/` は 2026-08-16 に削除しました。** ローカル開発時の実装計画であり、段階0（P00〜P12）の完了により役目を終えたためです。参照先の内容は次で確認できます。
+
+- 削除前の全文: Git 履歴（[Issue #17](https://github.com/vyPeony/Hakutaku/issues/17)）
+- 未完了・未着手だった内容: [Issue #12](https://github.com/vyPeony/Hakutaku/issues/12)（段階1検証）、[#13](https://github.com/vyPeony/Hakutaku/issues/13)（後続バックログ）、[#14](https://github.com/vyPeony/Hakutaku/issues/14)〜[#16](https://github.com/vyPeony/Hakutaku/issues/16)
+
+既存の参照は、設計判断の由来を示す記述として残しています。**新しいコメントでは `tasks/` を参照しません。** 要件 ID、ADR、Issue 番号を使ってください。
+
 ## テストコードの受け入れ条件コメント
 
 `tests/` および `#[cfg(test)]` 内のテスト関数には、テスト関数名や個々のアサーションを言い換える行内コメントではなく、そのテストが検証する受け入れ条件を、対応する要件 ID とともに `#[test]` の直前へ書きます。書式は次のいずれかです。

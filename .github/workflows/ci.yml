@@ -95,7 +95,7 @@ jobs:
               .gitattributes) run=true ;;
 
               # --- 検査結果に影響しないもの ---
-              docs/*|tasks/*|scripts/*|.claude/*|.github/*) ;;
+              docs/*|scripts/*|.claude/*|.github/*) ;;
               *.md|LICENSE|.gitignore|.editorconfig) ;;
 
               # --- 未分類は安全側で実行する ---

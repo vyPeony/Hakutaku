@@ -12,7 +12,7 @@
 - `WebView2` と `WebView2Runtime` という似た名前の2つのフォルダの役割の違い
 - 開発環境で Fixed Version Runtime を配置・使用するための設定キーと手順
 
-実装は [`src-tauri/src/bootstrap/`](../../src-tauri/src/bootstrap/) 配下（`runtime.rs`、`acl.rs`、`notify.rs`、`layout.rs`、`process.rs`）にあります。要件と受け入れ条件の正本は [`tasks/phase-01-bootstrap-webview2.md`](../../tasks/phase-01-bootstrap-webview2.md)（P01）です。ビルド対象・Fixed Version Runtime の固定版・依存クレート追加時の確認手順は [Windows ビルド互換性と依存追加時の確認](windows-build-compatibility.md)を正本とし、本書では重複させません。
+実装は [`src-tauri/src/bootstrap/`](../../src-tauri/src/bootstrap/) 配下（`runtime.rs`、`acl.rs`、`notify.rs`、`layout.rs`、`process.rs`）にあります。要件の正本は[機能要件](../requirements/functional.md)（`TECH-005`、`DIST-006`〜`017`、`DIAG-001`〜`007`）で、実装時の受け入れ条件は当時の Issue / PR にあります。ビルド対象・Fixed Version Runtime の固定版・依存クレート追加時の確認手順は [Windows ビルド互換性と依存追加時の確認](windows-build-compatibility.md)を正本とし、本書では重複させません。
 
 ## 3つの解決経路（`DIST-006`、`DIST-008`、`DIST-009`）
 
@@ -24,7 +24,7 @@ Hakutaku は、Tauri を初期化する前に Rust 側で次の3経路のいず�
 
 ## 解決順序
 
-[`tasks/phase-01-bootstrap-webview2.md`](../../tasks/phase-01-bootstrap-webview2.md)の「起動手順の実装順序」で定めた手順どおりに実装されています。
+P01（起動ブートストラップ）の実装計画が定めた「起動手順の実装順序」どおりに実装されています。
 
 1. `webview2.force_fixed_version_runtime`（`DIST-017`／`CFG-023`）の先行読み込みを行う。強制指定があれば手順3へ進む
 2. 互換性のある導入済み Evergreen Runtime を確認する
@@ -64,7 +64,7 @@ webview2:
   force_fixed_version_runtime: true
 ```
 
-**P01 で読み込むのはこの1項目だけです。** 設定ファイル全体の読み込みとスキーマ検証は P03（[`tasks/phase-03-configuration.md`](../../tasks/phase-03-configuration.md) 相当）で行います。この先行読み込みは [`crates/config/src/lib.rs`](../../crates/config/src/lib.rs) の `read_fixed_runtime_preference` が担い、YAML の構文エラーやキーの型不一致があっても安全側の既定（`Auto`）へフォールバックしたうえで Runtime 解決を続行します。設定ファイル全体を安全モードとして扱うかどうかの判断（`CFG-016`）は P03 に引き継がれ、P01 では行いません。
+**P01 で読み込むのはこの1項目だけです。** 設定ファイル全体の読み込みとスキーマ検証は P03（設定基盤）で行います。この先行読み込みは [`crates/config/src/lib.rs`](../../crates/config/src/lib.rs) の `read_fixed_runtime_preference` が担い、YAML の構文エラーやキーの型不一致があっても安全側の既定（`Auto`）へフォールバックしたうえで Runtime 解決を続行します。設定ファイル全体を安全モードとして扱うかどうかの判断（`CFG-016`）は P03 に引き継がれ、P01 では行いません。
 
 ## 固定している版
 
@@ -159,6 +159,6 @@ Windows 10 では、App Container からのアクセスに `WebView2Runtime` フ
 
 ## 既知の制約（`DIST-012`）
 
-Evergreen 未導入端末では、Runtime 追加パッケージ（Fixed Version Runtime 一式）の事前配置が起動の前提条件です。Hakutaku はネットワークから WebView2 Runtime を取得しないため、この制約は実装では解消できない仕様上の制約であり、導入手順書側で案内する必要があります（`tasks/phase-01-bootstrap-webview2.md` の「後続 Issue / ADR 候補」を参照）。
+Evergreen 未導入端末では、Runtime 追加パッケージ（Fixed Version Runtime 一式）の事前配置が起動の前提条件です。Hakutaku はネットワークから WebView2 Runtime を取得しないため、この制約は実装では解消できない仕様上の制約であり、[WebView2 Runtime 導入手順書](../deployment/webview2-runtime-installation.md)で導入担当者へ案内しています。
 
 導入担当者向けの事前確認・配置手順は[WebView2 Runtime 導入手順書](../deployment/webview2-runtime-installation.md)を正本とし、本書では重複させません。

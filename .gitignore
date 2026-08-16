@@ -482,8 +482,7 @@ src-tauri/gen/schemas/
 # 任意追加パッケージとして別 ZIP で提供する。単一ファイルが 100 MB を超える）
 /runtime/
 
-# P05 のログ解析試験データ（合成データのみ、実データ禁止。
-# tasks/phase-05-log-parsing-core.md 作業項目8）。
+# ログ解析の試験データ（合成データのみ、実データ禁止）。
 # 上の Visual Studio 由来の `*.log` ルールにより既定では無視されるため、
 # crates/core-services のテスト用 fixtures だけ明示的に追跡対象へ戻す。
 !/crates/core-services/tests/fixtures/*.log

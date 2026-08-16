@@ -9,7 +9,7 @@
 
 ロードマップは期日の約束や作業状態の正本ではなく、版1.10の確定要件を満たすために不確実性を減らす順序を示します。本書の状態は、この変更が `main` へマージされた時点で採用済みになります。
 
-各タスクの目的、受け入れ条件、担当者、進捗は GitHub Issue / PR を正本とします。実装計画の詳細とフェーズ間依存は [`tasks/README.md`](../tasks/README.md)、213件の要件 ID の割り当ては [`tasks/requirement-coverage.md`](../tasks/requirement-coverage.md) を参照します。`tasks/` は計画であり、要件の正本ではありません。
+各タスクの目的、受け入れ条件、担当者、進捗は GitHub Issue / PR を正本とします。段階1（P13）の検証項目は [Issue #12](https://github.com/vyPeony/Hakutaku/issues/12)、初期リリース後（P14）の対象と除外要件の一覧は [Issue #13](https://github.com/vyPeony/Hakutaku/issues/13) が引き継いでいます。
 
 ## 実装着手前の前提（達成済み）
 
@@ -80,3 +80,4 @@ P14 は一つのリリースや一つの Issue を意味しません。SQLite、
 ## 変更履歴
 
 - 2026-07-30: 初期仕様 版 1.10 の `VER-001`～`007` と `tasks/` の P00～P14 の割り当てに合わせ、段階0・段階1・後続リリースの順序とゲートを採用済みとした。
+- 2026-08-16: ローカル開発時の実装計画ディレクトリ `tasks/`（P00～P14 のフェーズ計画と要件 ID の対応表）を削除した。段階0（P00～P12）は実装・検証とも完了したため破棄し、未着手・未完了の内容は [Issue #12](https://github.com/vyPeony/Hakutaku/issues/12)（段階1検証）、[#13](https://github.com/vyPeony/Hakutaku/issues/13)（後続バックログ）、[#14](https://github.com/vyPeony/Hakutaku/issues/14)～[#16](https://github.com/vyPeony/Hakutaku/issues/16)（残る要検討事項）へ引き継いだ。削除前の全文は Git 履歴に残る（[Issue #17](https://github.com/vyPeony/Hakutaku/issues/17)）。
