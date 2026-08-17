@@ -184,6 +184,10 @@ jobs:
           node-version: 24
       # 構文、相対 import の解決、index.html の参照先を検査する
       - run: node scripts/check-frontend.mjs
+      # 仮想スクロールの規模依存ロジック（クランプ、比例写像、破棄判定）の回帰検査。
+      # 純粋関数だけを呼ぶため試験データも WebView2 も要らない
+      # （docs/verification/regression-checks.md）
+      - run: node scripts/check-virtual-scroll.mjs
       # Markdown の相対リンクと見出しアンカーの整合を検査する（外部 URL は対象外）
       - run: node scripts/check-docs-links.mjs
       # 解析のみで、スクリプトは実行しない

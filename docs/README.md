@@ -27,6 +27,7 @@
 | 要件 | [品質要件](requirements/quality.md) | 性能、安全性、信頼性などの品質要件 |
 | 検証 | [手動での動作確認手順](verification/manual-check.md) | サンプルログの生成と、画面・操作を通した動作確認の手順 |
 | 検証 | [段階0検証記録](verification/stage0-results.md) | 段階0検証シナリオの実施結果、不成立・未実施項目の記録 |
+| 検証 | [回帰検査の対象と判定方法](verification/regression-checks.md) | 回帰を検知したい対象、自動判定してよい範囲、重い試験を CI から除外した理由 |
 | アーキテクチャ | [概要](architecture/overview.md) | 論理構成、データフロー、信頼境界 |
 | アーキテクチャ | [コネクター契約](architecture/connector-contract.md) | データソース統合境界の契約（将来構想。初期・後続リリースの確定要件では外部プラグイン機構を設けない） |
 | アーキテクチャ | [設計判断](architecture/decisions/README.md) | 重要な設計判断と理由 |

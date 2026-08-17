@@ -198,6 +198,7 @@ Rust 以外の資産を変更した場合は、次も実行します。cargo と
 | 目的 | 標準コマンド |
 | --- | --- |
 | `src/` の構文、相対 import の解決、`index.html` の参照先 | `node scripts/check-frontend.mjs` |
+| 仮想スクロールの規模依存ロジック（クランプ、比例写像、破棄判定。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-virtual-scroll.mjs` |
 | Markdown の相対リンクと見出しアンカーの整合（外部 URL は対象外） | `node scripts/check-docs-links.mjs` |
 | PowerShell スクリプトの構文解析（実行はしない） | `pwsh -File scripts/check-powershell.ps1` |
 
