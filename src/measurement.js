@@ -10,9 +10,16 @@
 //   1. `open_measurement_file` で計測用ファイルを開く
 //   2. 転送コストの実測（max_items を変えて `fetch_log_range` を反復）
 //   3. 連続スクロール検証（PERF-012 の保持上限のゲート判定）
-//   4. `record_measurement_results` で結果を logs へ送信
-//   5. 完了をウィンドウタイトルへ反映する（外部からの終了判定用。アプリの
-//      自動終了はしない。呼び出し側が taskkill する）
+//   4. `record_measurement_results` で結果を logs へ送信する。途中でエラーに
+//      なった場合も、同じ経路で失敗記録を送信する（`recordFailure`）
+//
+// 外部からの終了判定は、`logs/measurement-p04-*.json` の出現で行う（成功・
+// 失敗のどちらでも書き出される）。アプリの自動終了はしない。呼び出し側が
+// taskkill する。ウィンドウタイトルを判定に使ってはならない: Tauri 2系は
+// document.title をネイティブウィンドウのタイトルへ同期しない
+// （`on_document_title_changed` ハンドラーを登録した場合だけ変更が Rust 側へ
+// 通知される仕組みで、本アプリは登録していない）ため、外部プロセスから
+// 見えるタイトルは起動時の「Hakutaku」のまま変化しない。
 //
 // 仮想スクロールの内部状態（chunkCache 等）は log_view.js だけが所有する
 // （PERF-012 の「行データを保持する場所を1箇所に限定する」設計）。このモジュール
@@ -601,11 +608,31 @@ async function verifyContinuousScroll(retentionLimits) {
   };
 }
 
-/** 完了をウィンドウタイトルへ反映する（外部からの終了判定用）。 */
-function markCompletion(success, detail) {
-  document.title = success
-    ? "Hakutaku [MEASUREMENT_DONE]"
-    : `Hakutaku [MEASUREMENT_FAILED] ${detail ?? ""}`;
+/**
+ * 計測が途中で失敗したことを、成功時と同じ `record_measurement_results` 経路で
+ * `logs/measurement-p04-*.json` として書き残す（外部からの終了判定用。
+ * モジュール doc コメント参照）。
+ *
+ * 成功時の結果 JSON と区別できるよう、`failed: true` とエラーメッセージを持つ
+ * 最小の記録にする。この書き残し自体に失敗した場合、フロントエンドから外部へ
+ * 完了を伝える残りの手段は無い（書き込み失敗は Rust 側が診断ログへ記録する）
+ * ため、コンソールへ出力して呼び出し側のタイムアウト検出に委ねる。
+ *
+ * @param {unknown} error
+ */
+async function recordFailure(error) {
+  const failureRecord = {
+    measuredAtIso: new Date().toISOString(),
+    failed: true,
+    error: error instanceof Error ? error.message : String(error),
+  };
+  try {
+    await invoke("record_measurement_results", {
+      resultsJson: JSON.stringify(failureRecord),
+    });
+  } catch (recordError) {
+    console.error("計測失敗の記録の書き出しにも失敗しました:", recordError);
+  }
 }
 
 /**
@@ -652,9 +679,8 @@ export async function runMeasurement(retentionLimits) {
     });
 
     console.info("計測モードが完了しました。");
-    markCompletion(true);
   } catch (error) {
     console.error("計測モードの実行中にエラーが発生しました:", error);
-    markCompletion(false, error instanceof Error ? error.message : String(error));
+    await recordFailure(error);
   }
 }
