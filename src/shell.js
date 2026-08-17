@@ -330,7 +330,21 @@ async function handleReloadTargetClick(targetId) {
       // が立つ）・failed（`LOG-023` の変更検知・`LOG-027` の共有違反等、対象は
       // Error へ遷移）のいずれも `ERR-002` の5要素を持つ。モーダルダイアログ
       // （`src/error_panel.js`）で表示する（同時多発時はキューで順に表示される）。
-      showTargetError(/** @type {import("./targets.js").UserFacingErrorDto} */ (response.error));
+      //
+      // 見出しは kind によって使い分ける（Issue #11）。rejected_over_limit は
+      // 対象が Ready のまま旧スナップショットの閲覧を継続でき、拒否されたのは
+      // 「更新の反映」だけ（ADR-0007 の「更新未反映」）であるため、既定見出し
+      // 「対象を開けませんでした」は実態と食い違う。「更新を反映できません
+      // でした」へ言い換える。failed は対象が Error へ遷移し閲覧できなくなる
+      // ため、既定見出しが実態に合い、差し替えない。
+      const headingOverride =
+        response.kind === "rejected_over_limit"
+          ? { headingText: "更新を反映できませんでした" }
+          : undefined;
+      showTargetError(
+        /** @type {import("./targets.js").UserFacingErrorDto} */ (response.error),
+        headingOverride,
+      );
       await refreshTargets();
       return;
     }
