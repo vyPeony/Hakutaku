@@ -246,7 +246,15 @@ pub fn open_log_file(
             source_label.clone(),
             targets::TargetOrigin::AdHoc { path: path.clone() },
         );
-        target_guard.begin_loading(target_id);
+        // 直前に登録したばかりの target_id のため、既存の読み込みトークンは
+        // あり得ない（`begin_loading` が `None` を返すのは「既に読み込み中」の
+        // 場合だけ。Issue #31）。`debug_assert!` は式を消さないので、release
+        // ビルドでも begin_loading は実行される。
+        let token = target_guard.begin_loading(target_id);
+        debug_assert!(
+            token.is_some(),
+            "新規登録した対象に既存の読み込みトークンがあってはならない"
+        );
         target_id
     };
 

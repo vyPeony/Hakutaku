@@ -74,6 +74,34 @@
 //! なお `TargetRegistryState`（対象一覧）側のロックは従来どおり短時間の
 //! 更新ごとに取得・解放しており、この分割の対象ではありません。
 //!
+//! ## 読み込み中の対象を閉じる・やり直す（Issue #31）
+//!
+//! P06-2 の逐次登録以降、**読み込み中（[`TargetStatus::Loading`]）の対象も、
+//! 最初のバッチ境界でコア層へ登録済み**です（`hakutaku_core::
+//! register_source_with_access` の中で `insert_source` が呼ばれます）。ソース
+//! と `SourceBudget` の予約は既に生きており、統合表示集合（`LOG-007`・
+//! `LOG-008`）にも参加します。一方でその `source_id` が GUI 層へ返るのは
+//! 読み込みの終了時だけのため、読み込み中の対象一覧はまだ `source_id` を
+//! 持ちません（[`active_source_id`] が `None` を返すのはこのためです）。
+//!
+//! そこで、読み込み中の対象に対する操作は次の規則で扱います。
+//!
+//! 1. [`close_target`] は、読み込み中なら (a) キャンセルを要求し、(b)
+//!    「閉じられた」印（[`TargetRegistry::mark_close_pending`]）を付けてから
+//!    一覧から除去します。ワーカーは終端処理（[`FinishLoadGuard`]）でこの印を
+//!    回収し、自分が登録したソースを `close_source` します。印を介するのは、
+//!    閉じる時点では `source_id` がまだ分からないためです
+//! 2. [`retry_target`] は読み込み中の対象を拒否します
+//!    （[`RetryTargetResponse::AlreadyLoading`]）。受け付けると同じ対象に
+//!    ワーカーが2つでき、[`TargetRegistry::begin_loading`] のトークン上書きに
+//!    より先発ワーカーがキャンセル不能・そのソースが解放不能になります
+//! 3. [`open_config_data_source`] は、同名の対象が既に開かれている場合に
+//!    新しいワーカーを作りません（[`reserve_configured_target`]）
+//!
+//! これらが満たす不変条件は「**ワーカーがどの時点で終わっても、対象がどの
+//! 時点で閉じられても、コア側のソース・`SourceBudget` の予約・`active_loads`
+//! のトークンが残らない**」ことです。
+//!
 //! ワーカースレッドは [`tauri::AppHandle`]（`Send + Sync + 'static`。`Clone`
 //! でスレッドへ渡せる）経由で managed state を再取得し（[`run_open`]）、進捗・
 //! 完了・失敗・キャンセルを Tauri イベント（`EVENT_LOAD_PROGRESS`・
@@ -114,7 +142,7 @@
 //! `CancelledPartial` は対象外で、完全な再取得は `retry_target` を使い
 //! ます）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -186,6 +214,13 @@ struct LoadProgress {
 #[derive(Debug, Clone)]
 enum TargetStatus {
     /// 読み込み中。
+    ///
+    /// この状態でも、最初のバッチ境界を越えていればコア層にはソースが登録
+    /// 済みです（モジュール doc コメント「読み込み中の対象を閉じる・やり直す
+    /// （Issue #31）」）。ただし払い出された `source_id` は読み込みの終了時に
+    /// しか GUI 層へ返らないため、ここでは保持できません。読み込み中に閉じた
+    /// 場合の後始末は、ワーカーの終端処理（[`FinishLoadGuard`]）が
+    /// [`TargetRegistry::mark_close_pending`] の印を頼りに代行します。
     Loading { progress: Option<LoadProgress> },
     /// 読み込み済み。
     Ready {
@@ -261,7 +296,20 @@ pub(crate) struct TargetRegistry {
     /// で読み込み開始と同時に登録し、[`Self::finish_loading`] で読み込み終了
     /// （成功・失敗・キャンセルのいずれでも）時に除去します。`cancel_load`
     /// コマンド（[`Self::request_cancel`]）はここを参照します。
+    ///
+    /// ここに登録があることは「その `target_id` のワーカーが走っている（か、
+    /// 走り始める直前である）」ことと同義です。[`Self::mark_close_pending`] は
+    /// この事実を、後始末を代行してくれる相手がいるかどうかの判断に使います。
     active_loads: HashMap<u32, CancellationToken>,
+    /// 読み込み中に閉じられた対象（Issue #31）。[`close_target`] が印を付け、
+    /// ワーカーの終端処理（[`FinishLoadGuard`]）が [`Self::take_close_pending`]
+    /// で回収します。
+    ///
+    /// 対象一覧のエントリそのものは閉じた時点で消えるため、この集合が
+    /// 「エントリは無いが、コア側の後始末だけが残っている `target_id`」の
+    /// 記録になります。`target_id` は [`Self::register`] が単調増加で払い出し
+    /// 再利用しないため、印が別の対象へ誤って効くことはありません。
+    close_pending_loads: HashSet<u32>,
 }
 
 impl TargetRegistry {
@@ -270,12 +318,14 @@ impl TargetRegistry {
     ///
     /// これだけではキャンセル要求を受け付けられません（`cancel_load` が対象を
     /// 見つけられるようにするには [`Self::begin_loading`] も呼び出す必要が
-    /// あります）。呼び出し側（`open_log_file` 等）は、登録直後に
-    /// `begin_loading` を呼んでから読み込みスレッドを起動してください
-    /// （登録とキャンセル受付開始を分けているのは、`open_config_data_source`
-    /// のようにフォルダ判定など同期的な事前チェックを挟む経路があるため
-    /// です。読み込みを実際に開始しない場合は `begin_loading` を呼ばずに
-    /// 済みます）。
+    /// あります）。
+    ///
+    /// 呼び出し側は **`register` と [`Self::begin_loading`] を同じロック区間で**
+    /// 続けて呼んでください（Issue #31）。分けると、その隙間に
+    /// [`close_target`] が入って対象が消え、担当するエントリが無いまま
+    /// ワーカーだけが走る状態（＝登録したソースを誰も回収できない状態）が
+    /// 作れてしまいます。読み込みを結局開始しない経路（`open_config_data_source`
+    /// のフォルダ判定など）は、[`Self::abort_loading`] で取り消します。
     pub(crate) fn register(&mut self, display_name: String, origin: TargetOrigin) -> u32 {
         let target_id = self.next_target_id;
         self.next_target_id += 1;
@@ -298,21 +348,77 @@ impl TargetRegistry {
     /// では既にこのメソッドを呼び終えているため）確実にトークンを見つけられ、
     /// 取りこぼしません。
     ///
-    /// 未登録の `target_id` に対して呼んでも安全です（`set_status` は
-    /// 未知の ID を無視するため、その場合は真新しいトークンだけが
-    /// `active_loads` に残ります。呼び出し側は必ず [`Self::register`] または
-    /// 既存の対象に対してだけ呼び出す前提です）。
-    pub(crate) fn begin_loading(&mut self, target_id: u32) -> CancellationToken {
+    /// # `None` を返す場合（Issue #31）
+    ///
+    /// 次のどちらかの場合は **`None` を返し、状態も `active_loads` も一切
+    /// 変更しません**。いずれも「呼び出し側はワーカーを起動してはいけない」
+    /// という同じ意味です。
+    ///
+    /// 1. その `target_id` が対象一覧に無い（既に [`close_target`] された、
+    ///    または最初から存在しない）。担当するエントリが無いままワーカーを
+    ///    起動すると、登録したソースを誰も回収できません
+    /// 2. 同じ `target_id` のトークンが既にある（既に読み込み中）。トークンを
+    ///    黙って上書きすると、
+    ///    - 先発ワーカーのトークンが失われて `cancel_load` で止められなくなる
+    ///    - 先に終わった側の [`Self::finish_loading`] が後発のトークンまで消す
+    ///    - 同じファイルが二重にコア層へ登録され、対象一覧が知らない側の
+    ///      ソース・`SourceBudget` の予約が解放不能になる
+    ///
+    ///    が同時に起こります
+    ///
+    /// 呼び出し側が対象の判定（存在確認・読み込み中判定）とこの呼び出しを
+    /// 同じロック区間で行っていれば `None` にはなりません。競合に対する
+    /// 最後の防御として、上書きしない側・起動しない側へ倒します。
+    pub(crate) fn begin_loading(&mut self, target_id: u32) -> Option<CancellationToken> {
+        if self.find(target_id).is_none() || self.active_loads.contains_key(&target_id) {
+            return None;
+        }
         self.set_status(target_id, TargetStatus::Loading { progress: None });
         let token = CancellationToken::new();
         self.active_loads.insert(target_id, token.clone());
-        token
+        Some(token)
     }
 
     /// 読み込み終了を記録し、`active_loads` から除去します（成功・失敗・
     /// キャンセルのいずれでも、読み込みスレッドの最後に必ず呼びます）。
     pub(crate) fn finish_loading(&mut self, target_id: u32) {
         self.active_loads.remove(&target_id);
+    }
+
+    /// [`Self::begin_loading`] の後に「結局ワーカーを起動しない」と決めた場合の
+    /// 取り消しです（`open_config_data_source`・[`retry_target`] のフォルダ
+    /// 未対応判定。Issue #31）。
+    ///
+    /// トークンに加えて「閉じられた」印も回収します。印を残すと、回収する
+    /// ワーカーがいないまま [`Self::close_pending_loads`] へ残り続けるため
+    /// です（この経路ではコア層へのソース登録も起きていないので、後始末は
+    /// 印の破棄だけで足ります）。
+    fn abort_loading(&mut self, target_id: u32) {
+        self.finish_loading(target_id);
+        self.take_close_pending(target_id);
+    }
+
+    /// 読み込み中に閉じられたことを記録します（Issue #31）。記録できた場合
+    /// （＝ワーカーが走っており、後始末を代行してもらえる場合）に `true` を
+    /// 返します。
+    ///
+    /// ワーカーが走っていない場合（`active_loads` にトークンが無い場合）は
+    /// 記録しません。回収する相手がいない印を残すと、`close_pending_loads`
+    /// に永久に残るだけだからです。この場合、コア側にそのソースは存在しない
+    /// （ワーカーが登録する前か、既に終端処理を終えている）ため、後始末も
+    /// 必要ありません。
+    fn mark_close_pending(&mut self, target_id: u32) -> bool {
+        if !self.active_loads.contains_key(&target_id) {
+            return false;
+        }
+        self.close_pending_loads.insert(target_id);
+        true
+    }
+
+    /// [`Self::mark_close_pending`] の印を回収します（印があれば `true`）。
+    /// ワーカーの終端処理から一度だけ呼びます。
+    fn take_close_pending(&mut self, target_id: u32) -> bool {
+        self.close_pending_loads.remove(&target_id)
     }
 
     /// `target_id` の読み込みにキャンセルを要求します。読み込み中でなければ
@@ -363,13 +469,15 @@ impl TargetRegistry {
 
     /// 対象一覧からエントリを除去するだけの下請けです。コア側の表示集合・
     /// `SourceBudget` の予約を合わせて解放する判断（[`active_source_id`] が
-    /// `Some` を返す場合の `close_source` 呼び出し）は、呼び出し側の
-    /// [`close_target`] が行います（`TargetRegistry` はコア層の型を知らない
-    /// ため、ここでは行えません）。読み込み中だった場合でも `active_loads`
-    /// は明示的には除去しません（読み込みスレッドは `finish_loading` で
-    /// 自ら除去するため、ここで先に消しても実害はありませんが、一覧からの
-    /// 除去とキャンセルは独立した操作であることを明確にするため、あえて
-    /// `cancel_load` を代行しません）。
+    /// `Some` を返す場合の `close_source` 呼び出し）と、読み込み中だった場合の
+    /// キャンセル要求・「閉じられた」印は、呼び出し側の [`close_target`] が
+    /// 行います（`TargetRegistry` はコア層の型を知らないため、`close_source`
+    /// はここでは行えません）。
+    ///
+    /// `active_loads` のトークンはここでは除去しません。ワーカーが
+    /// [`Self::finish_loading`] で自ら除去するまで残しておく必要があります
+    /// （先に消すと、[`Self::mark_close_pending`] が「回収してくれる相手が
+    /// いない」と誤判定し、Issue #31 のソース孤児化が戻ります）。
     fn remove(&mut self, target_id: u32) -> bool {
         let before = self.targets.len();
         self.targets.retain(|entry| entry.target_id != target_id);
@@ -593,12 +701,22 @@ pub fn list_datetime_formats() -> Vec<DateTimeFormatDto> {
 }
 
 /// 対象が現在コア層（`hakutaku_core::DisplaySetRegistry`）に生きたまま登録
-/// されている場合、その `source_id` を返します（P06-5）。
+/// されており、**その `source_id` を対象一覧が知っている**場合に、その
+/// `source_id` を返します（P06-5）。
 ///
 /// `Ready`・`CancelledPartial` のいずれも、`register_source_with_control` が
-/// 少なくとも最初のバッチを登録済みの状態です（`SourceBudget` の予約も
-/// 生きたまま）。`Loading`（まだ登録前）・`Error`（登録されずに失敗、または
-/// 予約済みなら `register_source_with_control` 側が返却済み）は `None` です。
+/// 少なくとも最初のバッチを登録済みで、`SourceBudget` の予約も生きたままの
+/// 状態です。`Error` は、最初のバッチの登録前に失敗した（この場合コア側が
+/// 予約を返却済み）か、登録済みのまま壊れた状態としてマークされたかの
+/// どちらかで、いずれも `retry_target`・`close_target` から解放すべき
+/// `source_id` を対象一覧が保持していないため `None` です。
+///
+/// `Loading` が `None` なのは「コア側に未登録だから」**ではありません**。
+/// 読み込み中の対象も最初のバッチ境界を越えていればコア側に登録済みですが、
+/// `source_id` が GUI 層へ返るのは読み込みの終了時だけのため、対象一覧が
+/// それを保持できないだけです（モジュール doc コメント「読み込み中の対象を
+/// 閉じる・やり直す（Issue #31）」）。読み込み中の対象を閉じたときの解放は、
+/// [`close_target`] が付けた印を [`FinishLoadGuard`] が回収して代行します。
 ///
 /// [`close_target`]・[`retry_target`] がこれを使い、新しい登録の前・対象
 /// 除去の際にコア側の予約を解放します。
@@ -613,14 +731,26 @@ fn active_source_id(status: &TargetStatus) -> Option<u32> {
 /// 対象を一覧から除去します。存在しない `target_id` を渡した場合は何もせず
 /// `false` を返します（`ERR-001`: 無関係な対象の操作に影響しない）。
 ///
-/// 対象が読み込み済み（`Ready`）または部分読み込みで終了した
-/// （`CancelledPartial`）場合、コア側の表示集合と `SourceBudget` の予約も
-/// 合わせて解放します（P06-5。`register_source_with_control` が
-/// `SourceBudget` を使うようになったため、解放しないと合計サイズ・ファイル数の
-/// 上限判定に永久に計上され続けてしまう）。読み込み中・エラー状態の対象は、
-/// コア側にまだ登録されていない（`Loading`）か、最初のバッチの登録前に失敗
-/// した（`Error`。この場合 `register_source_with_control` が予約を返却済み）
-/// ため、対象一覧からの除去だけで足ります（[`active_source_id`]）。
+/// 対象一覧が `source_id` を保持している場合（`Ready`・`CancelledPartial`。
+/// [`active_source_id`]）は、コア側の表示集合と `SourceBudget` の予約も合わせて
+/// 解放します（P06-5。解放しないと合計サイズ・ファイル数の上限判定
+/// （`PERF-004`〜`006`）へ永久に計上され続け、統合表示集合にも閉じたはずの
+/// 行が残り続けます）。
+///
+/// 読み込み中（`Loading`）の対象は、コア側に登録済みかどうかにかかわらず
+/// `source_id` を対象一覧が知りません。そこで (a) キャンセルを要求し、(b)
+/// 「閉じられた」印（[`TargetRegistry::mark_close_pending`]）を残してから
+/// 一覧より除去します。実際の `close_source` は、ワーカーの終端処理
+/// （[`FinishLoadGuard`]）が印を回収して代行します（Issue #31。モジュール
+/// doc コメント「読み込み中の対象を閉じる・やり直す（Issue #31）」）。
+///
+/// キャンセルを代行するのは、閉じた対象のためにワーカーが GB 級ファイルを
+/// 読み続け、その成果が誰からも解放できない形で残るのを防ぐためです（以前は
+/// 「一覧からの除去とキャンセルは独立した操作」としてあえて代行していません
+/// でしたが、コア側に登録済みのまま孤児化する経路が生まれたため見直しました）。
+///
+/// `Error` 状態の対象は [`active_source_id`] が `None` を返し、ワーカーも
+/// 走っていないため、一覧からの除去だけで足ります。
 #[tauri::command]
 pub fn close_target(
     target_id: u32,
@@ -628,14 +758,40 @@ pub fn close_target(
     registry: State<'_, DisplaySetRegistryState>,
     budget: State<'_, hakutaku_core::SourceBudget>,
 ) -> bool {
-    let mut target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
-    let source_id = match target_guard.find(target_id) {
-        Some(entry) => active_source_id(&entry.status),
-        None => return false,
+    close_target_core(&targets.0, &registry.0, budget.inner(), target_id)
+}
+
+/// [`close_target`] の中核処理です。[`run_open_core`]・[`run_reload_core`] と
+/// 同じ理由（単体テスト容易性。`tauri::State` は動作する Tauri アプリなしには
+/// 構築できない）で、素の `Mutex`・`SourceBudget` を直接受け取ります。
+fn close_target_core(
+    targets: &Mutex<TargetRegistry>,
+    display_set_registry: &Mutex<hakutaku_core::DisplaySetRegistry>,
+    budget: &hakutaku_core::SourceBudget,
+    target_id: u32,
+) -> bool {
+    // ロックの順序は「対象一覧 → レジストリ」（既存の close_target・
+    // retry_target と同じ。逆順で取る経路を作らない）。
+    let mut target_guard = targets.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(entry) = target_guard.find(target_id) else {
+        return false;
     };
+    let source_id = active_source_id(&entry.status);
+    let is_loading = matches!(entry.status, TargetStatus::Loading { .. });
+
+    if is_loading {
+        // 印とキャンセルは同じロック区間で行う。ここでロックを手放すと、
+        // ワーカーが終端処理（印の回収）を済ませた後に印を付けてしまい、
+        // 誰も回収しないまま残る。
+        target_guard.request_cancel(target_id);
+        target_guard.mark_close_pending(target_id);
+    }
+
     if let Some(source_id) = source_id {
-        let mut registry_guard = registry.0.lock().unwrap_or_else(PoisonError::into_inner);
-        registry_guard.close_source(source_id, budget.inner());
+        let mut registry_guard = display_set_registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        registry_guard.close_source(source_id, budget);
     }
     target_guard.remove(target_id)
 }
@@ -821,6 +977,101 @@ fn run_open(app: &AppHandle, request: OpenRequest) {
     );
 }
 
+/// 読み込みワーカーの終端処理をまとめた型です（Issue #31）。
+///
+/// ワーカーは終わり方（完了・キャンセル・失敗）によらず、次の2つを必ず
+/// 行う必要があります。
+///
+/// 1. `active_loads` のキャンセルトークンを除去する
+///    （[`TargetRegistry::finish_loading`]）
+/// 2. 読み込み中に対象が閉じられていた場合（[`TargetRegistry::mark_close_pending`]
+///    の印がある場合）、自分が登録したコア側のソースを `close_source` し、
+///    `SourceBudget` の予約を解放する
+///
+/// 2 をワーカー側で行うのは、[`close_target`] の時点では `source_id` がまだ
+/// 対象一覧に無いためです。ワーカーは読み込みの終了時に必ず `source_id` を
+/// 知るので、そこが唯一の確実な回収点になります。
+///
+/// [`Self::finish`] を呼ばずに破棄された場合（読み込み中のパニックによる
+/// 巻き戻し）でも `Drop` で同じ後始末を試みます。その場合 `source_id` が
+/// 未設定でコア側のソースまでは回収できないことがありますが、少なくとも
+/// `active_loads` にトークンが残り続けること（＝閉じた後もキャンセル可能な
+/// 読み込みとして参照され続けること）は防げます。
+struct FinishLoadGuard<'a> {
+    targets: &'a Mutex<TargetRegistry>,
+    display_set_registry: &'a Mutex<hakutaku_core::DisplaySetRegistry>,
+    budget: &'a hakutaku_core::SourceBudget,
+    target_id: u32,
+    /// コア層が払い出したソース識別子。読み込みの結果が得られるまで `None`。
+    source_id: Option<u32>,
+    /// [`Self::finish`] 済みか（`Drop` で二重に走らせないための印）。
+    finished: bool,
+}
+
+impl<'a> FinishLoadGuard<'a> {
+    fn new(
+        targets: &'a Mutex<TargetRegistry>,
+        display_set_registry: &'a Mutex<hakutaku_core::DisplaySetRegistry>,
+        budget: &'a hakutaku_core::SourceBudget,
+        target_id: u32,
+    ) -> Self {
+        FinishLoadGuard {
+            targets,
+            display_set_registry,
+            budget,
+            target_id,
+            source_id: None,
+            finished: false,
+        }
+    }
+
+    /// コア層が払い出したソース識別子を記録します（読み込みの結果が
+    /// 得られた時点で呼びます）。
+    fn set_source_id(&mut self, source_id: u32) {
+        self.source_id = Some(source_id);
+    }
+
+    /// 終端処理を実行します。読み込み中に対象が閉じられていた場合は `true` を
+    /// 返します（この場合、呼び出し側は完了・失敗イベントを発行しません。
+    /// 宛先の対象が既に一覧から消えているためです）。
+    fn finish(mut self) -> bool {
+        self.finished = true;
+        self.reclaim()
+    }
+
+    fn reclaim(&mut self) -> bool {
+        // 対象一覧のロックを先に手放してからレジストリのロックを取る
+        // （「対象一覧 → レジストリ」というロック順序を守りつつ、入れ子に
+        // しない）。印を取り切ってからレジストリを触るため、この間に別経路が
+        // 同じ source_id を閉じることはない（対象一覧のエントリは既に無く、
+        // source_id を知っているのはこのワーカーだけ）。
+        let closed = {
+            let mut target_guard = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
+            target_guard.finish_loading(self.target_id);
+            target_guard.take_close_pending(self.target_id)
+        };
+        if !closed {
+            return false;
+        }
+        if let Some(source_id) = self.source_id {
+            let mut registry_guard = self
+                .display_set_registry
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            registry_guard.close_source(source_id, self.budget);
+        }
+        true
+    }
+}
+
+impl Drop for FinishLoadGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.reclaim();
+        }
+    }
+}
+
 /// [`run_open`] の中核処理です。`AppHandle` に依存せず、素の `Mutex`・
 /// `SourceBudget`・`Diagnostics` を直接受け取ります。
 ///
@@ -853,12 +1104,20 @@ fn run_open_core(
     // 呼び忘れた場合の防御。その場合は真新しいトークンが使われる）。
     let cancellation = {
         let mut guard = targets.lock().unwrap_or_else(PoisonError::into_inner);
-        guard
-            .active_loads
-            .get(&request.target_id)
-            .cloned()
-            .unwrap_or_else(|| guard.begin_loading(request.target_id))
+        match guard.active_loads.get(&request.target_id).cloned() {
+            Some(token) => token,
+            // 同じロック区間でトークンが無いことを確認済みなので、
+            // begin_loading は必ず新しいトークンを返す（`None` は「既に
+            // 読み込み中」の意味であり、ここでは起こらない）。到達しない側は
+            // 真新しいトークン（＝キャンセルされていない状態）で続行する。
+            None => guard.begin_loading(request.target_id).unwrap_or_default(),
+        }
     };
+
+    // 終端処理（Issue #31）。`finish` を呼ばずにこの関数を抜けた場合
+    // （読み込み中のパニックによる巻き戻し）でも Drop が同じ後始末を試みる。
+    let mut finish_guard =
+        FinishLoadGuard::new(targets, display_set_registry, budget, request.target_id);
 
     let sink = TargetProgressSink {
         targets,
@@ -899,6 +1158,10 @@ fn run_open_core(
 
     let event = match register_result {
         Ok(register_outcome) => {
+            // 読み込み中に閉じられていた場合にコア側の後始末を代行できるよう、
+            // 払い出された source_id を終端処理へ渡す（Issue #31）。`Err` の
+            // 場合はコア層が予約を返却済みでソースも残らないため不要。
+            finish_guard.set_source_id(register_outcome.handle.source_id);
             diag_info!(
                 diagnostics,
                 module = request.module,
@@ -962,9 +1225,11 @@ fn run_open_core(
         }
     };
 
-    {
-        let mut guard = targets.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.finish_loading(request.target_id);
+    if finish_guard.finish() {
+        // 読み込み中に閉じられた対象。コア側のソースと予約は終端処理が回収
+        // 済みで、対象一覧にもエントリが無い。完了・失敗イベントの宛先も
+        // 無いため、ここで終える（Issue #31）。
+        return;
     }
 
     emit_outcome(event);
@@ -1052,12 +1317,83 @@ pub enum OpenConfigDataSourceResponse {
         target_id: u32,
         source_label: String,
     },
+    /// 同じ名前の対象が既に開かれている（読み込み中または読み込み済み）ため、
+    /// 新しい読み込みを開始しなかった（Issue #31。[`reserve_configured_target`]）。
+    ///
+    /// `target_id` は既存の対象のもので、フロントエンドはそれへ切り替えれば
+    /// 済みます（新しい行・新しいタブは増えません）。
+    AlreadyOpen {
+        target_id: u32,
+        source_label: String,
+    },
     Failed {
         /// 名前解決自体に失敗した場合（設定に存在しない名前）は対象を
         /// 登録しないため `None`。
         target_id: Option<u32>,
         error: UserFacingErrorDto,
     },
+}
+
+/// [`reserve_configured_target`] の結果です（Issue #31）。
+enum ConfiguredTargetSlot {
+    /// 同名の対象が既に開かれていた。新しいワーカーを起動してはいけません。
+    AlreadyOpen(u32),
+    /// 新しく登録した。呼び出し側が読み込みを開始します。
+    Registered(u32),
+}
+
+/// 設定由来の対象を開く前に、同名の対象が既に開かれていないかを判定し、
+/// 開かれていなければ新規登録します（Issue #31）。
+///
+/// 判定と登録を**1回のロック区間で**行うのが要点です。分けると、同じ名前への
+/// 連続した要求（フロントエンドの二重送信防止をすり抜けた場合など）が両方とも
+/// 「未登録」と判定し、同じファイルに対してワーカーが2つ走ります。すると
+/// 一方のソースはどの対象エントリからも参照されないまま `SourceBudget` の
+/// 予約ごと解放不能になります（`PERF-004`〜`006` の上限判定へ永久計上）。
+///
+/// 「既に開かれている」とみなすのは `Loading`（読み込み中）と `Ready`
+/// （読み込み済み）です。`Error`・`CancelledPartial` は開き直す意図が明確な
+/// 状態であり、既存エントリのやり直しは [`retry_target`] が担当するため、
+/// ここでは新しい対象として登録します。
+///
+/// 新規登録した場合は [`TargetRegistry::begin_loading`] まで済ませます（同じ
+/// 理由で、登録とキャンセル受付開始の間にもロックの切れ目を作らないため）。
+/// 呼び出し側は、結局ワーカーを起動しないと決めた場合
+/// （フォルダ未対応など）に [`TargetRegistry::abort_loading`] を呼びます。
+fn reserve_configured_target(
+    registry: &mut TargetRegistry,
+    name: &str,
+    path: &Path,
+) -> ConfiguredTargetSlot {
+    let already_open = registry.targets.iter().find(|entry| {
+        matches!(
+            &entry.origin,
+            TargetOrigin::Configured { name: opened, .. } if opened == name
+        ) && matches!(
+            entry.status,
+            TargetStatus::Loading { .. } | TargetStatus::Ready { .. }
+        )
+    });
+    if let Some(entry) = already_open {
+        return ConfiguredTargetSlot::AlreadyOpen(entry.target_id);
+    }
+    let target_id = registry.register(
+        name.to_string(),
+        TargetOrigin::Configured {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+        },
+    );
+    // 登録とキャンセル受付開始も同じロック区間で済ませる
+    // （[`TargetRegistry::register`] の doc コメント）。登録した直後なので
+    // `None` にはならない。`debug_assert!` は式を消さないので、release
+    // ビルドでも `begin_loading` は実行される。
+    let token = registry.begin_loading(target_id);
+    debug_assert!(
+        token.is_some(),
+        "登録した直後の対象は必ず読み込みを開始できるはず"
+    );
+    ConfiguredTargetSlot::Registered(target_id)
 }
 
 /// 設定（`hakutaku.yaml` の `data_sources`）に事前定義されたデータソースを、
@@ -1067,6 +1403,10 @@ pub enum OpenConfigDataSourceResponse {
 /// `ConfigState` 側でパスを解決します。フォルダは現段階では未対応のため、
 /// 明確なエラーとして返します（複数ファイルの同時読み込みは P06、DICOM の
 /// フォルダ走査対応は P14）。
+///
+/// 同じ名前の対象が既に開かれている（読み込み中または読み込み済み）場合は、
+/// 新しい読み込みを開始せず [`OpenConfigDataSourceResponse::AlreadyOpen`] を
+/// 返します（Issue #31。[`reserve_configured_target`]）。
 ///
 /// `manual_profile`（`LOG-022`、P07-2）を指定すると、そのプロファイル名で
 /// 開き直します（`hakutaku_core::resolve_profile` の第1段階）。
@@ -1110,13 +1450,22 @@ pub fn open_config_data_source(
 
     let target_id = {
         let mut target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
-        target_guard.register(
-            name.clone(),
-            TargetOrigin::Configured {
-                name: name.clone(),
-                path: path.clone(),
-            },
-        )
+        match reserve_configured_target(&mut target_guard, &name, &path) {
+            ConfiguredTargetSlot::AlreadyOpen(target_id) => {
+                diag_info!(
+                    diagnostics_ref,
+                    module = "targets",
+                    operation = "target.open_configured",
+                    "データソース \"{name}\" は既に開いているため、読み込みを開始しません\
+                     （Issue #31）: target_id={target_id}"
+                );
+                return OpenConfigDataSourceResponse::AlreadyOpen {
+                    target_id,
+                    source_label: name,
+                };
+            }
+            ConfiguredTargetSlot::Registered(target_id) => target_id,
+        }
     };
 
     if path.is_dir() {
@@ -1129,6 +1478,9 @@ pub fn open_config_data_source(
         );
         let error = folder_unsupported_error(&name, &path);
         let mut target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // ワーカーを起動しないので、reserve_configured_target が始めた
+        // 読み込み受付を取り消す（Issue #31）。
+        target_guard.abort_loading(target_id);
         target_guard.set_status(
             target_id,
             TargetStatus::Error {
@@ -1140,11 +1492,6 @@ pub fn open_config_data_source(
             target_id: Some(target_id),
             error: UserFacingErrorDto::from(&error),
         };
-    }
-
-    {
-        let mut target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
-        target_guard.begin_loading(target_id);
     }
 
     spawn_open(
@@ -1182,6 +1529,21 @@ pub enum RetryTargetResponse {
     },
     /// `target_id` が一覧に存在しない（`close_target` 済みなど）。
     NotFound,
+    /// 対象が現在読み込み中のため、再試行を受け付けなかった（Issue #31）。
+    ///
+    /// `reload_target` が `Ready` 以外を拒否するのと対称の判定です。読み込み
+    /// 中の再試行を受け付けると、同じ対象に対してワーカーが2つ走り、
+    /// [`TargetRegistry::begin_loading`] の doc コメントに挙げた3つの不具合
+    /// （先発ワーカーがキャンセル不能・トークンの早すぎる除去・二重登録した
+    /// ソースの解放不能）が同時に起こります。
+    ///
+    /// 読み込み中の対象に対する利用者の選択肢は「キャンセル」（`cancel_load`）
+    /// か「閉じる」（`close_target`）であり、フロントエンドも読み込み中の行に
+    /// 再試行ボタンを出しません。したがってこの応答は、二重送信や競合に対する
+    /// 防御としてだけ返ります。
+    AlreadyLoading {
+        target_id: u32,
+    },
 }
 
 /// 再試行の実行計画（対象一覧の Mutex を保持したまま長時間ロックしないよう、
@@ -1203,6 +1565,77 @@ struct RetryPlan {
     previous_source_id: Option<u32>,
 }
 
+/// [`begin_retry`] の結果です（[`RetryTargetResponse`] のうち、対象一覧だけで
+/// 決まる3通り）。
+enum RetryDecision {
+    /// `target_id` が一覧に存在しない。
+    NotFound,
+    /// 読み込み中のため再試行できない（Issue #31）。
+    AlreadyLoading,
+    /// 再試行してよい（[`TargetRegistry::begin_loading`] まで済んでいる）。
+    Proceed(RetryPlan),
+}
+
+/// [`retry_target`] が対象一覧のロック区間で行う判定と、読み込み受付の開始
+/// です。ロックを保持したまま読み込みへ進まないよう、必要な値をここで
+/// [`RetryPlan`] へコピーします。
+///
+/// 次の3つを**1回のロック区間**で行うのが要点です（Issue #31）。
+///
+/// 1. 対象の存在確認
+/// 2. 読み込み中（`Loading`）の拒否（[`RetryDecision::AlreadyLoading`]。理由は
+///    [`RetryTargetResponse::AlreadyLoading`] の doc コメント）
+/// 3. [`TargetRegistry::begin_loading`]（キャンセル受付の開始）
+///
+/// 分けると、その隙間に [`close_target`] が入って対象が消え、担当する
+/// エントリが無いままワーカーだけが走る状態（＝登録したソースを誰も回収
+/// できない状態）が作れてしまいます。
+///
+/// [`RetryDecision::Proceed`] を返したのにワーカーを起動しない場合
+/// （フォルダ未対応）は、呼び出し側が [`TargetRegistry::abort_loading`] で
+/// 取り消します。
+fn begin_retry(registry: &mut TargetRegistry, target_id: u32) -> RetryDecision {
+    let Some(entry) = registry.find(target_id) else {
+        return RetryDecision::NotFound;
+    };
+    if matches!(entry.status, TargetStatus::Loading { .. }) {
+        return RetryDecision::AlreadyLoading;
+    }
+    // begin_loading は状態を `Loading` へ変えるため、旧 source_id はその前に
+    // 取り出しておく（`Ready`／`CancelledPartial` からの再試行で必要）。
+    let previous_source_id = active_source_id(&entry.status);
+    let path = entry.origin.path().to_path_buf();
+    let display_name = entry.display_name.clone();
+    let plan = match &entry.origin {
+        TargetOrigin::AdHoc { .. } => RetryPlan {
+            error_target: path.display().to_string(),
+            path,
+            display_name,
+            module: "log_view",
+            operation: "log.retry",
+            error_next_action: "再試行するか、別のファイルを選び直してください。",
+            is_configured_folder: false,
+            previous_source_id,
+        },
+        TargetOrigin::Configured { name, .. } => RetryPlan {
+            error_target: format!("{name}（{}）", path.display()),
+            is_configured_folder: path.is_dir(),
+            path,
+            display_name,
+            module: "targets",
+            operation: "target.retry_configured",
+            error_next_action: "再試行するか、設定を確認してください。",
+            previous_source_id,
+        },
+    };
+    if registry.begin_loading(target_id).is_none() {
+        // 直前に存在と「読み込み中でないこと」を同じロック区間で確認済みの
+        // ため到達しない。防御的に、ワーカーを起動しない側へ倒す。
+        return RetryDecision::AlreadyLoading;
+    }
+    RetryDecision::Proceed(plan)
+}
+
 /// 失敗・キャンセル済みの対象を再試行します（`LOG-027`）。アドホックに選んだ
 /// ファイルは選択済みのパスを Rust 側に保持しており、再度ダイアログを表示
 /// しません。設定由来のデータソースは、登録時に解決したパスをそのまま
@@ -1214,6 +1647,10 @@ struct RetryPlan {
 /// `CancelledPartial` だった場合は、新しい登録を行う前に古い `source_id` を
 /// `close_source` し、`SourceBudget` の予約が二重に計上され続けないように
 /// します（P06-5）。
+///
+/// **読み込み中（`Loading`）の対象は受け付けません**
+/// （[`RetryTargetResponse::AlreadyLoading`]。Issue #31）。`reload_target` が
+/// `Ready` 以外を拒否するのと対称の判定です。
 ///
 /// `manual_profile`（`LOG-022`、P07-2）を指定すると、そのプロファイル名で
 /// 開き直します。`manual_datetime_format`（`LOG-022`）を指定すると、
@@ -1240,34 +1677,13 @@ pub fn retry_target(
     let diagnostics_ref: &Diagnostics = diagnostics.inner();
 
     let plan = {
-        let target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(entry) = target_guard.find(target_id) else {
-            return RetryTargetResponse::NotFound;
-        };
-        let previous_source_id = active_source_id(&entry.status);
-        let path = entry.origin.path().to_path_buf();
-        let display_name = entry.display_name.clone();
-        match &entry.origin {
-            TargetOrigin::AdHoc { .. } => RetryPlan {
-                error_target: path.display().to_string(),
-                path,
-                display_name,
-                module: "log_view",
-                operation: "log.retry",
-                error_next_action: "再試行するか、別のファイルを選び直してください。",
-                is_configured_folder: false,
-                previous_source_id,
-            },
-            TargetOrigin::Configured { name, .. } => RetryPlan {
-                error_target: format!("{name}（{}）", path.display()),
-                is_configured_folder: path.is_dir(),
-                path,
-                display_name,
-                module: "targets",
-                operation: "target.retry_configured",
-                error_next_action: "再試行するか、設定を確認してください。",
-                previous_source_id,
-            },
+        let mut target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match begin_retry(&mut target_guard, target_id) {
+            RetryDecision::NotFound => return RetryTargetResponse::NotFound,
+            RetryDecision::AlreadyLoading => {
+                return RetryTargetResponse::AlreadyLoading { target_id }
+            }
+            RetryDecision::Proceed(plan) => plan,
         }
     };
 
@@ -1287,6 +1703,9 @@ pub fn retry_target(
         );
         let error = folder_unsupported_error(&plan.display_name, &plan.path);
         let mut target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // ワーカーを起動しないので、begin_retry が始めた読み込み受付を
+        // 取り消す（Issue #31）。
+        target_guard.abort_loading(target_id);
         target_guard.set_status(
             target_id,
             TargetStatus::Error {
@@ -1300,11 +1719,8 @@ pub fn retry_target(
         };
     }
 
-    {
-        let mut target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
-        target_guard.begin_loading(target_id);
-    }
-
+    // キャンセル受付の開始（begin_loading）は begin_retry が判定と同じロック
+    // 区間で済ませている（Issue #31）。ここでは読み込み本体を起動するだけ。
     spawn_open(
         app,
         OpenRequest {
@@ -1733,7 +2149,10 @@ mod tests {
         fn register_and_begin(&self, display_name: &str, path: PathBuf) -> u32 {
             let mut guard = self.targets.lock().unwrap();
             let target_id = guard.register(display_name.to_string(), TargetOrigin::AdHoc { path });
-            guard.begin_loading(target_id);
+            assert!(
+                guard.begin_loading(target_id).is_some(),
+                "新規登録した対象なので、必ず新しいトークンが発行されるはず"
+            );
             target_id
         }
 
@@ -1781,6 +2200,23 @@ mod tests {
                 &|outcome| outcomes.lock().unwrap().push(outcome),
             );
             outcomes.into_inner().unwrap()
+        }
+
+        /// [`close_target_core`]（`close_target` の中核）をこの土台の状態に
+        /// 対して呼びます。
+        fn close(&self, target_id: u32) -> bool {
+            close_target_core(
+                &self.targets,
+                &self.display_set_registry,
+                &self.budget,
+                target_id,
+            )
+        }
+
+        /// 読み込み中に閉じられた対象の印（Issue #31）が残っていないことを
+        /// 確かめるための覗き見です。
+        fn close_pending_is_empty(&self) -> bool {
+            self.targets.lock().unwrap().close_pending_loads.is_empty()
         }
 
         /// [`run_reload_core`]（`reload_target` の中核）をこの土台の状態に対して
@@ -3128,6 +3564,407 @@ mod tests {
             ),
             other => panic!("Ready を期待しましたが {other:?} でした"),
         }
+    }
+
+    // --- 読み込み中の close / retry / 重複オープン（Issue #31） ---
+
+    // 受け入れ条件（Issue #31）: 既に読み込み中の対象へ begin_loading を
+    // 呼んでも、既存のキャンセルトークンを黙って上書きしない。上書きすると
+    // 先発ワーカーを cancel_load で止められなくなり、そのワーカーが登録した
+    // ソースと SourceBudget の予約が解放不能になる。
+    #[test]
+    fn begin_loading_does_not_replace_an_existing_token() {
+        let mut registry = TargetRegistry::default();
+        let target_id = registry.register(
+            "a.log".to_string(),
+            TargetOrigin::AdHoc {
+                path: PathBuf::from("C:\\logs\\a.log"),
+            },
+        );
+
+        let first = registry
+            .begin_loading(target_id)
+            .expect("最初の begin_loading は新しいトークンを発行するはず");
+        assert!(
+            registry.begin_loading(target_id).is_none(),
+            "読み込み中の対象への begin_loading は None を返すはず"
+        );
+
+        // 先発ワーカーが握っているトークンで、引き続きキャンセルできる。
+        assert!(registry.request_cancel(target_id));
+        assert!(
+            first.is_cancelled(),
+            "上書きされていなければ、先発ワーカーのトークンがキャンセルされるはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #31）: 「閉じられた」印は、回収してくれるワーカーが
+    // いるときだけ記録し、回収は一度だけできる。
+    #[test]
+    fn close_pending_mark_is_recorded_only_while_a_worker_is_running() {
+        let mut registry = TargetRegistry::default();
+        let target_id = registry.register(
+            "a.log".to_string(),
+            TargetOrigin::AdHoc {
+                path: PathBuf::from("C:\\logs\\a.log"),
+            },
+        );
+
+        assert!(
+            !registry.mark_close_pending(target_id),
+            "begin_loading 前は後始末を代行する相手がいないので記録しない"
+        );
+        assert!(registry.close_pending_loads.is_empty());
+
+        registry
+            .begin_loading(target_id)
+            .expect("新規登録した対象なので発行されるはず");
+        assert!(registry.mark_close_pending(target_id));
+        assert!(registry.take_close_pending(target_id));
+        assert!(
+            !registry.take_close_pending(target_id),
+            "印は一度しか回収できない（二重に close_source を呼ばない）"
+        );
+    }
+
+    // 受け入れ条件（Issue #31）: 読み込み中の対象は retry_target で再試行
+    // できない（reload_target が Ready 以外を拒否するのと対称）。拒否した
+    // 場合は先発ワーカーのトークンも書き換えない。存在しない対象は従来どおり
+    // NotFound。
+    #[test]
+    fn begin_retry_rejects_a_loading_target() {
+        let mut registry = TargetRegistry::default();
+        let target_id = registry.register(
+            "a.log".to_string(),
+            TargetOrigin::AdHoc {
+                path: PathBuf::from("C:\\logs\\a.log"),
+            },
+        );
+        let running = registry
+            .begin_loading(target_id)
+            .expect("新規登録した対象なので発行されるはず");
+
+        assert!(matches!(
+            begin_retry(&mut registry, target_id),
+            RetryDecision::AlreadyLoading
+        ));
+        assert!(matches!(
+            begin_retry(&mut registry, 9999),
+            RetryDecision::NotFound
+        ));
+
+        assert!(registry.request_cancel(target_id));
+        assert!(
+            running.is_cancelled(),
+            "拒否された再試行はトークンを差し替えないはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #31・P06-5）: 読み込み中以外は従来どおり再試行でき、
+    // 旧 source_id（`CancelledPartial`）は解放対象として計画へ引き継がれる。
+    // 判定を通ると同じロック区間でキャンセル受付が始まる（begin_loading 済み）。
+    #[test]
+    fn begin_retry_proceeds_for_error_and_cancelled_partial() {
+        let mut registry = TargetRegistry::default();
+        let target_id = registry.register(
+            "a.log".to_string(),
+            TargetOrigin::AdHoc {
+                path: PathBuf::from("C:\\logs\\a.log"),
+            },
+        );
+
+        registry.set_status(
+            target_id,
+            TargetStatus::Error {
+                error: UserFacingError::new("a.log", "失敗", "再試行してください"),
+                access_denied: false,
+            },
+        );
+        match begin_retry(&mut registry, target_id) {
+            RetryDecision::Proceed(plan) => assert_eq!(plan.previous_source_id, None),
+            _ => panic!("Error 状態は再試行できるはず"),
+        }
+        assert!(
+            registry.request_cancel(target_id),
+            "判定を通った時点でキャンセル受付が始まっているはず"
+        );
+
+        // ワーカーが終了したところ（finish_loading）から、キャンセル済みの
+        // 部分読み込みとして再試行する場合。
+        registry.finish_loading(target_id);
+        registry.set_status(
+            target_id,
+            TargetStatus::CancelledPartial {
+                source_id: 7,
+                display_set_id: 1,
+                generation: 1,
+                total_items: 3,
+                fell_back_to_raw_display: false,
+            },
+        );
+        match begin_retry(&mut registry, target_id) {
+            RetryDecision::Proceed(plan) => assert_eq!(plan.previous_source_id, Some(7)),
+            _ => panic!("CancelledPartial は再試行できるはず"),
+        }
+    }
+
+    // 受け入れ条件（Issue #31）: 結局ワーカーを起動しない経路（フォルダ未対応）
+    // は、begin_loading で始めた受付を取り消し、印もトークンも残さない。
+    #[test]
+    fn abort_loading_clears_the_token_and_the_close_pending_mark() {
+        let mut registry = TargetRegistry::default();
+        let target_id = registry.register(
+            "端末A".to_string(),
+            TargetOrigin::Configured {
+                name: "端末A".to_string(),
+                path: PathBuf::from("C:\\device"),
+            },
+        );
+        registry
+            .begin_loading(target_id)
+            .expect("新規登録した対象なので発行されるはず");
+        assert!(registry.mark_close_pending(target_id));
+
+        registry.abort_loading(target_id);
+
+        assert!(!registry.request_cancel(target_id));
+        assert!(
+            registry.close_pending_loads.is_empty(),
+            "回収する相手がいない印を残さないはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #31）: 同じ名前のデータソースを続けて開こうとしても
+    // 対象は増えず、2回目は既存の target_id を返す（＝ワーカーを増やさない。
+    // 増やすと、どの対象からも参照されないソースと予約が残る）。読み込み中・
+    // 読み込み済みのいずれも「既に開いている」とみなす。
+    #[test]
+    fn reserve_configured_target_reuses_a_loading_or_ready_target() {
+        let mut registry = TargetRegistry::default();
+        let path = Path::new("C:\\device\\a.log");
+
+        let first = match reserve_configured_target(&mut registry, "端末A", path) {
+            ConfiguredTargetSlot::Registered(target_id) => target_id,
+            ConfiguredTargetSlot::AlreadyOpen(_) => panic!("最初は新規登録のはず"),
+        };
+        assert!(
+            registry.request_cancel(first),
+            "新規登録と同時にキャンセル受付まで済ませるはず（Issue #31）"
+        );
+
+        match reserve_configured_target(&mut registry, "端末A", path) {
+            ConfiguredTargetSlot::AlreadyOpen(target_id) => assert_eq!(target_id, first),
+            ConfiguredTargetSlot::Registered(_) => {
+                panic!("読み込み中の同名対象は再利用されるはず")
+            }
+        }
+        assert_eq!(registry.list().len(), 1, "対象は増えないはず");
+
+        registry.set_status(
+            first,
+            TargetStatus::Ready {
+                source_id: 0,
+                display_set_id: 1,
+                generation: 1,
+                total_items: 3,
+                fell_back_to_raw_display: false,
+                update_pending: false,
+            },
+        );
+        match reserve_configured_target(&mut registry, "端末A", path) {
+            ConfiguredTargetSlot::AlreadyOpen(target_id) => assert_eq!(target_id, first),
+            ConfiguredTargetSlot::Registered(_) => {
+                panic!("読み込み済みの同名対象も再利用されるはず")
+            }
+        }
+        assert_eq!(registry.list().len(), 1, "対象は増えないはず");
+    }
+
+    // 受け入れ条件（Issue #31）: 別名、および開き直しの意図が明確な状態
+    // （Error）では、新しい対象として登録する。
+    #[test]
+    fn reserve_configured_target_registers_for_another_name_or_errored_target() {
+        let mut registry = TargetRegistry::default();
+        let path = Path::new("C:\\device\\a.log");
+
+        let first = match reserve_configured_target(&mut registry, "端末A", path) {
+            ConfiguredTargetSlot::Registered(target_id) => target_id,
+            ConfiguredTargetSlot::AlreadyOpen(_) => panic!("最初は新規登録のはず"),
+        };
+        // 読み込みが失敗して終わったところ（ワーカーの終端処理まで済んだ状態）。
+        registry.finish_loading(first);
+        registry.set_status(
+            first,
+            TargetStatus::Error {
+                error: UserFacingError::new("端末A", "失敗", "再試行してください"),
+                access_denied: false,
+            },
+        );
+
+        match reserve_configured_target(&mut registry, "端末A", path) {
+            ConfiguredTargetSlot::Registered(target_id) => assert_ne!(target_id, first),
+            ConfiguredTargetSlot::AlreadyOpen(_) => {
+                panic!("Error 状態は「既に開いている」とはみなさないはず")
+            }
+        }
+        match reserve_configured_target(&mut registry, "端末B", Path::new("C:\\device\\b.log")) {
+            ConfiguredTargetSlot::Registered(_) => {}
+            ConfiguredTargetSlot::AlreadyOpen(_) => panic!("別名は新規登録のはず"),
+        }
+        assert_eq!(registry.list().len(), 3);
+    }
+
+    // 受け入れ条件（Issue #31）: 読み込み中に閉じた対象について、ワーカーが
+    // その後にコア層へ登録を終えても、ソースも SourceBudget の予約も残らない。
+    //
+    // 閉じる時点で source_id がまだ払い出されていない経路を確実に通すため、
+    // 読み込み開始（register_and_begin）の直後に閉じてから、同じスレッドで
+    // ワーカー本体（run_open_core）を走らせる。閉じた時点でキャンセルが要求
+    // されるため、コア層は「1件も読めていないソース」を登録して
+    // CancelledPartial で終わる。修正前は、この登録が対象一覧のどこからも
+    // 参照されないまま残り、上限判定（PERF-004〜006）へ恒久計上され、統合
+    // 表示集合（LOG-007・LOG-008）にも閉じたファイルの行が混入していた。
+    #[test]
+    fn close_target_while_loading_reclaims_a_source_registered_afterwards() {
+        let mut contents = String::new();
+        for i in 0..50 {
+            contents.push_str(&format!("2026/07/28 15:12:{:02}.000 行{i}\n", i % 60));
+        }
+        let file = TempFile::create_text("close-during-load-early", &contents);
+        let fixture = Fixture::new();
+        let target_id = fixture.register_and_begin("closing.log", file.path.clone());
+
+        assert!(
+            fixture.close(target_id),
+            "読み込み中の対象も一覧から除去できるはず"
+        );
+        assert!(fixture.targets.lock().unwrap().list().is_empty());
+
+        let events = fixture.run(request(target_id, file.path.clone()));
+
+        assert!(
+            events.is_empty(),
+            "閉じた対象には完了・失敗イベントの宛先が無いので発行しないはず"
+        );
+        assert!(
+            fixture.display_set_registry.lock().unwrap().is_empty(),
+            "閉じた対象のソースがコア側に残っている（統合表示へ混入する）"
+        );
+        assert_eq!(
+            fixture.budget.total_bytes(),
+            0,
+            "SourceBudget の予約が解放されずに残っている"
+        );
+        assert!(
+            !fixture.targets.lock().unwrap().request_cancel(target_id),
+            "active_loads にトークンが残っている"
+        );
+        assert!(fixture.close_pending_is_empty(), "回収済みの印が残っている");
+    }
+
+    // 受け入れ条件（Issue #31）: 既にコア層へ登録済みの読み込み中対象を閉じた
+    // 場合も、ソースと予約が残らない。
+    //
+    // 「コア側に登録済み・かつ読み込み中」という状態を実際に観測してから
+    // 閉じるため、run_open_core_keeps_display_set_registry_available_during_load
+    // と同じ手法（小さい chunk_bytes と I/O 発行間隔）で読み込みを引き延ばす。
+    // 閉じた時点ではまだソースが残る（キャンセルはチャンク境界で確認される
+    // ため。cancel_load の doc コメントと同じ性質）が、ワーカーの終端処理が
+    // 必ず回収する。
+    #[test]
+    fn close_target_while_loading_frees_an_already_registered_core_source() {
+        const LINE_COUNT: u64 = 600;
+
+        let mut contents = String::new();
+        for i in 0..LINE_COUNT {
+            contents.push_str(&format!("2026/07/28 15:12:{:02}.000 行{i}\n", i % 60));
+        }
+        let file = TempFile::create_text("close-during-load-registered", &contents);
+
+        let fixture = Arc::new(Fixture::with_throttle_and_chunk_bytes(
+            hakutaku_data_source::IoThrottle::new(None, 10),
+            512,
+        ));
+        let target_id = fixture.register_and_begin("closing.log", file.path.clone());
+        let req = request(target_id, file.path.clone());
+
+        let runner = Arc::clone(&fixture);
+        let loader = std::thread::spawn(move || runner.run(req));
+
+        // 最初のバッチが登録され、かつまだ読み込み中である瞬間を待つ。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut observed = false;
+        while std::time::Instant::now() < deadline {
+            let registered = !fixture.display_set_registry.lock().unwrap().is_empty();
+            let loading = matches!(
+                fixture.status_of(target_id),
+                TargetStatusDto::Loading { .. }
+            );
+            if registered && loading {
+                observed = true;
+                break;
+            }
+            if loader.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            observed,
+            "読み込み中にコア側へ登録済みの状態を観測できなかった（この検査の前提が崩れている）"
+        );
+        assert!(
+            fixture.budget.total_bytes() > 0,
+            "読み込み中でも SourceBudget の予約は生きている前提"
+        );
+
+        assert!(fixture.close(target_id));
+        let events = loader.join().expect("パニックしないはず");
+
+        assert!(events.is_empty(), "閉じた対象のイベントは発行しないはず");
+        assert!(
+            fixture.display_set_registry.lock().unwrap().is_empty(),
+            "閉じた対象のソースがコア側に残っている（統合表示へ混入する）"
+        );
+        assert_eq!(
+            fixture.budget.total_bytes(),
+            0,
+            "SourceBudget の予約が解放されずに残っている"
+        );
+        assert!(!fixture.targets.lock().unwrap().request_cancel(target_id));
+        assert!(fixture.close_pending_is_empty());
+    }
+
+    // 受け入れ条件（P06-5）: 読み込み済みの対象を閉じる従来の経路
+    // （active_source_id 経由の close_source）は変わらない。読み込み中では
+    // ないため「閉じられた」印も付かない。
+    #[test]
+    fn close_target_after_load_frees_core_source_and_budget() {
+        let contents = "2026/07/28 15:12:23.456 起動しました\n";
+        let file = TempFile::create_text("close-after-load", contents);
+        let fixture = Fixture::new();
+        let target_id = fixture.register_and_begin("a.log", file.path.clone());
+
+        fixture.run(request(target_id, file.path.clone()));
+        assert_eq!(fixture.budget.total_bytes(), contents.len() as u64);
+
+        assert!(fixture.close(target_id));
+
+        assert!(fixture.targets.lock().unwrap().list().is_empty());
+        assert!(fixture.display_set_registry.lock().unwrap().is_empty());
+        assert_eq!(fixture.budget.total_bytes(), 0);
+        assert!(
+            fixture.close_pending_is_empty(),
+            "読み込み中ではないので印は付かないはず"
+        );
+    }
+
+    // ERR-001: 存在しない対象を閉じても false を返すだけで、何も起きない。
+    #[test]
+    fn close_target_for_unknown_target_id_returns_false() {
+        let fixture = Fixture::new();
+        assert!(!fixture.close(9999));
+        assert!(fixture.close_pending_is_empty());
     }
 
     #[test]
