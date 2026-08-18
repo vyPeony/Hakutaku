@@ -31,9 +31,20 @@
 //! 「armed」フラグを倒し、値がしきい値を**下回った**ときにだけ再武装します。
 //! 再武装後、再びしきい値へ到達すると改めて発火します。
 //!
-//! 先読み停止フラグ（[`super::MemoryBudget::prefetch_paused`]）は、この
-//! エッジ検出と連動して立て・解除します。「立てる」のは到達エッジのときだけ
-//! ですが、フラグの値自体はしきい値を下回るまで `true` のまま保持されます。
+//! 先読み停止フラグ（[`super::MemoryBudget::prefetch_paused`]）は、エッジでは
+//! なく**判定のたびにその時点の判定結果そのもの**で更新します（Issue #40）。
+//! エッジ検出は「解放処理を呼ぶかどうか」だけに使い、フラグの値には使いません。
+//! 両者を連動させると、2スレッドが同時に [`ThresholdState::evaluate`] を呼んだ
+//! ときに「再武装側の解除 → 到達側の設定」の順で確定し、しきい値未満なのに
+//! フラグが `true` のまま固着し得るためです（詳細は
+//! [`ThresholdState::evaluate`] の doc コメント）。
+//!
+//! # 解放処理はロックの外で呼ぶ
+//!
+//! 登録された解放処理は、登録簿（`Mutex`）から複製を取り出して**ロックを
+//! 手放してから**呼びます（Issue #40）。ロックを保持したまま呼ぶと、解放処理の
+//! 内部から会計 API へ再入したときに同じ `Mutex` を取り直して自ロックします
+//! （`std::sync::Mutex` は非再入）。
 //!
 //! # 会計イベントと診断ログの分離
 //!
@@ -44,7 +55,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::budget::ReservationRejected;
 
@@ -136,13 +147,19 @@ pub(crate) enum ThresholdEdge {
 pub(crate) struct ThresholdState {
     /// 予算に対する割合（パーセント、1〜100）。
     percent: AtomicU8,
-    /// エッジ検出の武装状態。`true` = 未到達（次に到達すると発火する）。
+    /// 解放処理を発火させるエッジ検出の武装状態。`true` = 未到達（次に到達
+    /// すると発火する）。先読み停止フラグの値には使いません（Issue #40。
+    /// 理由は [`Self::evaluate`] の doc コメント）。
     armed: AtomicBool,
-    /// 消費側が読む先読み停止フラグ。
+    /// 消費側が読む先読み停止フラグ。[`Self::evaluate`] が判定のたびに、その
+    /// 時点の判定結果そのもので上書きします。
     prefetch_paused: AtomicBool,
     /// 到達時に呼び出す解放処理（P06・P08 が実対象を登録する。ここでは
     /// 呼び出す枠組みだけを持つ）。
-    release_handlers: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+    ///
+    /// `Box` ではなく `Arc` で保持するのは、発火時にロックの外へ持ち出せる
+    /// 複製を安価に作るためです（Issue #40。[`Self::fire_release_handlers`]）。
+    release_handlers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
     /// 会計イベントの通知先。一度設定したら変更しない（`OnceLock`）。
     event_sink: OnceLock<Box<dyn Fn(AccountingEvent) + Send + Sync>>,
 }
@@ -197,14 +214,18 @@ impl ThresholdState {
     }
 
     pub(crate) fn register_release_handler(&self, handler: Box<dyn Fn() + Send + Sync>) {
-        // 注意: 解放処理の内部からこの関数を呼び直すと、fire_release_handlers が
-        // 保持したままのロックへ再入してデッドロックする。解放処理からは登録
-        // 操作を行わないこと。
+        // 発火中（fire_release_handlers の実行中）にこの関数が呼ばれても、
+        // 発火側は既にロックを手放しているためデッドロックしない（Issue #40）。
+        // ただし、その回の発火では複製済みの一覧を呼ぶため、ここで追加した
+        // 処理は次回の到達から呼ばれる。
+        //
+        // 公開 API の引数の型（Box）を保ったまま Arc へ移し替える。呼び出し側
+        // （src-tauri）の署名を変えずに、発火時の複製を安価にするため。
         let mut handlers = self
             .release_handlers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        handlers.push(handler);
+        handlers.push(Arc::from(handler));
     }
 
     pub(crate) fn set_event_sink(&self, sink: Box<dyn Fn(AccountingEvent) + Send + Sync>) -> bool {
@@ -217,25 +238,56 @@ impl ThresholdState {
         }
     }
 
+    /// 登録された解放処理を、**登録簿のロックを手放してから**呼びます。
+    ///
+    /// ロックを保持したまま呼ぶと、解放処理の内部から会計 API（予約、振り替え、
+    /// [`Self::evaluate`] を経由する明示的な確認、解放処理の追加登録）へ再入した
+    /// ときに、同じ `Mutex` を取り直して自ロックします（`std::sync::Mutex` は
+    /// 非再入。Issue #40）。そのため、ロック内では `Arc` の複製だけを集め、
+    /// 呼び出しはロックの外で行います。
+    ///
+    /// この複製は `Vec` の確保を伴いますが、しきい値判定はアロケータの
+    /// `alloc`／`dealloc` 経路では行わない（ADR-0003、このモジュールの
+    /// doc コメント）ため、ここでの確保は再入の危険になりません。
     fn fire_release_handlers(&self) {
-        let handlers = self
-            .release_handlers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for handler in handlers.iter() {
+        let handlers: Vec<Arc<dyn Fn() + Send + Sync>> = {
+            let guard = self
+                .release_handlers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.iter().map(Arc::clone).collect()
+        };
+        for handler in handlers {
             handler();
         }
     }
 
-    /// しきい値到達をエッジ検出で判定します。`current_usage_bytes` は呼び出し側
-    /// が組み立てた「確保済み + 予約済み」の合計です。
+    /// しきい値を判定します。`current_usage_bytes` は呼び出し側が組み立てた
+    /// 「確保済み + 予約済み」の合計です。
     ///
-    /// - 未到達 → 到達: [`ThresholdEdge::Reached`] を返し、登録された解放処理を
-    ///   呼び、先読み停止フラグを立てます。
-    /// - 到達 → 未到達: [`ThresholdEdge::Rearmed`] を返し、先読み停止フラグを
-    ///   解除し、次回の到達で再び発火できるようにします。
-    /// - 状態に変化がなければ `None` を返し、何もしません（解放処理の再送を
-    ///   防ぐ、エッジ検出の中心部分）。
+    /// - 先読み停止フラグは、**呼び出しのたびにその回の判定結果**（しきい値
+    ///   以上かどうか）で上書きします。戻り値がエッジかどうかとは無関係です。
+    /// - 未到達 → 到達のエッジでだけ [`ThresholdEdge::Reached`] を返し、登録
+    ///   された解放処理を呼びます。
+    /// - 到達 → 未到達のエッジでだけ [`ThresholdEdge::Rearmed`] を返し、次回の
+    ///   到達で再び発火できるようにします。
+    /// - エッジでなければ `None` を返します（超過が続く間に高コストな解放処理を
+    ///   呼び直さない、エッジ検出の中心部分）。
+    ///
+    /// # フラグをエッジに連動させない理由（Issue #40）
+    ///
+    /// 先読み停止フラグを `armed` の遷移（CAS 成功）に連動させると、2スレッドが
+    /// 同時に呼んだときに「しきい値未満なのにフラグが `true` のまま固着する」
+    /// 状態が作れてしまいます。再武装側が `armed` を `true` へ戻した後、到達側の
+    /// フラグ設定が後から確定すると、`armed = true`（未発火）と
+    /// `prefetch_paused = true`（停止中）が同時に成立し、次の「到達 → 再武装」の
+    /// 一巡が起きるまで先読みが止まり続けるためです。
+    ///
+    /// 判定のたびに結果そのものを書けば、重なりのない次の呼び出しが必ずフラグを
+    /// 自身の判定結果へ一致させるため、この固着は起こりません。並行して呼ばれて
+    /// いる間は、フラグの値は「同時に走ったいずれかの判定結果」になります
+    /// （どれもその時点の観測に基づく妥当な値であり、どれか一方が恒久的に
+    /// 残ることはありません）。
     ///
     /// `armed` の遷移は `compare_exchange` で行うため、複数スレッドが同時に
     /// 呼んでも、発火・再武装のどちらも高々1回だけ起こります。
@@ -252,13 +304,17 @@ impl ThresholdState {
         let current = current_usage_bytes as u128;
         let over = current >= threshold_bytes;
 
+        // 解放処理を呼ぶ前に書く。ハンドラが先読み停止フラグを読む場合、判定
+        // 結果が反映済みの状態で読めるようにするため。ハンドラ内から再入した
+        // 判定は、このあとで自身の結果を上書きしてよい（より新しい観測のため）。
+        self.prefetch_paused.store(over, Ordering::Release);
+
         if over {
             if self
                 .armed
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                self.prefetch_paused.store(true, Ordering::Release);
                 self.fire_release_handlers();
                 return Some(ThresholdEdge::Reached);
             }
@@ -267,7 +323,6 @@ impl ThresholdState {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.prefetch_paused.store(false, Ordering::Release);
             return Some(ThresholdEdge::Rearmed);
         }
         None
@@ -327,6 +382,135 @@ mod tests {
 
         // 再武装後、再び到達すると改めて発火する。
         assert_eq!(state.evaluate(600, 1000), Some(ThresholdEdge::Reached));
+        assert!(state.prefetch_paused());
+    }
+
+    // 受け入れ条件（Issue #40）: evaluate を終えた時点で、先読み停止フラグは
+    // 必ずその回の判定結果と一致する（戻り値がエッジかどうかに依らない）。
+    #[test]
+    fn evaluate_always_leaves_prefetch_paused_matching_the_verdict() {
+        let state = ThresholdState::new();
+        state.set_percent(50).expect("50は有効な割合のはず");
+
+        // 到達エッジ・超過の継続・再武装エッジ・未到達の継続の4通りを順に通す。
+        for (usage, expected_paused) in [(600, true), (700, true), (400, false), (300, false)] {
+            state.evaluate(usage, 1000);
+            assert_eq!(
+                state.prefetch_paused(),
+                expected_paused,
+                "usage={usage} の判定結果とフラグが一致するはず"
+            );
+        }
+    }
+
+    // 受け入れ条件（Issue #40）: 並行実行の交錯が残し得る「armed = true（未発火）
+    // かつ prefetch_paused = true（停止中）」の状態からでも、次の判定でフラグが
+    // 解除される（しきい値未満のまま固着しない）。
+    //
+    // 実スレッドの交錯が起きるのを待つ代わりに、交錯が残す状態そのものを直接
+    // 作って検証する（決定的なテストにするため）。フラグをエッジ（armed の CAS
+    // 成功）に連動させる実装では、この状態から未到達を判定しても CAS が失敗して
+    // フラグが true のまま残るため、このテストは失敗する。
+    #[test]
+    fn evaluate_clears_prefetch_paused_stuck_by_a_concurrent_interleaving() {
+        let state = ThresholdState::new();
+        state.set_percent(50).expect("50は有効な割合のはず");
+        state.armed.store(true, Ordering::Release);
+        state.prefetch_paused.store(true, Ordering::Release);
+
+        assert_eq!(
+            state.evaluate(400, 1000),
+            None,
+            "armed は既に再武装済みのため、再武装エッジは立たない"
+        );
+        assert!(
+            !state.prefetch_paused(),
+            "しきい値未満と判定した以上、先読み停止は解除されるはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #40）: 複数スレッドが同時に evaluate を呼んでも、
+    // 全スレッドの終了後に単独で判定し直せば、フラグは必ずその判定結果と一致
+    // する（並行実行の後にフラグが固着して残らない）。
+    #[test]
+    fn concurrent_evaluate_leaves_no_stuck_prefetch_paused() {
+        let state = Arc::new(ThresholdState::new());
+        state.set_percent(50).expect("50は有効な割合のはず");
+
+        // 半数を到達側、半数を未到達側にして、到達と再武装を繰り返し交錯させる。
+        // 反復回数は有限のため、各スレッドは必ず終了する。
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    let usage = if index % 2 == 0 { 600 } else { 400 };
+                    for _ in 0..1000 {
+                        state.evaluate(usage, 1000);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("パニックしないはず");
+        }
+
+        state.evaluate(400, 1000);
+        assert!(
+            !state.prefetch_paused(),
+            "並行実行の後でも、単独の未到達判定でフラグが解除されるはず"
+        );
+        state.evaluate(600, 1000);
+        assert!(
+            state.prefetch_paused(),
+            "並行実行の後でも、単独の到達判定でフラグが立つはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #40）: 解放処理の内部から会計 API へ再入しても
+    // デッドロックしない（ロックを手放してからハンドラを呼ぶ）。
+    //
+    // ロックを保持したままハンドラを呼ぶ実装では、ハンドラ内の
+    // register_release_handler が同じ Mutex を取り直してハングするため、
+    // 時間制限つきの待機が発火してこのテストは失敗する。
+    #[test]
+    fn release_handler_can_reenter_the_accounting_api_without_deadlock() {
+        let state = Arc::new(ThresholdState::new());
+        state.set_percent(50).expect("50は有効な割合のはず");
+
+        // 解放処理は `'static` である必要があるため、`Arc` の循環参照を作らない
+        // よう `Weak` を捕捉する（循環させるとこの状態自体が解放されない）。
+        let weak = Arc::downgrade(&state);
+        let reentered = Arc::new(AtomicBool::new(false));
+        let reentered_in_handler = Arc::clone(&reentered);
+        state.register_release_handler(Box::new(move || {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            // 再入その1: 登録簿のロックを取り直す経路。
+            state.register_release_handler(Box::new(|| {}));
+            // 再入その2: しきい値判定からハンドラ発火へ至り得る経路。armed は
+            // 既に倒れているため、ここから再発火して無限再帰することはない。
+            state.evaluate(600, 1000);
+            reentered_in_handler.store(true, Ordering::Release);
+        }));
+
+        // デッドロックした場合にテストが永久にハングしないよう、別スレッドで
+        // 実行して時間制限つきで完了を待つ。
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            worker_state.evaluate(600, 1000);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("解放処理からの再入でデッドロックしている（10秒以内に完了しない）");
+        worker.join().expect("パニックしないはず");
+
+        assert!(
+            reentered.load(Ordering::Acquire),
+            "解放処理が呼ばれ、再入も完了しているはず"
+        );
         assert!(state.prefetch_paused());
     }
 

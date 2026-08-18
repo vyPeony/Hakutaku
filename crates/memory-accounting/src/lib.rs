@@ -48,8 +48,10 @@
 //! 明示的な確認関数 [`MemoryBudget::check_soft_threshold`] でだけ行い、ADR-0003
 //! に従ってアロケータの `alloc` / `dealloc` 経路では判定しません。到達は
 //! エッジ検出で扱い、登録された解放処理（[`MemoryBudget::
-//! register_release_handler`]）の呼び出しと先読み停止フラグ
-//! （[`MemoryBudget::prefetch_paused`]）の設定を、超過中に繰り返しません。
+//! register_release_handler`]）を超過が続く間に呼び直しません。先読み停止フラグ
+//! （[`MemoryBudget::prefetch_paused`]）はエッジではなく、判定のたびにその回の
+//! 判定結果そのもので更新します（Issue #40。並行判定でフラグが固着しないように
+//! するため）。
 //! **実際に解放する対象（索引、ログ本文バッファ、表示範囲）の登録は本クレートの
 //! 対象外です**（P06・P08）。
 //!
