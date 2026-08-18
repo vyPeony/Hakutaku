@@ -15,6 +15,14 @@
 //! - `SEC-009`: 実行時に作成・書き込みするフォルダを `logs`・`temp`・`WebView2` に限定する。
 //!   `%LOCALAPPDATA%` などユーザープロファイル配下は一切参照しない。
 //!
+//! `SEC-009` は「導入フォルダごと退避・削除すれば、Hakutaku が残したデータをすべて
+//! 処分できる」ことまでを求めています。フォルダ**自体**がリンク（シンボリックリンク・
+//! ジャンクション）へ差し替えられていると、書き込みはリンク先へ透過的に抜け、この保証が
+//! 崩れます。`fs::create_dir_all` は既存のジャンクションを「既存ディレクトリ」として
+//! 成功扱いにするため、`ensure_*` の作成・書き込み確認だけではこれを検出できません。
+//! そのため [`Layout::ensure_runtime_folders_are_real_directories`] で 4 フォルダを
+//! 起動前に検査し、1 つでもリンクなら起動を拒否します（Issue #42）。
+//!
 //! 本体コードは `std::env::current_exe()` の親ディレクトリだけを基準にし、
 //! `std::env::temp_dir()` や `%LOCALAPPDATA%` 相当のユーザープロファイル参照は行いません
 //! （`SEC-009`）。テストコードでのみ、確認用の作業ディレクトリとして
@@ -46,6 +54,13 @@ const CONFIG_FILE_NAME: &str = "hakutaku.yaml";
 /// 起動を中止する。別の場所へ自動フォールバックしない」ことを求めている。
 /// この文言はその「必要な権限・対処」を表す。
 const REQUIRED_PRIVILEGE_MESSAGE: &str = "導入フォルダへの書き込み権限が必要です。別の場所へは作成しません。書き込み可能なフォルダへ Hakutaku 一式を移動するか、管理者に権限の付与を依頼してください。";
+
+/// 実行時フォルダ自体がリンクだったために起動を拒否した場合に、利用者へ伝えるべき対処
+/// （`SEC-009`、Issue #42）。
+///
+/// 「リンクを実体のフォルダへ戻す」ことが唯一の対処であり、Hakutaku 側で
+/// リンクを削除したり、リンク先へ書き込みを続けたりはしない。
+const REPARSE_POINT_REMEDY_MESSAGE: &str = "このリンクを削除し、同じ名前の実体のフォルダを作り直すか、リンクごと削除してから Hakutaku を再起動してください（Hakutaku が起動時に作り直します）。リンク先に必要なデータが残っている場合は、削除の前に手元へ移してください。これらのフォルダをリンクにして別の場所へ逃がす運用はできません。";
 
 /// 実行ファイル直下に固定される実行時フォルダの位置（`SEC-009`、`DIST-013`）。
 ///
@@ -138,6 +153,63 @@ impl Layout {
         &self.config_path
     }
 
+    /// 4 つの実行時フォルダ自体が、リンク（シンボリックリンク・ジャンクション）へ
+    /// 差し替えられていないことを確認する（`SEC-009`、Issue #42）。
+    ///
+    /// 差し替えを見つけた場合は [`ReparsePointRejection`] を返す。呼び出し側は理由を
+    /// 通知して起動を中止する。`ensure_*` の失敗（[`DirectoryFailure`]）が
+    /// 「用意できない」ことを表すのに対し、こちらは「用意はできるが、書き込むと
+    /// 導入フォルダの外へ抜ける」ことを表すため、`logs` のように通常は失敗しても
+    /// 続行するフォルダ（`DIAG-006`）でも起動を中止する。
+    ///
+    /// 検査は、どのフォルダへも書き込む前に 1 回で済ませる。`logs` を最初に検査するのは、
+    /// 診断ログを開く前にその保存先自体の差し替えを検出する必要があるためである。
+    ///
+    /// まだ存在しないフォルダは検査対象にならない（差し替えられていないため）。
+    /// 存在するが種別を確認できない場合も拒否しない（後続の `ensure_*` が
+    /// [`DirectoryFailure`] として具体的な理由を返すため、確認できていない状態を
+    /// 「リンクである」と断定して起動を止めない）。
+    pub fn ensure_runtime_folders_are_real_directories(&self) -> Result<(), ReparsePointRejection> {
+        for (folder_name, purpose, path) in self.runtime_folders() {
+            if is_reparse_point_path(path) {
+                return Err(ReparsePointRejection {
+                    target: path.to_path_buf(),
+                    folder_name,
+                    purpose,
+                    remedy: REPARSE_POINT_REMEDY_MESSAGE.to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 検査対象の実行時フォルダを、固定名・役割・絶対パスの組で返す。
+    ///
+    /// 役割の文言は利用者向けの通知文へそのまま載せる。`WebView2`（ユーザーデータの
+    /// 保存先）と `WebView2Runtime`（Fixed Version Runtime の配置先）は名前が似ており
+    /// 取り違えられやすいため、どちらのフォルダの話なのかが文面だけで分かるようにする。
+    fn runtime_folders(&self) -> [(&'static str, &'static str, &Path); 4] {
+        [
+            (LOGS_DIR_NAME, "診断ログの保存先", self.logs_dir.as_path()),
+            (
+                TEMP_DIR_NAME,
+                "一時ファイルの保存先",
+                self.temp_dir.as_path(),
+            ),
+            (
+                WEBVIEW2_DATA_DIR_NAME,
+                "WebView2 のユーザーデータ（閲覧・実行状態）の保存先",
+                self.webview2_data_dir.as_path(),
+            ),
+            (
+                WEBVIEW2_RUNTIME_DIR_NAME,
+                "Fixed Version WebView2 Runtime 本体の配置先",
+                self.webview2_runtime_dir.as_path(),
+            ),
+        ]
+    }
+
     /// `logs` フォルダを作成し、書き込めることを確認する（`DIAG-001`、`DIAG-006`）。
     ///
     /// 作成・書き込みに失敗しても panic せず [`DirectoryFailure`] を返す。
@@ -195,7 +267,7 @@ impl Layout {
 
         for entry in entries {
             match entry {
-                Ok(entry) => remove_entry_recursively(&entry.path(), &mut report),
+                Ok(entry) => remove_entry_tree(&entry.path(), &mut report),
                 Err(err) => report.failures.push(TempPurgeFailure {
                     target: self.temp_dir.clone(),
                     reason: format!("temp 配下のエントリを読み取れません: {err}"),
@@ -277,18 +349,92 @@ fn is_directory_link(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-/// `path` 以下を再帰的に削除する。`temp` の外へは出ない。
+/// `path` が存在し、かつリパースポイント（シンボリックリンク・ジャンクションなど、
+/// 別の場所へ透過的に転送される仕掛け）である場合だけ `true` を返す。
+///
+/// 判定には `symlink_metadata`（リンクをたどらない）を使う。`metadata` ではリンク先の
+/// 情報が返り、差し替えを検出できない。
+///
+/// 存在しない場合と種別を確認できない場合は `false` を返す。前者は差し替えようがなく、
+/// 後者は「確認できていない」だけであり、リンクだと断定して起動を止めるべきではない
+/// （`WebView2Runtime` 以外は後続の `ensure_*` が具体的な理由を返す）。
+fn is_reparse_point_path(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => is_reparse_point(&metadata),
+        Err(_) => false,
+    }
+}
+
+/// `symlink_metadata` で得た情報が、リパースポイントを指しているかどうかを判定する。
+///
+/// `FileType::is_symlink()` はシンボリックリンクとジャンクション（マウントポイント）
+/// だけを真とするため、それ以外のリパースポイント（別の場所へ内容を転送する仕掛け）を
+/// 取りこぼす。`SEC-009` の保証（導入フォルダごと削除すればデータを処分できる）は
+/// タグの種類によらず崩れるため、リパースポイントかどうかをファイル属性
+/// （`FILE_ATTRIBUTE_REPARSE_POINT`）で直接判定する。
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // winapi の FILE_ATTRIBUTE_REPARSE_POINT。新規に windows クレートへ依存しない。
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Unix 系にリパースポイントはない。相当する脅威はシンボリックリンクだけ。
+#[cfg(not(windows))]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+/// [`remove_entry_tree`] の明示スタックへ積む作業単位。
+enum PurgeStep {
+    /// 種別を判定して削除する。フォルダなら、配下と自分自身の削除を積み直す。
+    Inspect(PathBuf),
+    /// 配下をすべて処理し終えたフォルダ自身を削除する。
+    RemoveEmptyDir(PathBuf),
+}
+
+/// `path` 以下を削除する。`temp` の外へは出ない。
 ///
 /// 種別の判定には `symlink_metadata`（リンクをたどらない）を使う。
 /// シンボリックリンクやジャンクションは、リンク先をたどらず**リンク自体だけ**を
-/// 削除する（削除前に中身へ再帰しない）。これにより `temp` の外にあるファイルを
+/// 削除する（削除前に中身へ入らない）。これにより `temp` の外にあるファイルを
 /// 誤って削除しない。
-fn remove_entry_recursively(path: &Path, report: &mut TempPurgeReport) {
-    let metadata = match fs::symlink_metadata(path) {
+///
+/// 走査は再帰呼び出しではなく明示スタック（[`PurgeStep`]）で行う。`temp` 配下の
+/// 深さは Hakutaku が決めるものではなく（残存物は異常終了時の中身や外部プロセスが
+/// 置いたものでもあり得る）、再帰では深いツリーで通知のないスタックオーバーフローに
+/// 至るため（`ERR-004` の「再帰に上限を設ける」と同じ趣旨、Issue #42）。
+/// 深さの上限値を決め打ちすると、その値より深いだけの正常な残存物を清掃できなくなる。
+/// 反復方式ならその恣意的な線引きが要らないため、上限方式ではなくこちらを採る。
+fn remove_entry_tree(root: &Path, report: &mut TempPurgeReport) {
+    let mut pending = vec![PurgeStep::Inspect(root.to_path_buf())];
+
+    while let Some(step) = pending.pop() {
+        match step {
+            PurgeStep::Inspect(path) => inspect_and_remove(path, &mut pending, report),
+            PurgeStep::RemoveEmptyDir(path) => match fs::remove_dir(&path) {
+                Ok(()) => report.removed_entries += 1,
+                Err(err) => report.failures.push(TempPurgeFailure {
+                    target: path.clone(),
+                    reason: format!("フォルダ「{}」を削除できません: {}", path.display(), err),
+                }),
+            },
+        }
+    }
+}
+
+/// [`remove_entry_tree`] のエントリ 1 件分の処理。
+///
+/// フォルダの場合は、自分自身の削除を先に積んでから配下を積む。スタックは後入れ先出し
+/// のため、この順序により配下がすべて処理された後に自分自身が削除される
+/// （空でないフォルダに対する `remove_dir` は失敗するため、この順序でなければならない）。
+fn inspect_and_remove(path: PathBuf, pending: &mut Vec<PurgeStep>, report: &mut TempPurgeReport) {
+    let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) => {
             report.failures.push(TempPurgeFailure {
-                target: path.to_path_buf(),
+                target: path,
                 reason: format!("種別を確認できません: {err}"),
             });
             return;
@@ -306,56 +452,53 @@ fn remove_entry_recursively(path: &Path, report: &mut TempPurgeReport) {
         // 呼ぶと `ERROR_ACCESS_DENIED` になり、`remove_dir` はリンクだけを削除し
         // リンク先を残す。
         let result = if is_directory_link(&metadata) {
-            fs::remove_dir(path)
+            fs::remove_dir(&path)
         } else {
-            fs::remove_file(path)
+            fs::remove_file(&path)
         };
 
         match result {
             Ok(()) => report.removed_entries += 1,
             Err(err) => report.failures.push(TempPurgeFailure {
-                target: path.to_path_buf(),
+                target: path.clone(),
                 reason: format!("リンク「{}」を削除できません: {}", path.display(), err),
             }),
         }
         return;
     }
 
-    if file_type.is_dir() {
-        match fs::read_dir(path) {
-            Ok(entries) => {
-                for entry in entries {
-                    match entry {
-                        Ok(entry) => remove_entry_recursively(&entry.path(), report),
-                        Err(err) => report.failures.push(TempPurgeFailure {
-                            target: path.to_path_buf(),
-                            reason: format!("配下のエントリを読み取れません: {err}"),
-                        }),
-                    }
-                }
-            }
-            Err(err) => {
-                report.failures.push(TempPurgeFailure {
-                    target: path.to_path_buf(),
-                    reason: format!("フォルダ「{}」を読み取れません: {}", path.display(), err),
-                });
-                return;
-            }
-        }
-
-        match fs::remove_dir(path) {
+    if !file_type.is_dir() {
+        match fs::remove_file(&path) {
             Ok(()) => report.removed_entries += 1,
             Err(err) => report.failures.push(TempPurgeFailure {
-                target: path.to_path_buf(),
-                reason: format!("フォルダ「{}」を削除できません: {}", path.display(), err),
+                target: path.clone(),
+                reason: format!("ファイル「{}」を削除できません: {}", path.display(), err),
             }),
         }
-    } else {
-        match fs::remove_file(path) {
-            Ok(()) => report.removed_entries += 1,
+        return;
+    }
+
+    let entries = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            // 中身を確認できないフォルダは、削除も試みない（中身が残ったままの
+            // `remove_dir` は必ず失敗し、同じ原因で失敗が2件記録されるだけになる）。
+            report.failures.push(TempPurgeFailure {
+                target: path.clone(),
+                reason: format!("フォルダ「{}」を読み取れません: {}", path.display(), err),
+            });
+            return;
+        }
+    };
+
+    pending.push(PurgeStep::RemoveEmptyDir(path.clone()));
+
+    for entry in entries {
+        match entry {
+            Ok(entry) => pending.push(PurgeStep::Inspect(entry.path())),
             Err(err) => report.failures.push(TempPurgeFailure {
-                target: path.to_path_buf(),
-                reason: format!("ファイル「{}」を削除できません: {}", path.display(), err),
+                target: path.clone(),
+                reason: format!("配下のエントリを読み取れません: {err}"),
             }),
         }
     }
@@ -385,6 +528,25 @@ pub enum DirectoryAction {
     Create,
     /// フォルダへの書き込み確認に失敗した。
     Write,
+}
+
+/// 実行時フォルダ自体がリンクへ差し替えられていたために起動を拒否する理由
+/// （`SEC-009`、Issue #42）。
+///
+/// [`DirectoryFailure`] と違い、呼び出し側に選択の余地はない。リンク先への書き込みを
+/// 続ければ `SEC-009` の保証（導入フォルダごと削除すればデータを処分できる）が崩れ、
+/// リンクを Hakutaku 側で削除・差し替えれば利用者のデータを壊しかねないため、
+/// 通知して起動を中止する以外の継続手段を用意しない。
+#[derive(Clone, Debug)]
+pub struct ReparsePointRejection {
+    /// 対象フォルダの絶対パス。
+    pub target: PathBuf,
+    /// 対象フォルダの固定名（`logs`／`temp`／`WebView2`／`WebView2Runtime`）。
+    pub folder_name: &'static str,
+    /// そのフォルダの役割（利用者向けの短い説明）。
+    pub purpose: &'static str,
+    /// 利用者が取るべき対処（日本語）。
+    pub remedy: String,
 }
 
 /// [`Layout::purge_temp`] の結果。
@@ -462,6 +624,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// `link_path` に `target_dir` を指すディレクトリジャンクションを作る。
+    ///
+    /// Windows のディレクトリジャンクションは、シンボリックリンクと異なり
+    /// 管理者権限・開発者モードなしで作成できる（`mklink /J`）。作成に失敗する環境
+    /// （Windows 以外、`mklink` が使えない等）では前提を満たせないため、呼び出し側は
+    /// `false` を受けてテストをスキップする。
+    fn create_junction(link_path: &Path, target_dir: &Path) -> bool {
+        let created = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &link_path.display().to_string(),
+                &target_dir.display().to_string(),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+
+        created && link_path.exists()
     }
 
     #[test]
@@ -636,23 +820,7 @@ mod tests {
 
         let link_path = layout.temp_dir().join("link-to-target");
 
-        // Windows のディレクトリジャンクションは、シンボリックリンクと異なり
-        // 管理者権限・開発者モードなしで作成できる（`mklink /J`）。
-        // 作成に失敗する環境（Windows 以外、mklink が使えない等）では、
-        // このテストの前提を満たせないためスキップする。
-        let created = std::process::Command::new("cmd")
-            .args([
-                "/c",
-                "mklink",
-                "/J",
-                &link_path.display().to_string(),
-                &target_dir.display().to_string(),
-            ])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-
-        if !created || !link_path.exists() {
+        if !create_junction(&link_path, &target_dir) {
             eprintln!(
                 "ジャンクションを作成できない環境のため \
                  purge_temp_removes_directory_junction_without_deleting_its_target をスキップします"
@@ -685,5 +853,125 @@ mod tests {
 
         assert_eq!(report.removed_entries, 0);
         assert!(report.failures.is_empty());
+    }
+
+    // 受け入れ条件: `temp` 配下がどれだけ深くても、スタックオーバーフロー（通知のない
+    // 異常終了）を起こさずに清掃を完了する（`SEC-006`、`ERR-004` の趣旨、Issue #42）。
+    #[test]
+    fn purge_temp_removes_a_deep_directory_tree_without_recursion() {
+        let workspace = TestWorkspace::new("purge-deep");
+        let layout = Layout::from_exe_dir(workspace.path().to_path_buf());
+        layout.ensure_temp().expect("temp を用意できません");
+
+        // 深さを増やすほどパス解決の費用が深さの二乗で増えるため、ツリーは深くしすぎず、
+        // 代わりに清掃を小さいスタック（256 KiB）のスレッドで実行して検出力を確保する。
+        // 再帰実装では1段ごとに `ReadDir`（内部に約 600 バイトの検索バッファを持つ）を
+        // 抱えたフレームが積まれ、この大きさのスタックは数百段で尽きる。反復実装は
+        // スタック消費が深さに依存しないため通過する。
+        const DEPTH: usize = 1_200;
+        const PURGE_STACK_BYTES: usize = 256 * 1024;
+
+        let mut path = layout.temp_dir().to_path_buf();
+        let mut created = 0usize;
+        for _ in 0..DEPTH {
+            path.push("d");
+            if fs::create_dir(&path).is_err() {
+                // パス長の上限が異なる環境では目標の深さに届かないことがある。
+                // 作れたところまでを対象に検査する。
+                break;
+            }
+            created += 1;
+        }
+
+        assert!(
+            created >= 1_000,
+            "検査に足りる深さを作れません（作成できた深さ: {created}）"
+        );
+
+        let purge_layout = layout.clone();
+        let report = std::thread::Builder::new()
+            .stack_size(PURGE_STACK_BYTES)
+            .spawn(move || purge_layout.purge_temp())
+            .expect("清掃用スレッドを起動できません")
+            .join()
+            .expect("清掃用スレッドが異常終了しました");
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.removed_entries, created);
+        assert!(layout.temp_dir().is_dir(), "temp 自体は残るはずです");
+
+        let remaining: Vec<_> = fs::read_dir(layout.temp_dir())
+            .expect("temp を読み取れません")
+            .collect();
+        assert!(remaining.is_empty(), "残存物があります: {remaining:?}");
+    }
+
+    // 受け入れ条件: 実体のフォルダと、まだ存在しないフォルダは起動を拒否しない
+    // （`SEC-009`、Issue #42）。
+    #[test]
+    fn ensure_runtime_folders_are_real_directories_accepts_real_and_missing_folders() {
+        let workspace = TestWorkspace::new("reparse-ok");
+        let layout = Layout::from_exe_dir(workspace.path().to_path_buf());
+
+        // 4 フォルダのいずれもまだ作られていない、初回起動の状態。
+        let before = layout.ensure_runtime_folders_are_real_directories();
+        assert!(before.is_ok(), "{before:?}");
+
+        layout.ensure_logs().expect("logs を用意できません");
+        layout.ensure_temp().expect("temp を用意できません");
+        layout
+            .ensure_webview2_data()
+            .expect("WebView2 を用意できません");
+        fs::create_dir_all(layout.webview2_runtime_dir()).expect("WebView2Runtime の作成に失敗");
+
+        let after = layout.ensure_runtime_folders_are_real_directories();
+        assert!(after.is_ok(), "{after:?}");
+    }
+
+    // 受け入れ条件: `logs`／`temp`／`WebView2`／`WebView2Runtime` のいずれかが
+    // ジャンクションへ差し替えられている場合、対象と対処を伴って起動を拒否する
+    // （`SEC-009`、Issue #42）。
+    #[test]
+    fn ensure_runtime_folders_are_real_directories_rejects_a_junction_for_every_folder() {
+        for folder_name in [
+            LOGS_DIR_NAME,
+            TEMP_DIR_NAME,
+            WEBVIEW2_DATA_DIR_NAME,
+            WEBVIEW2_RUNTIME_DIR_NAME,
+        ] {
+            let workspace = TestWorkspace::new("reparse-junction");
+            let exe_dir = workspace.path().join("app");
+            fs::create_dir_all(&exe_dir).expect("exe_dir の作成に失敗");
+
+            // 差し替え先は導入フォルダの外に置く。`SEC-009` が問題にするのは、
+            // 導入フォルダを削除しても残る場所へ書き出されることそのもの。
+            let outside_dir = workspace.path().join("outside");
+            fs::create_dir_all(&outside_dir).expect("リンク先の作成に失敗");
+
+            let link_path = exe_dir.join(folder_name);
+            if !create_junction(&link_path, &outside_dir) {
+                eprintln!(
+                    "ジャンクションを作成できない環境のため \
+                     ensure_runtime_folders_are_real_directories_rejects_a_junction_for_every_folder \
+                     をスキップします"
+                );
+                return;
+            }
+
+            let layout = Layout::from_exe_dir(exe_dir);
+
+            match layout.ensure_runtime_folders_are_real_directories() {
+                Ok(()) => panic!("「{folder_name}」の差し替えを検出できていません"),
+                Err(rejection) => {
+                    assert_eq!(rejection.folder_name, folder_name);
+                    assert_eq!(rejection.target, link_path);
+                    assert!(rejection.target.is_absolute());
+                    assert!(!rejection.purpose.is_empty());
+                    assert!(!rejection.remedy.is_empty());
+                }
+            }
+
+            assert!(outside_dir.is_dir(), "リンク先には手を触れないはずです");
+        }
     }
 }

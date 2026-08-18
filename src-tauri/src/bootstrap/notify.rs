@@ -12,6 +12,9 @@
 //!   理由と必要な対応を通知する。
 //! - `DIST-014`: `WebView2`（ユーザーデータフォルダ）を作成・書き込みできない場合、
 //!   理由・対象パス・必要な権限を通知して起動を中止する。別の場所へは自動フォールバックしない。
+//! - `SEC-009`: `logs`・`temp`・`WebView2`・`WebView2Runtime` のいずれかが、フォルダ自体
+//!   を別の場所へのリンクへ差し替えられている場合、理由・対象パス・対処を通知して
+//!   起動を中止する（Issue #42）。
 //! - `DIAG-006`: 診断ログを使えない場合も、診断ログなしで動作を継続する旨を通知する。
 //!
 //! 文面の組み立て関数（`runtime_unavailable` など）は Win32 API を一切呼ばず、
@@ -32,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_TOPMOST, MESSAGEBOX_STYLE,
 };
 
-use crate::bootstrap::layout::{DirectoryAction, DirectoryFailure};
+use crate::bootstrap::layout::{DirectoryAction, DirectoryFailure, ReparsePointRejection};
 
 /// 通知の種別。アイコンの選択に使う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +212,47 @@ pub fn webview2_data_unavailable(failure: &DirectoryFailure) -> Notice {
     }
 }
 
+/// `SEC-009`。実行時フォルダ自体がリンク（シンボリックリンク・ジャンクション）へ
+/// 差し替えられていたため、起動を中止する場合の通知文を組み立てる（Issue #42）。
+///
+/// `rejection` は
+/// [`Layout::ensure_runtime_folders_are_real_directories`](crate::bootstrap::layout::Layout::ensure_runtime_folders_are_real_directories)
+/// が返した拒否理由。利用者は「なぜ起動できないのか」を画面からしか知り得ない
+/// （診断ログの保存先自体が拒否の対象になり得るため）ので、拒否した理由と、
+/// リンクを実体のフォルダへ戻すという対処の両方を本文へ入れる。
+pub fn runtime_folder_is_reparse_point(rejection: &ReparsePointRejection) -> Notice {
+    let target_display = rejection.target.display();
+    let folder_name = rejection.folder_name;
+    let purpose = rejection.purpose;
+    let remedy = &rejection.remedy;
+
+    let body = format!(
+        "Hakutaku を起動できません。実行時フォルダ「{folder_name}」が、実体のフォルダではなく\n\
+リンク（シンボリックリンク、ジャンクションなどのリパースポイント）になっています。\n\
+\n\
+対象フォルダ（絶対パス）:\n\
+  {target_display}\n\
+\n\
+このフォルダの役割:\n\
+  {purpose}\n\
+\n\
+起動を中止した理由:\n\
+  リンクのままでは、Hakutaku が書き込む内容がリンク先のフォルダへそのまま書き出されます。\n\
+  その状態では、Hakutaku の導入フォルダごと退避・削除しても、リンク先に書き出された\n\
+  データが残ります。Hakutaku は「導入フォルダごと処分すれば、残したデータをすべて\n\
+  処分できる」状態を保つため、書き込みを始める前に起動を中止しました。\n\
+\n\
+必要な対応:\n\
+  {remedy}"
+    );
+
+    Notice {
+        kind: NoticeKind::Error,
+        title: "Hakutaku: 実行時フォルダがリンクになっています".to_string(),
+        body,
+    }
+}
+
 /// `DIAG-006`。診断ログを使えないが、動作は継続する場合の通知文を組み立てる。
 pub fn diagnostics_unavailable(reason: &hakutaku_diagnostics::DiagnosticsUnavailable) -> Notice {
     let target_display = reason.target.display();
@@ -297,6 +341,29 @@ mod tests {
         assert!(notice.body.contains("書き込みできません"));
         assert!(notice.body.contains("書き込み権限を確認してください"));
         assert!(notice.body.contains("別の場所へは自動的に作成しません"));
+    }
+
+    // 受け入れ条件: 実行時フォルダがリンクだった場合の通知に、対象の絶対パス、拒否した
+    // 理由、リンクを戻す対処が含まれる（`SEC-009`、Issue #42）。
+    #[test]
+    fn runtime_folder_is_reparse_point_includes_target_reason_and_remedy() {
+        let rejection = ReparsePointRejection {
+            target: PathBuf::from(r"C:\apps\Hakutaku\logs"),
+            folder_name: "logs",
+            purpose: "診断ログの保存先",
+            remedy: "このリンクを削除し、実体のフォルダを作り直してください".to_string(),
+        };
+
+        let notice = runtime_folder_is_reparse_point(&rejection);
+
+        assert_eq!(notice.kind, NoticeKind::Error);
+        assert!(notice.body.contains(r"C:\apps\Hakutaku\logs"));
+        assert!(notice.body.contains("診断ログの保存先"));
+        assert!(notice.body.contains("リンク"));
+        assert!(notice.body.contains("導入フォルダごと"));
+        assert!(notice
+            .body
+            .contains("このリンクを削除し、実体のフォルダを作り直してください"));
     }
 
     #[test]
