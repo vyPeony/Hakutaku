@@ -9,35 +9,51 @@
 //! 新しい公開 API（[`DateTimeMatch`] 系）を追加するだけで、既存 API を置き換え
 //! ません。呼び出し側をこの新 API へ差し替える作業は P05-6 の担当です。
 //!
-//! # 曖昧性検出の設計（`LOG-022`）
+//! # 曖昧性検出と境界条件の設計（`LOG-022`、Issue #36）
 //!
 //! 自動判定（[`parse_datetime_auto`]）は 6 書式すべてを独立に試し、成立した
 //! 書式の比較キーまたは消費長が異なる場合に [`AutoParseOutcome::Ambiguous`] を
 //! 返します。愚直に「6書式を無条件に先頭一致で試す」だけだと、`LOG-DT-006`
 //! （秒を持たない）が常に他の全書式の単なる短い接頭辞として成立してしまい、
 //! `LOG-DT-001` のような曖昧でないはずの入力まで曖昧判定になってしまいます。
-//! これを避けるため、各書式には「直後の1バイトが特定の文字だった場合は候補から
+//! これを避けるため、各書式には「一致箇所の直後に続く文字を見て候補から
 //! 除外する」境界条件（[`boundary_ok`]）を持たせています。
 //!
-//! 境界条件の判断基準は次のとおりです。
+//! 境界条件は、次の一つの原則で決めます（Issue #36 で6書式に対して対称化
+//! しました。それ以前は `001`／`002` に境界条件が無く、4桁以上の小数秒が黙って
+//! 3桁へ切り詰められていました）。
 //!
-//! - `LOG-DT-001`／`002`（3桁ミリ秒）: 境界条件なし（P04 からの既存の許容方式を
-//!   維持。行末でも任意の続きの文字でも構いません）。
-//! - `LOG-DT-003`／`004`（2桁の1/100秒）: 直後がさらに数字であれば除外します。
-//!   3桁形式（`001`／`002`）の小数点以下を2桁だけ読んでしまう誤読を防ぎます。
-//! - `LOG-DT-005`（秒まで、小数なし）: 直後が `.` であれば除外します。`.` は
-//!   小数点区切りとして一義的（この文脈で他の意味を持たない）なため、`005` と
-//!   解釈する余地を残しません。一方 `:` は本文中でも汎用的に使われる区切り
-//!   文字であるため、あえて除外せず許容します。この結果、`HH:mm:ss:SS`
-//!   （`LOG-DT-004`）と `HH:mm:ss`（`LOG-DT-005`）が同時に成立する入力
-//!   （計画書の例: `2026/07/28 15:12:23:45`）は意図どおり曖昧判定になります。
-//! - `LOG-DT-006`（分まで）: 直後が `:` であれば除外します。`:` は他の5書式
-//!   すべてで秒の区切りとして使われるため、直後に `:` が続く場合は明確に
-//!   「秒を持つ書式の一部」であり、`006` の独立した候補にはしません。
+//! > **わずかに合致しない入力を、黙って部分一致で成立させない。** 一致箇所の
+//! > 直後に「その書式では読み取れない時刻の桁」が続く場合、その書式は候補に
+//! > しません。ただし、その桁を読み取れる別の既知書式が同時に成立する場合は
+//! > 候補に残し、判断を曖昧性検出（`LOG-022`）へ委ねます。
+//!
+//! 除外の結果どの書式も成立しなければ、その行は「日時なし」になります。直前に
+//! 日時付き行があれば継続行として結合され（`LOG-014`）、無ければ日時未確定の
+//! 独立した項目になります。**精度を黙って切り捨てた解析結果を返すより、解析
+//! しないことを選ぶ**という判断です（`LOG-024`「元の精度を失わない」）。
+//!
+//! 書式ごとの内訳は次のとおりです。
+//!
+//! - `LOG-DT-001`／`002`（3桁ミリ秒）・`LOG-DT-003`／`004`（2桁の1/100秒）:
+//!   直後がさらに数字であれば除外します。入力がその書式より細かい小数秒
+//!   （マイクロ秒など）を持つことを意味し、採用すると残りの桁を黙って
+//!   捨てることになるためです。
+//! - `LOG-DT-005`（秒まで、小数なし）: 直後が数字（秒の桁の続き）または `.`
+//!   （この文脈で小数点区切り以外の意味を持たない）であれば除外します。直後が
+//!   `:` の場合は、そこから続く数字の桁数で分けます。**ちょうど2桁**のときだけ
+//!   候補に残します（`LOG-DT-004` が必ず同時に成立するため、どちらの読み方が
+//!   正しいかを推測せず曖昧性検出へ委ねられる）。1桁または3桁以上のときは、
+//!   その桁を読み取れる既知書式が無く、採用すれば黙って捨てることになるため
+//!   除外します。数字が続かない `:`（本文中の区切り）は、失う桁が無いため
+//!   候補に残します。
+//! - `LOG-DT-006`（分まで）: 直後が `:`、`.`、数字のいずれかであれば除外します。
+//!   `:` は他の5書式すべてで秒の区切りとして使われ、`.` と数字は分より細かい
+//!   桁の始まりであるため、いずれも `006` の独立した候補にはしません。
 //!
 //! この規則により、`LOG-DT-004` は成立するたびに必ず `LOG-DT-005` とも同時に
-//! 成立します（`004` の小数点区切りは常に `:` であり、`005` の除外条件
-//! （直後が `.`）に該当しないため）。これは意図した設計です。`LOG-DT-004`
+//! 成立します（`004` の小数点区切りは常に `:` であり、続く数字がちょうど2桁
+//! なので `005` の除外条件に該当しないため）。これは意図した設計です。`LOG-DT-004`
 //! 単独では「曖昧でない」自動判定結果を作れません（仕様の例そのものが表す
 //! 性質のため）。単一書式を指定した解析（[`parse_datetime_with_format`]）では
 //! 曖昧性の比較を行わないため、`LOG-DT-004` 単体の解析は通常どおり成功します。
@@ -138,6 +154,13 @@ pub enum Precision {
 ///
 /// 書式に含まれない下位桁は 0 として補完済みの値から構築されます。`Ord` を
 /// 実装しているため、P09 の時系列マージがそのまま全順序比較に使えます。
+///
+/// **タイムゾーン変換を行いません。** 既知の6書式はいずれもタイムゾーン表記を
+/// 持たず、Hakutaku はそれらを端末のローカル時刻として解釈します（`LOG-012`）。
+/// この型は、そのローカル壁時計の値をそのまま数値の一次元へ写して大小比較を
+/// できるようにするだけのもので、絶対時刻（UTC の瞬間）を表しません。異なる
+/// タイムゾーンで記録されたログを混在させても、この値は記録された壁時計の
+/// 順序で並びます（`LOG-016`: 時刻ずれ補正を行わない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ComparisonKey(i64);
 
@@ -160,8 +183,14 @@ impl ComparisonKey {
         ComparisonKey(days * 86_400_000 + millis_of_day)
     }
 
-    /// 内部値（エポック（1970-01-01T00:00:00.000）からのミリ秒数）を返します。
-    /// 診断・デバッグ表示、およびテストでの検証向けです。
+    /// 内部値を返します。診断・デバッグ表示、およびテストでの検証向けです。
+    ///
+    /// 値は、解析した**ローカル壁時計の**年月日時分秒ミリ秒を、
+    /// `1970-01-01T00:00:00.000` を起点とする経過ミリ秒として換算したものです。
+    /// タイムゾーン変換を行わないため（[`ComparisonKey`] の doc コメント）、
+    /// 同じ壁時計の値を UTC として解釈した場合の Unix 時刻と数値は一致しますが、
+    /// 意味は「その瞬間の絶対時刻」ではありません。呼び出し側はこの値を比較・
+    /// 差分計算にだけ使い、絶対時刻として外部へ渡さないでください。
     #[must_use]
     pub fn as_millis_since_epoch(&self) -> i64 {
         self.0
@@ -357,17 +386,57 @@ const FORMAT_SPECS: [FormatSpec; 6] = [
     },
 ];
 
-/// 一致箇所の直後の1バイト（存在すれば）から、その書式を候補として採用してよいか
-/// を判定します。判断基準はモジュール冒頭のドキュメントを参照してください。
-fn boundary_ok(format: LogDateTimeFormat, next_byte: Option<u8>) -> bool {
+/// 一致箇所の直後に続くバイト列から、その書式を候補として採用してよいかを
+/// 判定します。判断の原則と書式ごとの内訳は、モジュール冒頭のドキュメント
+/// 「曖昧性検出と境界条件の設計」を参照してください。
+///
+/// `rest` は一致箇所の直後から行末までのバイト列です（一致箇所が行末で
+/// 終わっていれば空）。直後の1バイトだけでは `LOG-DT-005` の `:` を判断
+/// できない——続く数字がちょうど2桁なら `LOG-DT-004` も同時に成立し、それ
+/// 以外の桁数なら読み取れる書式が無い——ため、1バイトではなく残り全体を
+/// 受け取ります。
+fn boundary_ok(format: LogDateTimeFormat, rest: &[u8]) -> bool {
+    let next_byte = rest.first().copied();
     match format {
-        LogDateTimeFormat::LogDt001 | LogDateTimeFormat::LogDt002 => true,
-        LogDateTimeFormat::LogDt003 | LogDateTimeFormat::LogDt004 => {
-            !matches!(next_byte, Some(byte) if byte.is_ascii_digit())
+        // 小数秒を持つ4書式は、直後がさらに数字なら「入力の方が細かい精度を
+        // 持つ」ことの証拠なので候補にしない（Issue #36）。
+        LogDateTimeFormat::LogDt001
+        | LogDateTimeFormat::LogDt002
+        | LogDateTimeFormat::LogDt003
+        | LogDateTimeFormat::LogDt004 => !matches!(next_byte, Some(byte) if byte.is_ascii_digit()),
+        LogDateTimeFormat::LogDt005 => match next_byte {
+            // 秒の桁がまだ続いている（`15:12:234` など）。どの既知書式でも
+            // 読み取れない桁であり、採用すれば黙って捨てることになる。
+            Some(byte) if byte.is_ascii_digit() => false,
+            // `.` は小数点区切りとして一義的。`.SSS`／`.SS` は 001／003 が
+            // 読み取り、それ以外の桁数はどの書式でも読み取れない。
+            Some(b'.') => false,
+            // `:` は小数点区切り（`LOG-DT-004`）にも本文の区切りにもなり得る
+            // ため、続く数字の桁数で判断する。0桁（本文の区切り）は失う桁が
+            // 無いので許容し、2桁は 004 も成立して曖昧性検出（`LOG-022`）が
+            // 推測せず利用者へ返すので許容する。それ以外は除外する。
+            Some(b':') => {
+                let digits = leading_digit_run(&rest[1..]);
+                digits == 0 || digits == 2
+            }
+            _ => true,
+        },
+        // 分までの書式は、秒の区切り（`:`）・小数点（`.`）・分の桁の続き
+        // （数字）のいずれが来ても、より細かい桁を捨てることになるため
+        // 独立した候補にしない。
+        LogDateTimeFormat::LogDt006 => {
+            !matches!(next_byte, Some(byte) if byte == b':' || byte == b'.' || byte.is_ascii_digit())
         }
-        LogDateTimeFormat::LogDt005 => next_byte != Some(b'.'),
-        LogDateTimeFormat::LogDt006 => next_byte != Some(b':'),
     }
+}
+
+/// 先頭から連続する ASCII 数字の個数を返します（[`boundary_ok`] が
+/// 「直後に何桁の数字が続くか」で書式を分けるために使います）。
+fn leading_digit_run(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count()
 }
 
 /// 年月日時分（共通部分、`YYYY/MM/DD HH:mm` の12桁）が数字であるべき相対位置。
@@ -447,8 +516,7 @@ fn parse_with_spec(spec: &FormatSpec, text: &str) -> Option<DateTimeMatch> {
         return None;
     }
 
-    let next_byte = bytes.get(total_len).copied();
-    if !boundary_ok(spec.format, next_byte) {
+    if !boundary_ok(spec.format, &bytes[total_len..]) {
         return None;
     }
 
@@ -858,5 +926,239 @@ mod tests {
             parse_datetime_auto("2026/07/28 15:12:23:45"),
             AutoParseOutcome::Ambiguous(_)
         ));
+    }
+
+    // 受け入れ条件（Issue #36 ①、`LOG-024`）: 小数4桁以上（マイクロ秒など）は
+    // 3桁へ黙って切り捨てず、どの書式にも一致しない。自動判定はファイル先頭で
+    // 最初に一致した行の書式を全体へ適用するため、ここで部分一致を許すと
+    // ファイル全体がミリ秒へ切り詰められる。
+    #[test]
+    fn sub_millisecond_precision_is_rejected_instead_of_truncated() {
+        assert!(
+            parse_datetime_with_format(LogDateTimeFormat::LogDt001, "2026/07/28 15:12:23.4567")
+                .is_none(),
+            "小数4桁を3桁として部分一致させない"
+        );
+        assert!(parse_datetime_with_format(
+            LogDateTimeFormat::LogDt002,
+            "2026-07-28 15:12:23:4567"
+        )
+        .is_none());
+
+        for input in [
+            "2026/07/28 15:12:23.4567",
+            "2026/07/28 15:12:23.4567 起動しました",
+            "2026/07/28 15:12:23.456789",
+            "2026-07-28 15:12:23:4567",
+            "2026-07-28 15:12:23:456789 起動しました",
+        ] {
+            assert!(
+                matches!(parse_datetime_auto(input), AutoParseOutcome::NoMatch),
+                "入力 {input} は日時なし（継続行へ吸収）になるはず"
+            );
+        }
+    }
+
+    // 受け入れ条件（Issue #36 ②、`LOG-007`）: `YYYY/MM/DD HH:mm:ss:SSS`
+    // （スラッシュ日付＋コロンミリ秒）は既知の6書式に無い。`LOG-DT-005` として
+    // 部分一致させるとミリ秒を捨てた比較キー（.000）で時系列統合の並びが
+    // 実際の記録順とずれるため、日時なしとして扱う。
+    #[test]
+    fn colon_millisecond_with_slash_date_is_rejected_instead_of_dropping_the_fraction() {
+        for input in [
+            "2026/07/28 15:12:23:456",
+            "2026/07/28 15:12:23:456 起動しました",
+        ] {
+            assert!(
+                matches!(parse_datetime_auto(input), AutoParseOutcome::NoMatch),
+                "入力 {input} は日時なしになるはず"
+            );
+            assert!(
+                parse_datetime_with_format(LogDateTimeFormat::LogDt005, input).is_none(),
+                "入力 {input} を LOG-DT-005 として部分一致させない"
+            );
+        }
+    }
+
+    // 受け入れ条件（Issue #36 ③、`LOG-014`）: 小数1桁の行はどの書式にも
+    // 一致せず、日時なし（＝直前の日時付き行の継続行へ吸収される）になる。
+    // 区切りが `.` でも `:` でも同じ扱いになることを固定する。
+    #[test]
+    fn single_fraction_digit_yields_no_match_for_both_separators() {
+        for input in [
+            "2026/07/28 15:12:23.4",
+            "2026/07/28 15:12:23.4 起動しました",
+            "2026/07/28 15:12:23:4",
+            "2026/07/28 15:12:23:4 起動しました",
+        ] {
+            assert!(
+                matches!(parse_datetime_auto(input), AutoParseOutcome::NoMatch),
+                "入力 {input} は日時なしになるはず"
+            );
+        }
+    }
+
+    // 受け入れ条件（`LOG-022`）: `:` の直後がちょうど2桁の場合だけは
+    // `LOG-DT-005` を候補に残す。`LOG-DT-004` が必ず同時に成立し、どちらの
+    // 読み方かを推測せず曖昧性検出で利用者へ返せるためで、境界条件の対称化
+    // （Issue #36）でもこの性質を変えない。
+    #[test]
+    fn two_digit_colon_fraction_keeps_log_dt_004_and_005_both_as_candidates() {
+        for input in [
+            "2026/07/28 15:12:23:45",
+            "2026/07/28 15:12:23:45 起動しました",
+        ] {
+            match parse_datetime_auto(input) {
+                AutoParseOutcome::Ambiguous(candidates) => {
+                    let formats: Vec<LogDateTimeFormat> =
+                        candidates.iter().map(|c| c.format).collect();
+                    assert!(
+                        formats.contains(&LogDateTimeFormat::LogDt004),
+                        "入力: {input}"
+                    );
+                    assert!(
+                        formats.contains(&LogDateTimeFormat::LogDt005),
+                        "入力: {input}"
+                    );
+                }
+                other => panic!("入力 {input} は Ambiguous になるはずが {other:?} だった"),
+            }
+        }
+    }
+
+    // 受け入れ条件: 数字を伴わない `:`（本文中の区切り）は失う桁が無いため、
+    // `LOG-DT-005` の候補から外さない。境界条件の対称化（Issue #36）が本文の
+    // 書き出しまで巻き込んで日時なしにしないことの確認。
+    #[test]
+    fn log_dt_005_accepts_a_colon_that_is_not_a_fraction() {
+        for input in [
+            "2026/07/28 15:12:23: 起動しました",
+            "2026/07/28 15:12:23:エラー発生",
+            "2026/07/28 15:12:23::区切り",
+        ] {
+            match parse_datetime_auto(input) {
+                AutoParseOutcome::Matched(m) => {
+                    assert_eq!(m.format, LogDateTimeFormat::LogDt005, "入力: {input}");
+                    assert_eq!(m.second, 23);
+                }
+                other => panic!("入力 {input} は Matched になるはずが {other:?} だった"),
+            }
+        }
+    }
+
+    // 受け入れ条件（Issue #36）: 秒の桁がさらに続く入力（`15:12:234`）を
+    // `LOG-DT-005` として部分一致させない。どの既知書式でも読み取れない桁を
+    // 黙って捨てないための境界条件。
+    #[test]
+    fn log_dt_005_rejects_a_trailing_second_digit() {
+        assert!(
+            parse_datetime_with_format(LogDateTimeFormat::LogDt005, "2026/07/28 15:12:234")
+                .is_none()
+        );
+        assert!(matches!(
+            parse_datetime_auto("2026/07/28 15:12:234"),
+            AutoParseOutcome::NoMatch
+        ));
+    }
+
+    // 受け入れ条件（Issue #36）: `LOG-DT-006`（分まで）は、直後に分より細かい
+    // 桁の始まり（`.` または数字）が続く場合も候補にしない（従来から除外して
+    // いた `:` と揃える）。本文が空白で始まる通常の行は従来どおり成立する。
+    #[test]
+    fn log_dt_006_rejects_finer_precision_that_follows() {
+        for input in ["2026/07/28 15:123", "2026/07/28 15:12.34"] {
+            assert!(
+                parse_datetime_with_format(LogDateTimeFormat::LogDt006, input).is_none(),
+                "入力 {input} を LOG-DT-006 として部分一致させない"
+            );
+            assert!(
+                matches!(parse_datetime_auto(input), AutoParseOutcome::NoMatch),
+                "入力 {input} は日時なしになるはず"
+            );
+        }
+
+        assert!(matches!(
+            parse_datetime_auto("2026/07/28 15:12 起動しました"),
+            AutoParseOutcome::Matched(_)
+        ));
+    }
+
+    // 受け入れ条件（Issue #36 の絶対条件）: 境界条件を対称化しても、6書式
+    // それぞれの正しい入力は——行末で終わる場合も本文が続く場合も——従来どおり
+    // 単一書式指定で解析できる。
+    #[test]
+    fn all_six_formats_still_match_their_own_valid_inputs() {
+        let cases = [
+            (LogDateTimeFormat::LogDt001, "2026/07/28 15:12:23.456"),
+            (LogDateTimeFormat::LogDt002, "2026-07-28 15:12:23:456"),
+            (LogDateTimeFormat::LogDt003, "2026/07/28 15:12:23.45"),
+            (LogDateTimeFormat::LogDt004, "2026/07/28 15:12:23:45"),
+            (LogDateTimeFormat::LogDt005, "2026/07/28 15:12:23"),
+            (LogDateTimeFormat::LogDt006, "2026/07/28 15:12"),
+        ];
+
+        for (format, input) in cases {
+            let at_end = parse_datetime_with_format(format, input)
+                .unwrap_or_else(|| panic!("{} は {input} を解析できるはず", format.id()));
+            let with_message = parse_datetime_with_format(format, &format!("{input} 起動しました"))
+                .unwrap_or_else(|| panic!("{} は本文付きでも解析できるはず", format.id()));
+
+            assert_eq!(at_end.comparison_key, with_message.comparison_key);
+            assert_eq!(at_end.matched_len, input.len());
+            assert_eq!(at_end.precision, with_message.precision);
+        }
+    }
+
+    // 受け入れ条件（`LOG-024`、Issue #36 の付随項目）: 時刻の範囲外表記は
+    // 日時として成立しない。`24:00`（翌日0時の別表記）・分60・秒60
+    // （うるう秒表記 `23:59:60` を含む）はいずれも拒否し、日時なしとして
+    // 扱う（`docs/domain/time-model.md` の「うるう秒と時刻の範囲外表記」）。
+    #[test]
+    fn out_of_range_clock_values_including_leap_second_notation_are_rejected() {
+        for input in [
+            // 24時制の終端表記（一部のログが日の終わりに使う）。
+            "2026/07/28 24:00:00.000",
+            "2026/07/28 24:00",
+            // 分が60。
+            "2026/07/28 23:60:00.000",
+            // 秒が60（うるう秒表記）。実際にうるう秒が挿入された日を含む。
+            "2026/07/28 23:59:60.000",
+            "2016/12/31 23:59:60.000",
+            "2016/12/31 23:59:60",
+        ] {
+            assert!(
+                matches!(parse_datetime_auto(input), AutoParseOutcome::NoMatch),
+                "入力 {input} は日時として成立しないはず"
+            );
+        }
+
+        // 範囲内の終端は従来どおり成立する（拒否が広がりすぎていないことの確認）。
+        assert!(matches!(
+            parse_datetime_auto("2026/07/28 23:59:59.999"),
+            AutoParseOutcome::Matched(_)
+        ));
+    }
+
+    // 受け入れ条件（`LOG-012`、`LOG-016`）: 比較キーは、解析したローカル壁時計の
+    // 値をそのままエポック起点のミリ秒へ換算した比較専用の値であり、
+    // タイムゾーン変換を行わない。
+    #[test]
+    fn comparison_key_is_local_wall_clock_millis_without_timezone_conversion() {
+        let epoch =
+            parse_datetime_with_format(LogDateTimeFormat::LogDt001, "1970/01/01 00:00:00.000")
+                .expect("解析できるはず");
+        assert_eq!(epoch.comparison_key.as_millis_since_epoch(), 0);
+
+        let next_day =
+            parse_datetime_with_format(LogDateTimeFormat::LogDt001, "1970/01/02 00:00:00.000")
+                .expect("解析できるはず");
+        assert_eq!(next_day.comparison_key.as_millis_since_epoch(), 86_400_000);
+
+        // エポック以前は負の値になる（符号付きのまま全順序比較に使える）。
+        let before_epoch =
+            parse_datetime_with_format(LogDateTimeFormat::LogDt001, "1969/12/31 23:59:59.999")
+                .expect("解析できるはず");
+        assert_eq!(before_epoch.comparison_key.as_millis_since_epoch(), -1);
+        assert!(before_epoch.comparison_key < epoch.comparison_key);
     }
 }

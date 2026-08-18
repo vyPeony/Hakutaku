@@ -627,4 +627,55 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(items[0].unconfirmed);
     }
+
+    // 受け入れ条件（Issue #36、LOG-014・LOG-024）: 既知の6書式より細かい小数秒
+    // （マイクロ秒など）を持つ行は、ミリ秒へ切り詰めて解析せず日時なしとして
+    // 扱う。直前に日時付き行があれば継続行として結合される。
+    #[test]
+    fn sub_millisecond_line_is_absorbed_as_a_continuation_line() {
+        let mut assembler = StreamingAssembler::new(false, None);
+        feed_all(
+            &mut assembler,
+            &[
+                ("2026/07/28 15:12:23.456 一行目", false),
+                ("2026/07/28 15:12:24.4567 マイクロ秒の行", false),
+            ],
+        );
+        assembler.finish();
+
+        assert_eq!(
+            assembler.detected_datetime_format(),
+            Some(LogDateTimeFormat::LogDt001)
+        );
+        let items = assembler.drain_ready();
+        assert_eq!(items.len(), 1, "小数4桁の行は継続行として結合される");
+        assert_eq!(items[0].continuation_count, 1);
+    }
+
+    // 受け入れ条件（Issue #36、LOG-022）: マイクロ秒精度だけで構成された
+    // ファイルは、先頭行で書式を確定できないため「日時を持たないログ」として
+    // 1行=1項目で扱う（曖昧判定による生表示退避ではない）。
+    #[test]
+    fn file_of_only_sub_millisecond_lines_has_no_detected_format() {
+        let mut assembler = StreamingAssembler::new(false, None);
+        feed_all(
+            &mut assembler,
+            &[
+                ("2026/07/28 15:12:23.4567 一行目", false),
+                ("2026/07/28 15:12:24.4567 二行目", false),
+            ],
+        );
+        assembler.finish();
+
+        assert!(assembler.detected_datetime_format().is_none());
+        assert!(
+            !assembler.fell_back_to_raw_display(false),
+            "曖昧判定による退避ではなく、単に日時書式を持たないログとして扱う"
+        );
+        let items = assembler.drain_ready();
+        assert_eq!(items.len(), 2, "日時なし行はそれぞれ独立した項目のまま");
+        assert!(items
+            .iter()
+            .all(|item| item.comparison_key_millis.is_none()));
+    }
 }
