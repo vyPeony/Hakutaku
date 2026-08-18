@@ -22,10 +22,64 @@
 //! `Err` を返さず、無効化された [`Diagnostics`] と理由（[`DiagnosticsUnavailable`]）
 //! を返します。**別の保存先へは自動フォールバックしません。** 呼び出し側は
 //! 理由を利用者へ通知したうえで、診断ログなしで動作を継続できます。
+//!
+//! # レコードの書式と機械的な分割（`DIAG-005`）
+//!
+//! 1 レコードは 1 行で、欄の区切りは「半角スペース・縦棒・半角スペース」
+//! （` | `）です。欄は先頭から次の 9 個で、**本文は必ず最後尾の欄**です。
+//!
+//! ```text
+//! 時刻 | 重要度 | モジュール | 操作種別 | src=ソースID | code=エラーコード | proc=権限 | at=内部位置 | 本文
+//! ```
+//!
+//! 本文はマスキングも加工もせずそのまま記録するため（`DIAG-003`、`DIAG-004`）、
+//! **本文に含まれる ` | ` をエスケープしません**。エスケープすると記録された
+//! 本文が原文と一致しなくなり、無加工で記録するという要件そのものを崩すため
+//! です。区切りに使う文字列を本文から取り除くこともしません。
+//!
+//! そのため、レコードを機械的に欄へ分割する場合は、**先頭から 8 回だけ区切り、
+//! 9 個目（残り全部）を本文とみなします**。Rust なら `line.splitn(9, " | ")`、
+//! PowerShell なら `-split ' \| ', 9` が対応します。すべての区切りで分割する
+//! 方法は、本文に ` | ` を含むレコードで欄数が変わるため使えません。
+//!
+//! 行の読み分けは次のとおりです。
+//!
+//! - `#` で始まる行: ファイル冒頭の見出し（レコードではありません）
+//! - タブで始まる行: 直前のレコードの本文の 2 行目以降（[`Record::message`] が
+//!   複数行の場合、2 行目以降はタブ 1 個で字下げします）
+//! - それ以外の行: 新しいレコードの先頭行
+//!
+//! # 多重プロセスでの追記とローテーション（`DIAG-002`、`DIAG-006`、`DIAG-007`）
+//!
+//! 診断ログは追記モードで開くため、昇格プロセスと非昇格プロセスのレコードが
+//! 同一ファイルに混在し得ます（`DIAG-007`。ファイル冒頭の見出しにも明記します）。
+//! そのためローテーションの判定には、自プロセスが書いたバイト数の累計ではなく、
+//! **書き込み直後の実ファイルサイズ**を使います
+//! （非公開の `ActiveState::write_record`）。自プロセス分だけを数えると、他プロセスの
+//! 追記で実ファイルが `max_file_bytes` を大きく超えても退避されません。
+//!
+//! 一方、次の3点は**多重プロセス時の既知の性質**として残ります。プロセス間で
+//! 退避を調停する仕組み（名前付きミューテックスなど）をこのクレートは持たず、
+//! `DIAG-006`／`DIAG-007` の縮退（通知したうえで、診断ログなしでアプリの動作を
+//! 継続する）で足りると判断しているためです。診断ログを読むときの前提として
+//! ください。
+//!
+//! 1. 他プロセスが先に退避すると、自プロセスのハンドルは退避済みファイル
+//!    （`hakutaku.1.log`）を指したまま追記を続けます。レコード自体は失われ
+//!    ませんが、退避済みファイルの末尾に、退避より後の時刻のレコードが並びます
+//! 2. 退避（[`std::fs::rename`]）は、他プロセスがハンドルを保持していると
+//!    失敗し得ます（Windows）。この場合は `DIAG-006` の扱いに合流し、その時点で
+//!    診断ログを無効化して理由を通知します。**判定を書き込みの後に行うため、
+//!    直前のレコードは既にファイルへ書き込み済みで、失われません**
+//! 3. 複数プロセスがほぼ同時に退避すると世代の繰り下げが二重に走り、
+//!    `max_generations` に届く前に古い世代が削除され得ます
+//!
+//! 単一プロセスで起動する通常の運用（`PRIV-002` の昇格再起動を挟まない場合）
+//! では、いずれも発生しません。
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -166,22 +220,32 @@ impl fmt::Display for DiagnosticsUnavailable {
 /// `file` は `Option` にしています。ローテーション時に Windows 上でハンドルを
 /// 保持したまま rename できないため、退避の前に一度 `None` へ落として
 /// ハンドルを明示的に閉じる必要があるからです。
+///
+/// 現行ファイルのサイズは**保持しません**。多重プロセスで追記し得るため
+/// （モジュール doc コメント「多重プロセスでの追記とローテーション」）、
+/// 自プロセスが書いた量の累計は実ファイルサイズと一致しないからです。
 struct ActiveState {
     dir: PathBuf,
     file: Option<File>,
-    current_size: u64,
     policy: RotationPolicy,
     elevation: ProcessElevation,
 }
 
 impl ActiveState {
+    /// 1 レコードを追記し、**追記後の実ファイルサイズ**でローテーションを
+    /// 判定します（`DIAG-002`）。
+    ///
+    /// 判定に自プロセスの累積書き込み量を使わない理由は、モジュール doc
+    /// コメントの「多重プロセスでの追記とローテーション」を参照してください。
+    ///
+    /// 判定を書き込みの**後**に置いているため、1 ファイルは最大で 1 レコード分
+    /// だけ `max_file_bytes` を超え得ます。書き込みの前に判定すると、1 レコードが
+    /// 単独で `max_file_bytes` を超える場合に「退避しても収まらない」状態が
+    /// 続くため、「超えたら次のレコードから新しいファイルへ」という後判定に
+    /// します。退避に失敗した場合でも、このレコード自体は書き込み済みです。
     fn write_record(&mut self, record: &Record<'_>) -> Result<(), DiagnosticsUnavailable> {
         let line = format_record(record, self.elevation);
         let bytes = line.as_bytes();
-
-        if self.current_size.saturating_add(bytes.len() as u64) > self.policy.max_file_bytes {
-            self.rotate()?;
-        }
 
         let target = generation_path(&self.dir, 0);
         let Some(file) = self.file.as_mut() else {
@@ -201,12 +265,25 @@ impl ActiveState {
             DiagnosticsUnavailable::from_io("診断ログのフラッシュに失敗しました", &target, &error)
         })?;
 
-        self.current_size += bytes.len() as u64;
+        // 追記モードのハンドルは write の直後に必ずファイル末尾を指すため、
+        // ここでの位置が「他プロセスの追記を含む実ファイルサイズ」になる。
+        // 位置を取得できなかった場合は、記録を止めないことを優先してこの回の
+        // 判定だけを見送る（次の書き込みで判定し直される）。
+        let size = file.stream_position().ok();
+        if size.is_some_and(|size| size > self.policy.max_file_bytes) {
+            self.rotate()?;
+        }
+
         Ok(())
     }
 
     /// `hakutaku.log` → `hakutaku.1.log` → … と退避し、新しい `hakutaku.log` を
     /// 見出し付きで作り直します（`DIAG-002`）。
+    ///
+    /// 失敗した場合は `Err` を返し、呼び出し側（[`Diagnostics::log`]）が診断ログを
+    /// 無効化して理由を通知します（`DIAG-006`）。多重プロセスでは他プロセスの
+    /// ハンドル保持により退避が失敗し得ますが、そこまでの調停は行いません
+    /// （モジュール doc コメント「多重プロセスでの追記とローテーション」）。
     fn rotate(&mut self) -> Result<(), DiagnosticsUnavailable> {
         // Windows ではハンドルを保持したまま rename できないため、先に閉じる。
         self.file = None;
@@ -235,7 +312,6 @@ impl ActiveState {
             )
         })?;
 
-        self.current_size = LOG_HEADER.len() as u64;
         self.file = Some(file);
         Ok(())
     }
@@ -358,19 +434,20 @@ impl Diagnostics {
                 DiagnosticsUnavailable::from_io("診断ログファイルを開けません", &target, &error)
             })?;
 
-        let mut current_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-
-        if current_size == 0 {
+        // 空のときだけ見出しを書く。既に他プロセスが見出しを書いた後に開いた
+        // 場合へ二重に書き足さないための判定であり、長さを取得できなかった
+        // 場合は「新規作成された」とみなして見出しを書く（見出しが 1 つも無い
+        // ファイルを作らないことを優先する。`SEC-005` の明記）。
+        let existing_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if existing_size == 0 {
             file.write_all(LOG_HEADER.as_bytes()).map_err(|error| {
                 DiagnosticsUnavailable::from_io("診断ログの見出しを書き込めません", &target, &error)
             })?;
-            current_size = LOG_HEADER.len() as u64;
         }
 
         Ok(ActiveState {
             dir: logs_dir.to_path_buf(),
             file: Some(file),
-            current_size,
             policy,
             elevation,
         })
@@ -457,8 +534,13 @@ fn generation_path(dir: &Path, generation: u32) -> PathBuf {
     }
 }
 
-/// `DIAG-005` の 1 レコードを、見出し行 1 行（複数行本文は 2 行目以降をタブで
+/// `DIAG-005` の 1 レコードを、先頭行 1 行（複数行本文は 2 行目以降をタブで
 /// 字下げ）の形式へ整形します。`src`・`code` が無い場合は `-` にします。
+///
+/// 欄の区切りは ` | `、欄は 9 個で本文が最後尾です。本文内の ` | ` は
+/// エスケープしないため、読み手は先頭から 8 回だけ分割します。規定の全文は
+/// モジュール doc コメントの「レコードの書式と機械的な分割」を正本とし、
+/// ここへは複製しません。
 fn format_record(record: &Record<'_>, elevation: ProcessElevation) -> String {
     let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z");
     let severity = severity_label(record.severity);
@@ -494,14 +576,27 @@ fn elevation_label(elevation: ProcessElevation) -> &'static str {
 }
 
 /// 本文が複数行の場合、2 行目以降をタブ 1 個で字下げします。
+///
+/// 改行として扱うのは `\n`、`\r\n`、`\r` 単独の 3 種類です。Windows 以外で
+/// 作られたログや古い機器の出力には `\r` 単独の改行が現れ得るため、これを
+/// 改行として扱わないと、本文の 2 行目以降が字下げされず、次のレコードの
+/// 先頭行と見分けられなくなります（モジュール doc コメント「レコードの書式と
+/// 機械的な分割」の行の読み分け）。
+///
+/// 挿入するのはタブだけで、**本文のバイト列そのものは書き換えません**
+/// （`DIAG-003`、`DIAG-004`）。`\r\n` は改行 1 個として扱い、`\r` と `\n` の
+/// 間へタブを差し込みません。
 fn indent_continuation(message: &str) -> String {
     let mut result = String::with_capacity(message.len());
-    for (index, line) in message.split('\n').enumerate() {
-        if index > 0 {
-            result.push('\n');
-            result.push('\t');
+    let mut chars = message.chars().peekable();
+    while let Some(character) = chars.next() {
+        result.push(character);
+        match character {
+            '\n' => result.push('\t'),
+            // CRLF は 2 文字で改行 1 個。字下げは後続の LF 側で行う。
+            '\r' if chars.peek() != Some(&'\n') => result.push('\t'),
+            _ => {}
         }
-        result.push_str(line);
     }
     result
 }
@@ -625,6 +720,65 @@ mod tests {
             indent_continuation("line1\nline2\nline3"),
             "line1\n\tline2\n\tline3"
         );
+    }
+
+    // 受け入れ条件: `\r` 単独の改行も継続行として字下げし、`\r\n` は改行 1 個
+    // として扱う（`DIAG-005` の「1 レコードであることが分かる形式」、Issue #41）。
+    #[test]
+    fn indent_continuation_treats_lone_cr_and_crlf_as_line_breaks() {
+        assert_eq!(indent_continuation("line1\r\nline2"), "line1\r\n\tline2");
+        assert_eq!(indent_continuation("line1\rline2"), "line1\r\tline2");
+        assert_eq!(
+            indent_continuation("line1\rline2\r\nline3\nline4"),
+            "line1\r\tline2\r\n\tline3\n\tline4"
+        );
+        // 末尾の改行の後ろにも字下げが入る（`\n` のときと同じ扱い）。
+        assert_eq!(indent_continuation("line1\r"), "line1\r\t");
+    }
+
+    // 受け入れ条件: 字下げはタブを差し込むだけで、本文の文字そのものを
+    // 書き換えない（`DIAG-003`、`DIAG-004`）。
+    #[test]
+    fn indent_continuation_only_inserts_tabs() {
+        let message = "本文\r\n2 行目\r3 行目\n4 行目";
+        let indented = indent_continuation(message);
+        let stripped: String = indented.chars().filter(|c| *c != '\t').collect();
+        assert_eq!(stripped, message);
+    }
+
+    // 受け入れ条件: 本文に区切り文字 ` | ` が含まれてもエスケープせず、
+    // 先頭から 8 回の分割で 9 個目に本文全体が入る（`DIAG-003`、`DIAG-004`、
+    // モジュール doc コメント「レコードの書式と機械的な分割」）。
+    #[test]
+    fn format_record_keeps_separator_in_message_and_places_it_last() {
+        let message = "本文 | の中に | 区切りが | あります";
+        let line = format_record(
+            &Record {
+                severity: Severity::Info,
+                module: "test::format",
+                operation: "format.separator",
+                source_id: None,
+                error_code: None,
+                location: "lib.rs:0",
+                message,
+            },
+            ProcessElevation::Normal,
+        );
+
+        let trimmed = line.strip_suffix('\n').expect("行末は改行");
+        let fields: Vec<&str> = trimmed.splitn(9, " | ").collect();
+        assert_eq!(fields.len(), 9, "欄は 9 個（本文が最後尾）");
+        assert_eq!(fields[8], message, "本文は無加工のまま最後尾の欄に入る");
+        assert_eq!(fields[1], "INFO");
+        assert_eq!(fields[2], "test::format");
+        assert_eq!(fields[3], "format.separator");
+        assert_eq!(fields[4], "src=-");
+        assert_eq!(fields[5], "code=-");
+        assert_eq!(fields[6], "proc=normal");
+        assert_eq!(fields[7], "at=lib.rs:0");
+
+        // すべての区切りで分割すると欄数が増えるため使えないことも固定する。
+        assert!(trimmed.split(" | ").count() > 9);
     }
 
     #[test]

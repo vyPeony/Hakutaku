@@ -111,6 +111,36 @@ pub use decode::{decode, DecodeError, DecodeOutcome, MAX_INVALID_POSITIONS};
 #[cfg(windows)]
 pub use win32::WINDOWS_CODEPAGE_SCAN_CHUNK_BYTES;
 
+/// 診断ログ用エラーコード（領域 `ENC`: 文字コードの判定とデコード）。
+///
+/// 書式と採番規則は `docs/development/error-codes.md` を正本とし、この
+/// モジュールが領域 `ENC` の採番台帳である。番号は既存の最大値 + 1 で追加し、
+/// 一度 `main` へマージした番号の意味変更と再利用はしない（欠番はコメントで
+/// 残す）。利用者向けの意味と対処は `docs/deployment/error-codes.md` に載せる。
+///
+/// このクレート自身は診断ログへ書かない（`hakutaku-diagnostics` に依存しない）。
+/// 定数を公開しているのは、失敗の意味を持つこのクレートを採番台帳とし、実際に
+/// 記録する呼び出し側（読み込み経路）が同じ名前を参照できるようにするためで
+/// ある。
+pub mod error_codes {
+    /// UTF-16 LE/BE の BOM を検出し、未対応形式と判定した（`ENC-006`）。
+    ///
+    /// 対象ファイルを読み込めず処理を継続できない失敗であり、利用者側の対処
+    /// （UTF-8 などへの変換）が必要なため採番する。判定そのものは
+    /// `EncodingDecision::Unsupported`、読み込み経路での失敗は
+    /// `hakutaku_core::LoadFileError::UnsupportedEncoding` に対応する。
+    pub const UNSUPPORTED_UTF16: &str = "HKT-ENC-0001";
+
+    /// プロファイルが指定したコードページが実行環境に存在せず、デコードできな
+    /// かった（`DecodeError::UnknownCodepage`。`ENC-007`）。
+    ///
+    /// 対象ファイルを読み込めず処理を継続できない失敗であり、利用者側の対処
+    /// （設定の修正、または対象端末への言語パック導入）が必要なため採番する。
+    /// 起動時検証で先に検出できた場合は安全モード（`HKT-CFG-0001`）となり、
+    /// このコードには至らない。
+    pub const UNKNOWN_CODEPAGE: &str = "HKT-ENC-0002";
+}
+
 /// 形式判定層が担う責務の表示名です。
 pub const RESPONSIBILITY: &str = "形式判定";
 

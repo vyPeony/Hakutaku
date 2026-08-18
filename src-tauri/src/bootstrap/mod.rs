@@ -190,7 +190,12 @@ pub fn run() -> Result<Bootstrap, Aborted> {
 
     // 手順4の設定読み込み結果を、診断ログが開いた後に記録する。正常起動・
     // 既定値起動（CFG-015）は Info、安全モード（CFG-016）は Warn とする
-    // （安全モードは利用者の対処を要するため）。
+    // （安全モードは利用者の対処を要するため）。同じ理由で、安全モードにだけ
+    // アプリ内エラーコード（HKT-CFG-0001）を付ける。エラーコードは「起動でき
+    // ない／利用者・導入組織側の対処が必要な失敗」にだけ割り当てる基準のため、
+    // 正常起動・既定値起動には付けない（docs/development/error-codes.md）。
+    // 明細行（検証エラー1件ずつ）は同じ失敗の内訳であり、コードは代表となる
+    // 集計行1本にだけ付けて重複させない。
     match config_state.route {
         config::ConfigRoute::Loaded => {
             diag_info!(
@@ -215,6 +220,7 @@ pub fn run() -> Result<Bootstrap, Aborted> {
                 diagnostics,
                 module = MODULE,
                 operation = "startup.config_load",
+                error_code = hakutaku_config::error_codes::SAFE_MODE_START,
                 "hakutaku.yaml の検証に失敗しました。安全モードで起動します（CFG-016）: \
                  エラー {} 件, {}",
                 config_state.errors.len(),

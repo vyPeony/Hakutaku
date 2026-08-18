@@ -97,3 +97,29 @@ pub use private_usage::{
     PrivateUsageSample, ProcessPrivateUsage, REFERENCE_INDICATOR_MARGIN_BYTES,
 };
 pub use threshold::{AccountingEvent, InvalidSoftThresholdPercent, DEFAULT_SOFT_THRESHOLD_PERCENT};
+
+/// 診断ログ用エラーコード（領域 `MEM`: メモリ会計の予算と予約）。
+///
+/// 書式と採番規則は `docs/development/error-codes.md` を正本とし、この
+/// モジュールが領域 `MEM` の採番台帳である。番号は既存の最大値 + 1 で追加し、
+/// 一度 `main` へマージした番号の意味変更と再利用はしない（欠番はコメントで
+/// 残す）。利用者向けの意味と対処は `docs/deployment/error-codes.md` に載せる。
+///
+/// このクレートは `hakutaku-diagnostics` に依存しない（上記「会計イベント」の
+/// 設計判断）。定数を公開しているのは、失敗の意味を持つこのクレートを採番台帳
+/// とし、実際に記録する呼び出し側（`src-tauri`）が同じ名前を参照できるように
+/// するためである。
+pub mod error_codes {
+    /// メモリ予算の上限に達し、予約を拒否した（`PERF-008`、`PERF-010`。
+    /// [`AccountingEvent::ReservationRejected`]）。
+    ///
+    /// 要求された読み込み・索引作成をその場では継続できず、利用者側の対処
+    /// （開いている対象を閉じる、`memory.budget_mib` を見直す）が必要なため
+    /// 採番する。アプリの起動と既に開いている対象の表示は継続する。
+    ///
+    /// ソフトしきい値到達（[`AccountingEvent::SoftThresholdReached`]）と参考
+    /// 指標の超過（[`AccountingEvent::ReferenceIndicatorExceeded`]）は、アプリ
+    /// 側が先読み停止・バッファ解放で自動的に縮退し、利用者の対処を要さない
+    /// ため採番しない（診断ログでは `code=-`）。
+    pub const RESERVATION_REJECTED: &str = "HKT-MEM-0001";
+}
