@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use hakutaku_config::{
-    load_config, DateTimeFormatSetting, EncodingSetting, FixedRuntimePreference, HakutakuConfig,
-    LoadOutcome, ProcessPriority,
+    load_config, load_config_with_codepage_check, DateTimeFormatSetting, EncodingSetting,
+    FixedRuntimePreference, HakutakuConfig, LoadOutcome, ProcessPriority,
 };
 
 /// 一意な一時ファイルパスを作る（`std::env::temp_dir()` 配下。テスト専用の一時領域であり、
@@ -31,6 +31,20 @@ fn load_from_contents(label: &str, contents: &str) -> LoadOutcome {
     let path = temp_yaml_path(label);
     std::fs::write(&path, contents).unwrap();
     let outcome = load_config(&path);
+    std::fs::remove_file(&path).unwrap();
+    outcome
+}
+
+/// [`load_config_with_codepage_check`] 版の [`load_from_contents`]。
+/// `available` に「実行環境に存在する」とみなすコードページ番号を渡す。
+fn load_from_contents_with_codepage_check(
+    label: &str,
+    contents: &str,
+    available: &[u32],
+) -> LoadOutcome {
+    let path = temp_yaml_path(label);
+    std::fs::write(&path, contents).unwrap();
+    let outcome = load_config_with_codepage_check(&path, &|codepage| available.contains(&codepage));
     std::fs::remove_file(&path).unwrap();
     outcome
 }
@@ -853,6 +867,199 @@ log_profiles:
 "#,
     );
     assert_eq!(config.log_profiles.len(), 2);
+}
+
+// ---------------------------------------------------------------------
+// 「書いたのに使われない設定」の検出（CFG-016、Issue #39）。
+// ---------------------------------------------------------------------
+
+// 受け入れ条件: 最上位の同一キー二重定義は、位置つきの検証エラーになる
+// （後勝ちで片方が黙って捨てられることがない。CFG-016）。
+#[test]
+fn duplicate_top_level_key_is_invalid_with_position() {
+    let errors = expect_invalid(
+        "dup-key-top-level",
+        "config_version: 1\nmemory:\n  budget_mib: 2048\nconfig_version: 1\n",
+    );
+    assert_eq!(errors.len(), 1);
+    let error = &errors.as_slice()[0];
+    assert_eq!(error.item_path, "config_version");
+    // 黙って捨てられるのは先に書いたほうなので、その位置（1行目）を指す。
+    assert_eq!(error.line, Some(1));
+    assert!(error.column.is_some());
+    assert!(error.reason.contains("2回以上"), "理由: {}", error.reason);
+}
+
+// 受け入れ条件: 区分の中の重複も、項目パスつきで検出する。
+#[test]
+fn duplicate_key_within_section_is_invalid() {
+    let errors = expect_invalid(
+        "dup-key-nested",
+        "config_version: 1\nmemory:\n  budget_mib: 2048\n  budget_mib: 4096\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors.as_slice()[0].item_path, "memory.budget_mib");
+    assert_eq!(errors.as_slice()[0].line, Some(3));
+}
+
+// 受け入れ条件: 配列要素の中の重複は、添字を含む項目パスで検出する。
+#[test]
+fn duplicate_key_inside_sequence_item_is_invalid() {
+    let errors = expect_invalid(
+        "dup-key-sequence",
+        "config_version: 1\ndata_sources:\n  - name: a\n    name: b\n    path: \"C:/Device/Logs\"\n",
+    );
+    assert!(errors
+        .iter()
+        .any(|error| error.item_path == "data_sources[0].name"));
+}
+
+// 受け入れ条件: `---` 区切りの2件目以降は黙って無視されず、位置つきの検証
+// エラーになる（CFG-016）。
+#[test]
+fn multiple_documents_are_invalid_with_position() {
+    let errors = expect_invalid(
+        "multi-document",
+        "config_version: 1\n---\nconfig_version: 1\nmemory:\n  budget_mib: 4096\n",
+    );
+    assert_eq!(errors.len(), 1);
+    let error = &errors.as_slice()[0];
+    assert!(error.item_path.is_empty());
+    // 無視される側（2件目のドキュメント）の先頭位置を指す。
+    assert_eq!(error.line, Some(3));
+    assert!(
+        error.reason.contains("ドキュメント"),
+        "理由: {}",
+        error.reason
+    );
+}
+
+// 受け入れ条件: 末尾に区切りだけを置いた場合（2件目が空になる場合）も、
+// 「区切りより後は使われない」ことを一律に示すため検証エラーにする。
+#[test]
+fn trailing_document_separator_is_invalid() {
+    let errors = expect_invalid("multi-document-trailing", "config_version: 1\n---\n");
+    assert_eq!(errors.len(), 1);
+    assert!(errors.as_slice()[0].reason.contains("ドキュメント"));
+}
+
+// 受け入れ条件: 先頭の区切り（1件のドキュメントを `---` で始める書き方）は
+// 従来どおり正常に読める。
+#[test]
+fn leading_document_separator_is_accepted() {
+    let config = expect_loaded("single-document-leading", "---\nconfig_version: 1\n");
+    assert_eq!(config.config_version, 1);
+}
+
+// ---------------------------------------------------------------------
+// ansi_codepage の存在確認（CFG-008、ENC-007、Issue #39）。
+// ---------------------------------------------------------------------
+
+// 受け入れ条件: 実行環境に存在しないコードページ番号は、ファイルを開く時点まで
+// 待たずに起動時検証エラーになる（位置つき）。
+#[test]
+fn unknown_ansi_codepage_is_invalid_when_check_is_injected() {
+    let outcome = load_from_contents_with_codepage_check(
+        "codepage-unknown",
+        "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    ansi_codepage: 99999\n",
+        &[932, 1252],
+    );
+    let LoadOutcome::Invalid(errors) = outcome else {
+        panic!("Invalid を期待しました");
+    };
+    assert_eq!(errors.len(), 1);
+    let error = &errors.as_slice()[0];
+    assert_eq!(error.item_path, "log_profiles[0].ansi_codepage");
+    assert_eq!(error.line, Some(5));
+    assert!(error.reason.contains("99999"), "理由: {}", error.reason);
+}
+
+// 受け入れ条件: 実行環境に存在するコードページ番号はそのまま読める。
+#[test]
+fn known_ansi_codepage_passes_the_injected_check() {
+    let outcome = load_from_contents_with_codepage_check(
+        "codepage-known",
+        "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    ansi_codepage: 932\n",
+        &[932, 1252],
+    );
+    let LoadOutcome::Loaded(config) = outcome else {
+        panic!("Loaded を期待しました");
+    };
+    assert_eq!(config.log_profiles[0].ansi_codepage, Some(932));
+}
+
+// 受け入れ条件: 確認手段を注入しない load_config は、値域だけを検証する
+// （存在確認は呼び出し側が注入したときだけ行う）。
+#[test]
+fn load_config_without_injection_does_not_check_codepage_existence() {
+    let config = expect_loaded(
+        "codepage-no-injection",
+        "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    ansi_codepage: 99999\n",
+    );
+    assert_eq!(config.log_profiles[0].ansi_codepage, Some(99999));
+}
+
+// ---------------------------------------------------------------------
+// 読み取れないファイル（CFG-016 の安全モード。Issue #39）。
+// ---------------------------------------------------------------------
+
+// 受け入れ条件: ファイルが「存在しない」以外の理由で読み取れない場合は、既定値
+// 起動（CFG-015）ではなく安全モード（Invalid）にする。設定の内容を確認できて
+// いない以上、既定値で起動すると誤設定を黙って通したことになり得るため。
+#[test]
+fn unreadable_file_is_invalid_not_missing() {
+    // Windows でファイルの代わりにディレクトリを開くとアクセスが拒否される
+    // （ERROR_ACCESS_DENIED）ため、権限設定に依存せず決定的に読み取り失敗を
+    // 起こせる。
+    let path = temp_yaml_path("unreadable");
+    std::fs::create_dir(&path).unwrap();
+
+    let outcome = load_config(&path);
+    std::fs::remove_dir(&path).unwrap();
+
+    let LoadOutcome::Invalid(errors) = outcome else {
+        panic!("Invalid を期待しましたが {outcome:?} でした");
+    };
+    assert_eq!(errors.len(), 1);
+    let error = &errors.as_slice()[0];
+    assert!(
+        error.reason.contains("読み取れませんでした"),
+        "理由: {}",
+        error.reason
+    );
+    // 位置を特定できないため行・列は None（表示は `?` になる）。
+    assert_eq!(error.line, None);
+    assert_eq!(error.column, None);
+    assert!(!error.file_name.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// デバイス名前空間のパス（ADR-0005、Issue #39）。
+// ---------------------------------------------------------------------
+
+// 受け入れ条件: `\\.\` で始まるパスの拒否理由が、ネットワーク共有（UNC）では
+// なくデバイス名前空間であることを示す。
+#[test]
+fn device_namespace_path_reason_does_not_claim_unc() {
+    let errors = expect_invalid(
+        "path-device-namespace",
+        r"config_version: 1
+data_sources:
+  - name: a
+    path: '\\.\PhysicalDrive0'
+",
+    );
+    let error = errors
+        .iter()
+        .find(|error| error.item_path == "data_sources[0].path")
+        .expect("path のエラーが積まれるはず");
+    assert!(
+        error
+            .reason
+            .contains("デバイス名前空間のパスが指定されています"),
+        "理由: {}",
+        error.reason
+    );
 }
 
 #[test]

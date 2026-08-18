@@ -74,9 +74,20 @@ impl ConfigState {
     ///
     /// 診断ログに依存しない（呼び出し順序の制約はモジュール doc コメントを参照）。
     /// 結果の記録は呼び出し側（`bootstrap::run`）が診断ログを開いた後に行う。
+    ///
+    /// # コードページ存在確認の注入（Issue #39）
+    ///
+    /// `log_profiles[].ansi_codepage` の番号が実行環境に存在するかは Win32 の
+    /// `GetCPInfoExW` にしか答えられず、`hakutaku_config` は Win32 に依存しない。
+    /// 判定を持つのは形式判定層（`hakutaku_core::codepage_available` が再公開）
+    /// であるため、両方を知っているこの起動経路で結び付け、他の検証エラーと
+    /// 同じ一覧（`CFG-016` の一括提示）へ合流させる。
     #[must_use]
     pub fn load(config_path: &Path) -> Self {
-        match hakutaku_config::load_config(config_path) {
+        match hakutaku_config::load_config_with_codepage_check(
+            config_path,
+            &hakutaku_core::codepage_available,
+        ) {
             LoadOutcome::Loaded(config) => ConfigState {
                 route: ConfigRoute::Loaded,
                 config,
@@ -211,6 +222,45 @@ mod tests {
         assert!(error.column.is_some());
         assert!(!error.reason.is_empty());
         assert!(!error.file_name.is_empty());
+    }
+
+    // 受け入れ条件: 実行環境に存在しないコードページ番号は、対象ファイルを開く
+    // 時点まで待たずに起動時の一覧へ出る（`CFG-016`、`ENC-007`、Issue #39）。
+    // 存在確認は `hakutaku_core::codepage_available` を注入して行う。
+    #[test]
+    fn unknown_ansi_codepage_is_reported_at_startup() {
+        let path = temp_yaml_path("unknown-codepage");
+        std::fs::write(
+            &path,
+            "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    ansi_codepage: 99999\n",
+        )
+        .unwrap();
+
+        let state = ConfigState::load(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(state.route, ConfigRoute::Invalid);
+        assert_eq!(state.errors.len(), 1);
+        assert_eq!(state.errors[0].item_path, "log_profiles[0].ansi_codepage");
+        assert!(state.errors[0].line.is_some());
+    }
+
+    // 受け入れ条件: 実行環境に存在するコードページ（CP932 / CP1252 は Windows
+    // に標準で含まれる）は、注入した存在確認を通過して正常起動になる。
+    #[test]
+    fn known_ansi_codepage_still_loads() {
+        let path = temp_yaml_path("known-codepage");
+        std::fs::write(
+            &path,
+            "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    ansi_codepage: 932\n",
+        )
+        .unwrap();
+
+        let state = ConfigState::load(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(state.route, ConfigRoute::Loaded);
+        assert_eq!(state.config.log_profiles[0].ansi_codepage, Some(932));
     }
 
     #[test]

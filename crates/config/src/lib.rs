@@ -59,6 +59,22 @@
 //! 従って行います。パスの正規化（[`normalize_path_separators`] / [`paths_equivalent`]）は、
 //! P05 のログ解析プロファイル照合が同じ規則を再利用できるよう公開しています。
 //!
+//! ## 「書いたのに使われない設定」も黙って通さない（Issue #39）
+//!
+//! `CFG-016` は誤設定を黙って既定値へ置換しないことを求めます。値の型・値域だけ
+//! でなく、**設定として読まれない記述**も同じ理由で検証エラーにします。
+//!
+//! - `---` 区切りで2件以上の YAML ドキュメントが書かれている場合（設定として
+//!   読むのは先頭の1件だけ）
+//! - 同じマッピングに同じキーが2回以上書かれている場合（後に書いた値だけが
+//!   使われ、先に書いた値は捨てられる。検出方法は `crate::duplicate_keys` の
+//!   doc コメントを参照）
+//!
+//! また、`log_profiles[].ansi_codepage` に書かれたコードページが実行環境に存在
+//! するかどうかは、確認手段（Win32 の `GetCPInfoExW`）を持つ呼び出し側から
+//! [`load_config_with_codepage_check`] で注入し、起動時の一括提示へ合流させます。
+//! このクレート自体は Win32 に依存しません。
+//!
 //! # ログ解析プロファイルの glob 照合（P05）
 //!
 //! [`glob_match`] / [`is_glob_pattern`]（`crate::glob`）は `LogProfileConfig::path_pattern`
@@ -68,6 +84,7 @@
 //! （手動指定 → 完全一致 → glob → 自動判定）は `crates/core-services` の
 //! `resolve_profile` が、この関数群を使って行います。
 
+mod duplicate_keys;
 mod error;
 mod glob;
 mod load;
@@ -76,7 +93,7 @@ mod schema;
 
 pub use error::{ConfigError, ConfigErrors};
 pub use glob::{glob_match, is_glob_pattern};
-pub use load::{load_config, LoadOutcome};
+pub use load::{load_config, load_config_with_codepage_check, LoadOutcome};
 pub use path::{
     classify_path, is_absolute_local_path, normalize_path_separators, paths_equivalent, PathKind,
 };
@@ -148,6 +165,7 @@ impl PreflightOutcome {
 /// - ファイルが存在しない → [`PreflightOutcome::Missing`]
 /// - ファイルを読み取れない（権限など） → [`PreflightOutcome::Undetermined`]（行・列なし）
 /// - YAML の構文が壊れている → [`PreflightOutcome::Undetermined`]（行・列あり）
+/// - `---` 区切りのドキュメントが2件以上ある → [`PreflightOutcome::Undetermined`]（行・列あり）
 /// - `webview2` 節がない、または `force_fixed_version_runtime` キーがない
 ///   → [`PreflightOutcome::Determined`]`(Auto)`
 /// - `force_fixed_version_runtime` の値が真偽値でも文字列 `"auto"` でもない
@@ -185,6 +203,20 @@ pub fn read_fixed_runtime_preference(config_path: &Path) -> PreflightOutcome {
             };
         }
     };
+
+    // `---` 区切りで複数のドキュメントが書かれている場合、この先行読み込みが
+    // 見る先頭のドキュメントに対象キーが無くても、2件目以降には書かれている
+    // かもしれない。どちらを設定とみなすかを勝手に決めず、安全側
+    // （既定の `Auto` で Runtime 解決を続行）へ倒す。利用者への提示は
+    // [`load_config`] の一括検証が位置つきで行う（Issue #39）。
+    if let Some(second) = documents.get(1) {
+        let marker = second.span.start;
+        return PreflightOutcome::Undetermined {
+            reason: multiple_documents_reason(documents.len()),
+            line: Some(marker.line()),
+            column: Some(normalize_column(marker.col())),
+        };
+    }
 
     // ドキュメントが無い（内容が空など）場合は、webview2 節も無いものとして扱う。
     let Some(root) = documents.first() else {
@@ -242,6 +274,19 @@ pub(crate) fn interpret_fixed_runtime_preference<'a>(
         return Some(FixedRuntimePreference::Auto);
     }
     None
+}
+
+/// `---` 区切りで複数の YAML ドキュメントが書かれていた場合の理由文言
+/// （`CFG-016`、Issue #39）。
+///
+/// [`read_fixed_runtime_preference`]（先行読み込み）と
+/// [`crate::load::load_config`]（全体検証）は、複数ドキュメントに対する扱い
+/// （前者は安全側へ倒す、後者は検証エラー）が異なるが、利用者が読む理由は
+/// 同じ事実を指すため、文言をここで共有して食い違いを防ぐ。
+pub(crate) fn multiple_documents_reason(count: usize) -> String {
+    format!(
+        "設定ファイルに YAML ドキュメントが {count} 件あります（`---` 区切り）。Hakutaku が設定として読むのは先頭の1件だけで、2件目以降は使われません。1件にまとめてください"
+    )
 }
 
 /// `saphyr`（実体は `saphyr-parser`）の [`saphyr::Marker::col`] は、実装上

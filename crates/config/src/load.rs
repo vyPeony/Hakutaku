@@ -8,6 +8,7 @@ use std::path::Path;
 
 use saphyr::{LoadableYamlNode, MarkedYaml, Marker};
 
+use crate::duplicate_keys::{collect_duplicate_keys, DuplicateKeys};
 use crate::error::{ConfigError, ConfigErrors};
 use crate::glob;
 use crate::path::PathKind;
@@ -44,11 +45,42 @@ pub enum LoadOutcome {
 /// # 判定規則
 ///
 /// - ファイルが存在しない → [`LoadOutcome::Missing`]（`CFG-015`）
-/// - ファイルを読み取れない（権限など）、YAML の構文が壊れている、または値の
+/// - ファイルを読み取れない（権限など）、YAML の構文が壊れている、`---` 区切りの
+///   ドキュメントが2件以上ある、同じキーが2回以上書かれている、または値の
 ///   検証に1件でも失敗した → [`LoadOutcome::Invalid`]（`CFG-016`）
 /// - 全項目の検証に成功した → [`LoadOutcome::Loaded`]
+///
+/// `log_profiles[].ansi_codepage` は値域（1 以上）だけを検証し、その番号の
+/// コードページが実行環境に存在するかは確認しない。存在確認まで起動時に
+/// 一括提示したい呼び出し側は [`load_config_with_codepage_check`] を使う。
 #[must_use]
 pub fn load_config(config_path: &Path) -> LoadOutcome {
+    load_config_with_codepage_check(config_path, &|_| true)
+}
+
+/// [`load_config`] に、コードページの存在確認を注入して実行する（`CFG-008`、
+/// `ENC-007`、Issue #39）。
+///
+/// # なぜ注入するのか
+///
+/// `ansi_codepage` に書かれた番号が実行環境に存在するかは、Win32 の
+/// `GetCPInfoExW` にしか答えられない。一方このクレートは `hakutaku.yaml` の
+/// 解釈だけを担い、Win32 へは依存しない（ADR-0004 で `saphyr` 依存をこの
+/// クレートに封じ込めたのと同じく、層の依存の向きを保つため）。そこで確認手段
+/// だけを呼び出し側から受け取り、判定結果を他の値検証と同じ
+/// [`ConfigError`] として**起動時に一括提示**する。
+///
+/// これが無いと、誤ったコードページ番号は「そのプロファイルが適用される
+/// ファイルを実際に開いた時点」まで表面化せず、`CFG-016` の「誤設定を起動時に
+/// まとめて提示する」から漏れる。
+///
+/// `codepage_exists` には、実行環境で使用できるコードページ番号に対して `true`
+/// を返す関数を渡す（`hakutaku_core::codepage_available`）。
+#[must_use]
+pub fn load_config_with_codepage_check(
+    config_path: &Path,
+    codepage_exists: &dyn Fn(u32) -> bool,
+) -> LoadOutcome {
     let file_name = config_path.display().to_string();
 
     let contents = match std::fs::read_to_string(config_path) {
@@ -85,7 +117,12 @@ pub fn load_config(config_path: &Path) -> LoadOutcome {
         }
     };
 
-    let mut validator = Validator::new(file_name);
+    let mut validator = Validator::new(file_name, codepage_exists);
+    // ファイル全体の構造に関する検証（ドキュメント数・重複キー）を、個々の項目の
+    // 検証より先に行う。どちらも「書いたのに使われない設定がある」という同じ
+    // 種類の誤りであり、利用者が最初に読む位置へ置くほうが直しやすいため。
+    validator.validate_single_document(&documents);
+    validator.validate_duplicate_keys(&contents, documents.first());
     // [`Validator`] は不正値でも既定値を埋めて走査を続けるため、`config` が
     // 組み立てられたこと自体は妥当性を意味しない。採否は収集したエラーの有無だけで
     // 決め、1件でもあれば組み立て済みの `config` は捨てる。
@@ -120,16 +157,20 @@ struct PatternRecord {
 ///
 /// 個々の `validate_*` メソッドは、値が不正でもエラーを `errors` へ積んだうえで
 /// 既定値を返す。これにより1件のエラーで止まらず、他の項目の検証を続けられる。
-struct Validator {
+struct Validator<'check> {
     file_name: String,
     errors: Vec<ConfigError>,
+    /// `log_profiles[].ansi_codepage` の存在確認（注入の理由は
+    /// [`load_config_with_codepage_check`] の doc コメントを参照）。
+    codepage_exists: &'check dyn Fn(u32) -> bool,
 }
 
-impl Validator {
-    fn new(file_name: String) -> Self {
+impl<'check> Validator<'check> {
+    fn new(file_name: String, codepage_exists: &'check dyn Fn(u32) -> bool) -> Self {
         Self {
             file_name,
             errors: Vec::new(),
+            codepage_exists,
         }
     }
 
@@ -141,6 +182,84 @@ impl Validator {
             item_path: item_path.into(),
             reason: reason.into(),
         });
+    }
+
+    /// `---` 区切りで複数の YAML ドキュメントが書かれていないことを検証する
+    /// （`CFG-016`、Issue #39）。
+    ///
+    /// Hakutaku が設定として読むのは先頭のドキュメントだけである。2件目以降を
+    /// 黙って読み飛ばすと、利用者は書いたはずの設定が使われていないことに
+    /// 気づけないため、起動時検証エラーにする。末尾に区切りだけを置いた場合
+    /// （2件目が空のドキュメントになる場合）も同じ扱いとし、「区切りより後は
+    /// 使われない」ことを一律に示す。
+    fn validate_single_document(&mut self, documents: &[MarkedYaml]) {
+        let Some(second) = documents.get(1) else {
+            return;
+        };
+        self.push(
+            second.span.start,
+            "",
+            crate::multiple_documents_reason(documents.len()),
+        );
+    }
+
+    /// 同じキーが2回以上書かれていないことを検証する（`CFG-016`、Issue #39）。
+    ///
+    /// 検出そのものは [`crate::duplicate_keys`] が別の走査で行う（`saphyr` が
+    /// 組み立てた木では二重定義が1件へ潰れてしまう理由は、同モジュールの doc
+    /// コメントを参照）。ここでは、その結果（項目パスとキー名）を
+    /// [`MarkedYaml`] の木と突き合わせ、表示に使う行・列を補って積む。
+    fn validate_duplicate_keys(&mut self, source: &str, root: Option<&MarkedYaml>) {
+        let Some(root) = root else {
+            return;
+        };
+        let duplicates = collect_duplicate_keys(source);
+        if duplicates.is_empty() {
+            return;
+        }
+        self.push_duplicate_key_errors(root, "", &duplicates);
+    }
+
+    /// [`Self::validate_duplicate_keys`] の再帰本体。
+    ///
+    /// `path` の組み立て規則は [`crate::duplicate_keys`] 側と一致させる必要が
+    /// ある（両者の走査結果を突き合わせる鍵がこの文字列であるため）。
+    fn push_duplicate_key_errors(
+        &mut self,
+        node: &MarkedYaml,
+        path: &str,
+        duplicates: &DuplicateKeys,
+    ) {
+        if let Some(mapping) = node.data.as_mapping() {
+            let duplicated_here = duplicates.get(path);
+            for (key_node, value_node) in mapping {
+                let Some(key) = key_node.data.as_str() else {
+                    continue;
+                };
+                let child_path = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if duplicated_here.is_some_and(|keys| keys.iter().any(|known| known == key)) {
+                    // `saphyr` は二重定義を「先に書いたキーのノード」と「後に
+                    // 書いた値」の組へ潰す。したがってここで得られる位置は
+                    // **先に書いたほう**であり、黙って捨てられる側を指す。
+                    self.push(
+                        key_node.span.start,
+                        child_path.clone(),
+                        format!(
+                            "設定項目 {child_path} が2回以上指定されています。同じ項目を複数回書くと、後に書いた値だけが使われ、先に書いた値は黙って捨てられます。1か所だけ残してください"
+                        ),
+                    );
+                }
+                self.push_duplicate_key_errors(value_node, &child_path, duplicates);
+            }
+        } else if let Some(items) = node.data.as_vec() {
+            for (index, item) in items.iter().enumerate() {
+                self.push_duplicate_key_errors(item, &format!("{path}[{index}]"), duplicates);
+            }
+        }
     }
 
     fn validate_documents(&mut self, documents: &[MarkedYaml]) -> HakutakuConfig {
@@ -647,8 +766,8 @@ impl Validator {
                             self.validate_encoding(value_node, &format!("{prefix}.encoding"));
                     }
                     "ansi_codepage" => {
-                        ansi_codepage =
-                            self.validate_u32(value_node, &format!("{prefix}.ansi_codepage"), 1);
+                        ansi_codepage = self
+                            .validate_ansi_codepage(value_node, &format!("{prefix}.ansi_codepage"));
                     }
                     "datetime_format" => {
                         datetime_format = self.validate_datetime_format(
@@ -778,6 +897,30 @@ impl Validator {
                 seen.insert(key, record);
             }
         }
+    }
+
+    /// `log_profiles[].ansi_codepage` を検証する（`CFG-008`、`ENC-007`）。
+    ///
+    /// 値域（1 以上の `u32`）に加えて、その番号のコードページが**実行環境に
+    /// 存在するか**も確認する（Issue #39）。存在確認の手段は呼び出し側から
+    /// 注入する（理由は [`load_config_with_codepage_check`] を参照）。
+    ///
+    /// 存在しない番号は、そのプロファイルが適用されるファイルを開いた時点で
+    /// どのみち失敗する。起動時に位置つきで示すほうが、利用者は「どの行を
+    /// 直せばよいか」へ直接たどり着ける（`CFG-016`）。
+    fn validate_ansi_codepage(&mut self, node: &MarkedYaml, item_path: &str) -> Option<u32> {
+        let codepage = self.validate_u32(node, item_path, 1)?;
+        if (self.codepage_exists)(codepage) {
+            return Some(codepage);
+        }
+        self.push(
+            node.span.start,
+            item_path.to_string(),
+            format!(
+                "{item_path} の値 {codepage} は、この実行環境に存在しない Windows コードページです。実行環境で使用できるコードページ番号を指定してください"
+            ),
+        );
+        None
     }
 
     fn validate_encoding(&mut self, node: &MarkedYaml, item_path: &str) -> EncodingSetting {
@@ -925,7 +1068,7 @@ impl Validator {
                 node.span.start,
                 item_path.to_string(),
                 format!(
-                    "{item_path} は絶対ローカルパスである必要があります（{}）。ADR-0005 により相対パスとネットワーク共有パス（UNC）には対応していません",
+                    "{item_path} は絶対ローカルパスである必要があります（{}）。ADR-0005 により、相対パス、ネットワーク共有パス（UNC）、デバイス名前空間のパスには対応していません",
                     describe_path_kind(kind)
                 ),
             );
@@ -1058,6 +1201,7 @@ fn describe_path_kind(kind: PathKind) -> &'static str {
         PathKind::DriveRelative => "ドライブ相対パスが指定されています",
         PathKind::RootRelative => "ルート相対パスが指定されています",
         PathKind::Unc => "ネットワーク共有パス（UNC）が指定されています",
+        PathKind::DeviceNamespace => "デバイス名前空間のパスが指定されています",
         PathKind::Relative => "相対パスが指定されています",
     }
 }

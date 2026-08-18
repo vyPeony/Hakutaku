@@ -7,7 +7,8 @@
 //!   ローカルの verbatim パス（例: `\\?\C:\Device\Logs`）
 //! - エラー: 相対パス（例: `logs\a.log`）、ドライブ相対パス（例: `C:logs`）、
 //!   ルート相対パス（例: `\logs`）、ネットワーク共有パス（UNC。例: `\\server\share`、
-//!   `\\?\UNC\...`）
+//!   `\\?\UNC\...`）、デバイス名前空間のパス（例: `\\.\PhysicalDrive0`、
+//!   `\\?\Volume{...}`）
 //!
 //! 判定は**文字列の形式判定のみ**で行い、ファイルシステムへは一切アクセスしない
 //! （ADR-0005）。ログ解析プロファイルの `path_pattern`（glob）にも同じ規則を適用する。
@@ -37,6 +38,14 @@ pub enum PathKind {
     RootRelative,
     /// ネットワーク共有パス（UNC。例: `\\server\share`、`\\?\UNC\...`）。エラー。
     Unc,
+    /// デバイス名前空間など、ファイルシステム上の場所ではない特殊な名前空間の
+    /// パス（例: `\\.\PhysicalDrive0`、`\\.\COM1`、`\\?\Volume{...}`）。エラー。
+    ///
+    /// UNC と別の種別として持つのは、利用者へ示す理由を取り違えないためである
+    /// （Issue #39）。`\\.\` で始まるパスはネットワーク共有ではないため、
+    /// 「ネットワーク共有パス（UNC）が指定されています」と表示すると、利用者は
+    /// 実際の誤りとは別の原因を探すことになる。
+    DeviceNamespace,
     /// 相対パス（例: `logs\a.log`）。エラー。
     Relative,
 }
@@ -63,10 +72,19 @@ pub fn classify_path(path: &str) -> PathKind {
         return if is_drive_absolute(rest) {
             PathKind::LocalVerbatim
         } else {
-            // `\\?\` に続く形式がドライブ絶対でも UNC でもない場合は、絶対ローカル
-            // パスとして認められないため安全側（エラー）へ倒す。
-            PathKind::Unc
+            // `\\?\` に続く形式がドライブ絶対でも UNC でもない場合（例:
+            // `\\?\Volume{...}`）は、絶対ローカルパスとして認められないため
+            // 安全側（エラー）へ倒す。ネットワーク共有ではないので、理由は
+            // デバイス名前空間側で示す。
+            PathKind::DeviceNamespace
         };
+    }
+
+    // デバイス名前空間（`\\.\`）の判定は UNC より前に置く。どちらも `\\` で
+    // 始まるため、順序を入れ替えるとネットワーク共有として報告してしまう。
+    // 拒否する点は同じでも、利用者が探すべき誤りは別である（Issue #39）。
+    if starts_with_case_insensitive(path, r"\\.\") || starts_with_case_insensitive(path, "//./") {
+        return PathKind::DeviceNamespace;
     }
 
     // UNC の判定は、後段のルート相対（`\logs`）の判定より前に置く必要がある。
@@ -115,6 +133,24 @@ pub fn normalize_path_separators(path: &str) -> String {
 /// 大文字小文字を畳み込んで比較する。**注意:** これは NTFS 自体の大文字小文字畳み込み
 /// 規則（コードポイントごとの例外を含む）を完全に再現するものではない近似実装であり、
 /// 通常の ASCII 主体のパスでは実用上問題にならない。
+///
+/// # 近似の帰結（Issue #39 で明文化）
+///
+/// この比較は文字列だけを見る（ADR-0005 のとおりファイルシステムへ問い合わせ
+/// ない）ため、次は同じ場所を指していても**別のパス**として扱う。起動時検証の
+/// 重複検出（`log_profiles` の同一パターン検出）も同じ限界を持ち、これらの
+/// 書き分けは重複として検出されない。
+///
+/// - `.` / `..` を含むパス（例: `C:\a\..\a\x.log` と `C:\a\x.log`）
+/// - 末尾の区切り文字の有無（例: `C:\a\` と `C:\a`）
+/// - 短縮名（8.3 形式。例: `C:\PROGRA~1`）と長い名前
+/// - シンボリックリンク・ジャンクション経由のパスと実体のパス
+///
+/// また、畳み込みに `str::to_uppercase` を使うため、1文字が複数文字へ変わる
+/// コードポイント（例: `ß` → `SS`）では**文字数が変わる**。完全一致の比較では
+/// 両辺に同じ変換を適用するため問題にならないが、`?`（1文字一致）を使う
+/// [`crate::glob_match`] の照合では、そうした文字を含むパスで一致する文字数が
+/// 直感と食い違い得る。
 #[must_use]
 pub fn paths_equivalent(a: &str, b: &str) -> bool {
     normalize_path_separators(a).to_uppercase() == normalize_path_separators(b).to_uppercase()
@@ -233,6 +269,34 @@ mod tests {
     #[test]
     fn forward_slash_unc_path_is_denied() {
         assert_eq!(classify_path("//server/share"), PathKind::Unc);
+    }
+
+    // 受け入れ条件: デバイス名前空間のパスは、UNC ではなく専用の種別として
+    // 拒否する（利用者へ示す理由を取り違えない。Issue #39）。
+    #[test]
+    fn device_namespace_path_is_denied_as_its_own_kind() {
+        assert_eq!(
+            classify_path(r"\\.\PhysicalDrive0"),
+            PathKind::DeviceNamespace
+        );
+        assert_eq!(classify_path(r"\\.\COM1"), PathKind::DeviceNamespace);
+        assert!(!is_absolute_local_path(r"\\.\PhysicalDrive0"));
+        // 区切り文字を `/` で書いた形も同じ扱いにする。
+        assert_eq!(
+            classify_path("//./PhysicalDrive0"),
+            PathKind::DeviceNamespace
+        );
+    }
+
+    // 受け入れ条件: `\\?\` に続く形式がドライブ絶対でも UNC でもない場合
+    // （例: ボリューム GUID）も、ネットワーク共有ではないため UNC とは
+    // 区別して拒否する。
+    #[test]
+    fn verbatim_volume_guid_path_is_denied_as_device_namespace() {
+        assert_eq!(
+            classify_path(r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\Logs"),
+            PathKind::DeviceNamespace
+        );
     }
 
     // glob パターンへの適用（基点の判定。P05 が意味解釈を行う対象）。
