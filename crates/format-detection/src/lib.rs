@@ -114,6 +114,33 @@ pub use win32::WINDOWS_CODEPAGE_SCAN_CHUNK_BYTES;
 /// 形式判定層が担う責務の表示名です。
 pub const RESPONSIBILITY: &str = "形式判定";
 
+/// `codepage` が実行環境で使用可能かを返します（`GetCPInfoExW`。`ENC-007`）。
+///
+/// # 何のために公開しているか
+///
+/// `hakutaku.yaml` の `log_profiles[].ansi_codepage` に存在しない番号が書かれて
+/// いた場合、そのプロファイルが適用されるファイルを開くまで失敗が表面化しません。
+/// 起動時に一括提示する（`CFG-016`、Issue #39）ため、設定の検証
+/// （`hakutaku_config::load_config_with_codepage_check`）へこの判定を注入します。
+/// 設定クレートは Win32 に依存しないので、判定を持つ本クレートが提供します。
+#[cfg(windows)]
+#[must_use]
+pub fn codepage_available(codepage: u32) -> bool {
+    win32::codepage_exists(codepage)
+}
+
+/// Windows 以外でのビルド用の代替実装です。
+///
+/// 本リポジトリのビルド対象は `.cargo/config.toml` で `x86_64-pc-windows-msvc`
+/// に固定されているため、この関数が実際に呼ばれることはありません。型として
+/// コンパイルが通るようにするための最小限の代替であり、存在確認ができない
+/// 環境で設定を弾かないよう「使用可能」を返します。
+#[cfg(not(windows))]
+#[must_use]
+pub fn codepage_available(_codepage: u32) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::RESPONSIBILITY;

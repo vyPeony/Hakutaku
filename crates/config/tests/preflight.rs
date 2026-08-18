@@ -181,6 +181,66 @@ fn malformed_yaml_is_undetermined_with_position() {
     std::fs::remove_file(&path).unwrap();
 }
 
+// 受け入れ条件: `---` 区切りで複数ドキュメントがある場合、先頭で値を確定
+// できても安全側（Undetermined → 既定の Auto で続行）へ倒す。利用者への提示は
+// load_config の一括検証が行う（Issue #39）。
+#[test]
+fn multiple_documents_are_undetermined_with_position() {
+    let path = temp_yaml_path("multi-document");
+    std::fs::write(
+        &path,
+        "webview2:\n  force_fixed_version_runtime: true\n---\nwebview2:\n  force_fixed_version_runtime: false\n",
+    )
+    .unwrap();
+
+    let outcome = read_fixed_runtime_preference(&path);
+    match &outcome {
+        PreflightOutcome::Undetermined {
+            reason,
+            line,
+            column,
+        } => {
+            assert!(reason.contains("ドキュメント"), "理由: {reason}");
+            // 無視される側（2件目のドキュメント）の先頭位置を指す。区切り行
+            // （3行目の `---`）ではなく、その次の内容の行を指す。
+            assert_eq!(*line, Some(4));
+            assert!(column.is_some());
+        }
+        other => panic!("Undetermined を期待しましたが {other:?} でした"),
+    }
+    assert_eq!(
+        outcome.preference_or_default(),
+        FixedRuntimePreference::Auto
+    );
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+// 受け入れ条件: 存在するが読み取れない設定ファイルは、Missing（既定値起動）
+// ではなく Undetermined として扱い、Runtime 解決は既定で続行する。
+#[test]
+fn unreadable_file_is_undetermined_with_default_preference() {
+    // Windows でファイルの代わりにディレクトリを開くとアクセスが拒否される
+    // ため、権限設定に依存せず決定的に読み取り失敗を起こせる。
+    let path = temp_yaml_path("unreadable");
+    std::fs::create_dir(&path).unwrap();
+
+    let outcome = read_fixed_runtime_preference(&path);
+    std::fs::remove_dir(&path).unwrap();
+
+    match &outcome {
+        PreflightOutcome::Undetermined { reason, line, .. } => {
+            assert!(reason.contains("読み取れませんでした"), "理由: {reason}");
+            assert_eq!(*line, None);
+        }
+        other => panic!("Undetermined を期待しましたが {other:?} でした"),
+    }
+    assert_eq!(
+        outcome.preference_or_default(),
+        FixedRuntimePreference::Auto
+    );
+}
+
 #[test]
 fn realistic_config_with_many_keys_reads_target_key_only() {
     let path = temp_yaml_path("realistic");

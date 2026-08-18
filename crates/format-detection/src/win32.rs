@@ -42,7 +42,11 @@ pub(crate) fn environment_ansi_codepage() -> u32 {
 }
 
 /// `codepage` が実行環境で使用可能かを確認します（`GetCPInfoExW`）。
-fn codepage_exists(codepage: u32) -> bool {
+///
+/// デコード時の判定（[`decode_windows_codepage`]）に加えて、設定の起動時検証
+/// （`crates/config` の `ansi_codepage`。`CFG-016`、Issue #39）も
+/// [`crate::codepage_available`] 経由でこの判定を使います。
+pub(crate) fn codepage_exists(codepage: u32) -> bool {
     let mut info = CPINFOEXW::default();
     // SAFETY: info はこのスタックフレーム上の有効な CPINFOEXW への可変参照で
     // あり、GetCPInfoExW はその範囲内にしか書き込まない（Win32 API の契約）。

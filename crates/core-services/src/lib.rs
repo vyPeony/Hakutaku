@@ -37,6 +37,14 @@ pub use display_set::{
     DisplaySet, ItemDto, RangeFetchError, RangeRequest, RangeResponse, MAX_ITEMS_PER_RESPONSE,
     MAX_RESPONSE_RAW_BYTES,
 };
+/// コードページの存在確認（`ENC-007`）の再公開です（Issue #39）。
+///
+/// `src-tauri` が起動時の設定検証へこの判定を注入します
+/// （`hakutaku_config::load_config_with_codepage_check`）。下の
+/// [`LogDateTimeFormat`] と同じ理由で、呼び出し側へ
+/// `hakutaku-format-detection` への直接依存を1本増やさせる代わりに、共通
+/// サービス層が公開する関数として通します。
+pub use hakutaku_format_detection::codepage_available;
 /// 日時書式（`LOG-DT-001`〜`006`）の再公開です（P07）。
 ///
 /// [`LoadControl::manual_datetime_format`] が公開 API でこの型を使うため、
