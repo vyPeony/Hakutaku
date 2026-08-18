@@ -39,7 +39,11 @@
 //!   応答1件の中では、他の項目・他のソースの取得を継続します**（`ERR-001`。
 //!   影響を受けたソースの項目は空の本文で返り、次回以降の範囲取得は世代不一致
 //!   （フロントエンドが検出して再取得する）または `SourceStatus` の変化で
-//!   利用者に伝わります）。
+//!   利用者に伝わります）。ただし**クリップボードコピーだけは、空になった
+//!   本文が利用者の手元へ渡ると取り消せない**ため、この既定値の件数を
+//!   [`DisplaySetRegistry::hydrate_fallback_items`] で数え、
+//!   `crate::copy::assemble_copy` がコピー全体を失敗させます（`COPY-005`、
+//!   Issue #37）。
 //!
 //! # P08-3 → P08-5: しきい値到達時の解放の単純化
 //!
@@ -271,6 +275,18 @@ pub struct MergedViewHandle {
     pub total_items: u64,
 }
 
+/// 表示集合の現在の世代と件数です（[`DisplaySetRegistry::display_set_state`]）。
+///
+/// 単独ソースの表示集合と統合表示集合（P09-1）を、呼び出し側が区別せずに
+/// 扱えるようにするための共通形です。[`DisplaySetHandle`]・
+/// [`MergedViewHandle`] と違い、`source_id`（単独ソースにしかない）も
+/// `display_set_id`（呼び出し側が既に持っている）も含みません。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplaySetState {
+    pub generation: u64,
+    pub total_items: u64,
+}
+
 /// 統合表示集合（P09-1）の内部記録です。
 ///
 /// `order` は各項目を指す [`ItemId`]（`source_id` + `seq`）の並びだけを保持し、
@@ -383,6 +399,9 @@ pub struct DisplaySetRegistry {
     decoded_cache: DecodedChunkCache,
     /// 統合表示集合（P09-1）。ON のときだけ `Some`。
     merged_view: Option<MergedViewRecord>,
+    /// 本文のオンデマンド読み出しが成立せず、既定値（空の本文）で応答した
+    /// 項目数の累計です（[`Self::hydrate_fallback_items`]）。
+    hydrate_fallback_items: u64,
 }
 
 impl DisplaySetRegistry {
@@ -397,7 +416,26 @@ impl DisplaySetRegistry {
             active_source_id: None,
             decoded_cache: DecodedChunkCache::new(),
             merged_view: None,
+            hydrate_fallback_items: 0,
         }
+    }
+
+    /// 本文のオンデマンド読み出しが成立せず、既定値（空の本文）で応答した
+    /// 項目数の累計です（プロセス起動からの単調増加）。
+    ///
+    /// [`Self::fetch_range`] は、削除・置換・共有違反・読み出し失敗を検知しても
+    /// **その応答1件の中では他の項目・他のソースの取得を継続します**
+    /// （`ERR-001`。モジュール doc コメント参照）。表示は次回以降の範囲取得か
+    /// `SourceStatus` の変化で追いつけますが、**クリップボードコピーでは
+    /// 空になった本文がそのまま利用者の手元へ渡り、取り消せません**。
+    ///
+    /// そこで `crate::copy::assemble_copy` は、範囲取得の前後でこの値を比べ、
+    /// 増えていればコピー全体を失敗させます（`COPY-005` の「部分コピーを黙って
+    /// 行わない」）。呼び出しの前後で差を取る用途にだけ使ってください
+    /// （絶対値そのものには意味がありません）。
+    #[must_use]
+    pub fn hydrate_fallback_items(&self) -> u64 {
+        self.hydrate_fallback_items
     }
 
     /// 既存の表示集合を再構築し、世代を1つ進めます（`LOG-023`・`LOG-028` の
@@ -553,12 +591,45 @@ impl DisplaySetRegistry {
     }
 
     /// `display_set_id` に対応する `source_id` を返します（未登録なら `None`）。
+    ///
+    /// **統合表示集合（P09-1）は複数ソースを横断するため、常に `None` になり
+    /// ます。** 「単独ソースの表示集合か」を判定する用途にはそのまま使えます
+    /// が、表示集合の世代・件数を知りたいだけの用途には
+    /// [`Self::display_set_state`] を使ってください（統合表示集合を
+    /// 「存在しない表示集合」として扱ってしまわないため。Issue #37）。
     #[must_use]
     pub fn source_id_for_display_set(&self, display_set_id: u32) -> Option<u32> {
         self.sources
             .iter()
             .find(|(_, record)| record.display_set_id == display_set_id)
             .map(|(source_id, _)| *source_id)
+    }
+
+    /// `display_set_id` の現在の世代・件数を返します（未登録なら `None`）。
+    ///
+    /// 単独ソースの表示集合と統合表示集合（P09-1）のどちらでも同じ意味の値を
+    /// 返します。世代・件数の出所は [`Self::fetch_range`] が範囲取得に使うもの
+    /// と同一であり、同じ借用の中で読めば両者は必ず一致します
+    /// （`crate::copy::assemble_copy` が、範囲取得の前に上限判定へ使います）。
+    #[must_use]
+    pub fn display_set_state(&self, display_set_id: u32) -> Option<DisplaySetState> {
+        // 統合表示集合は `display_sets` には入っておらず（`merged_view` が単独で
+        // 保持する）、`fetch_range` も専用の分岐で扱う。判定の順序と条件を
+        // `fetch_range` と揃え、同じ ID が両者で別の表示集合を指すことがない
+        // ようにする。
+        if let Some(merged) = &self.merged_view {
+            if merged.display_set_id == display_set_id {
+                return Some(DisplaySetState {
+                    generation: merged.generation,
+                    total_items: merged.order.len() as u64,
+                });
+            }
+        }
+        let display_set = self.display_sets.get(&display_set_id)?;
+        Some(DisplaySetState {
+            generation: display_set.generation(),
+            total_items: display_set.total_items(),
+        })
     }
 
     /// 現在アクティブ（表示中）のソースを設定します（P08-3）。
@@ -1283,11 +1354,14 @@ impl DisplaySetRegistry {
             return Vec::new();
         }
 
-        let datetime_format = match self.sources.get(&source_id) {
-            Some(record) => record.datetime_format,
-            None => {
-                return group.iter().map(item_dto_fallback).collect();
-            }
+        // 未登録の `source_id`（close との競合など）。本文を読み出す手立てが
+        // 無いため、この項目群は既定値（空の本文）で返す。
+        let Some(datetime_format) = self
+            .sources
+            .get(&source_id)
+            .map(|record| record.datetime_format)
+        else {
+            return self.fallback_group(&group);
         };
 
         // 包含判定の突き合わせに使う、要求した項目群の生バイト範囲
@@ -1315,13 +1389,16 @@ impl DisplaySetRegistry {
         }
         CHUNK_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 
-        let (path, selected_encoding, recorded_snapshot) = match self.sources.get(&source_id) {
-            Some(record) => (
-                record.path.clone(),
-                record.selected_encoding,
-                record.snapshot,
-            ),
-            None => return group.iter().map(item_dto_fallback).collect(),
+        let Some((path, selected_encoding, recorded_snapshot)) =
+            self.sources.get(&source_id).map(|record| {
+                (
+                    record.path.clone(),
+                    record.selected_encoding,
+                    record.snapshot,
+                )
+            })
+        else {
+            return self.fallback_group(&group);
         };
 
         SOURCE_REOPENS.fetch_add(1, Ordering::Relaxed);
@@ -1329,15 +1406,15 @@ impl DisplaySetRegistry {
             Ok(pair) => pair,
             Err(hakutaku_data_source::ReopenForReloadError::Deleted) => {
                 self.mark_changed_now(source_id, ChangeKind::Deleted);
-                return group.iter().map(item_dto_fallback).collect();
+                return self.fallback_group(&group);
             }
             Err(hakutaku_data_source::ReopenForReloadError::SharingViolation { .. }) => {
                 self.mark_sharing_violation_now(source_id);
-                return group.iter().map(item_dto_fallback).collect();
+                return self.fallback_group(&group);
             }
             Err(hakutaku_data_source::ReopenForReloadError::Io { reason }) => {
                 self.mark_error_now(source_id, reason);
-                return group.iter().map(item_dto_fallback).collect();
+                return self.fallback_group(&group);
             }
         };
 
@@ -1346,11 +1423,11 @@ impl DisplaySetRegistry {
         // より縮んでいたりする場合、索引がもはや有効ではない）。
         if new_snapshot.identity != recorded_snapshot.identity {
             self.mark_changed_now(source_id, ChangeKind::Replaced);
-            return group.iter().map(item_dto_fallback).collect();
+            return self.fallback_group(&group);
         }
         if new_snapshot.snapshot_end < recorded_snapshot.snapshot_end {
             self.mark_changed_now(source_id, ChangeKind::Shrunk);
-            return group.iter().map(item_dto_fallback).collect();
+            return self.fallback_group(&group);
         }
 
         let span_start = group.iter().map(|item| item.raw_offset).min().unwrap_or(0);
@@ -1366,7 +1443,7 @@ impl DisplaySetRegistry {
                 source_id,
                 "本文の読み出しに失敗しました（seek）。".to_string(),
             );
-            return group.iter().map(item_dto_fallback).collect();
+            return self.fallback_group(&group);
         }
         let mut buffer = vec![0u8; span_len];
         if file.read_exact(&mut buffer).is_err() {
@@ -1374,7 +1451,7 @@ impl DisplaySetRegistry {
                 source_id,
                 "本文の読み出しに失敗しました（read）。".to_string(),
             );
-            return group.iter().map(item_dto_fallback).collect();
+            return self.fallback_group(&group);
         }
 
         let decided = hakutaku_format_detection::DecidedEncoding {
@@ -1414,6 +1491,21 @@ impl DisplaySetRegistry {
             .zip(decoded_items.iter())
             .map(|(item, text)| item_dto_from_text(item, Arc::clone(text), datetime_format))
             .collect()
+    }
+
+    /// 本文を読み出せなかった項目群を、既定値（空の本文）の [`ItemDto`] として
+    /// 返し、その件数を [`Self::hydrate_fallback_items`] へ数え上げます。
+    ///
+    /// `ERR-001` に従い、この応答自体は失敗させません（同じ応答に含まれる他の
+    /// 項目・他のソースの取得は継続します）。数え上げるのは、空の本文が黙って
+    /// 結果へ混ざると取り消せない呼び出し側——クリップボードコピー——が、
+    /// 後から気づいて全体を失敗させられるようにするためです（`COPY-005`、
+    /// Issue #37）。
+    fn fallback_group(&mut self, group: &[IndexItemRef]) -> Vec<ItemDto> {
+        self.hydrate_fallback_items = self
+            .hydrate_fallback_items
+            .saturating_add(group.len() as u64);
+        group.iter().map(item_dto_fallback).collect()
     }
 
     /// 現在登録されている表示集合の件数（テスト・診断用）。
@@ -2298,6 +2390,39 @@ mod tests {
             Some(handle.source_id)
         );
         assert_eq!(registry.source_id_for_display_set(999), None);
+    }
+
+    // 受け入れ条件（Issue #37）: display_set_state は単独ソースでも統合表示集合
+    // でも現在の世代・件数を返し、未知の ID では None を返す（source_id を
+    // 持たない統合表示集合を「存在しない表示集合」として扱わない）。
+    #[test]
+    fn display_set_state_resolves_both_single_source_and_merged_view() {
+        let mut registry = DisplaySetRegistry::new();
+        let budget = crate::budget::SourceBudget::new();
+        let file = TempFile::create("state", b"content");
+        let handle = insert_from_file(&mut registry, &budget, &file.path, "a.log", "content");
+
+        assert_eq!(
+            registry.display_set_state(handle.display_set_id),
+            Some(DisplaySetState {
+                generation: handle.generation,
+                total_items: handle.total_items,
+            })
+        );
+        assert_eq!(registry.display_set_state(999), None);
+
+        let merged = registry.enable_merged_view().expect("成功するはず");
+        assert_eq!(
+            registry.display_set_state(merged.display_set_id),
+            Some(DisplaySetState {
+                generation: merged.generation,
+                total_items: merged.total_items,
+            })
+        );
+
+        // OFF にした後の識別子は、他の表示集合と取り違えず未知として扱われる。
+        registry.disable_merged_view();
+        assert_eq!(registry.display_set_state(merged.display_set_id), None);
     }
 
     // 受け入れ条件: 未知の display_set_id は UnknownDisplaySet になる。

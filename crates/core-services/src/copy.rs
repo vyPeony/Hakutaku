@@ -21,6 +21,32 @@
 //! 拒否時はクリップボード用バッファを一切生成・予約しません
 //! （`COPY-005` の「部分コピーを黙って行わない」）。
 //!
+//! # 本文を読み出せなかった場合（`COPY-005`、Issue #37）
+//!
+//! 範囲取得は、コピーの最中にソースが削除・置換された場合も応答自体は
+//! 成功させ、そのソースの項目を**空の本文**で返します（`ERR-001`。
+//! `crate::registry` のモジュール doc コメント参照）。表示ならば次の取得で
+//! 追いつけますが、コピーでは中身の抜けた内容がそのままクリップボードへ渡り、
+//! 利用者は「コピーできた」と受け取ります。そこで [`assemble_copy`] は
+//! [`DisplaySetRegistry::hydrate_fallback_items`] を範囲取得の前後で比べ、
+//! 既定値で返された項目が1件でもあれば [`CopyError::SourceUnavailable`] として
+//! コピー全体を失敗させます（クリップボードには一切触れません）。
+//!
+//! # 統合表示集合（P09-1）のコピー
+//!
+//! 表示集合の世代・件数の解決には
+//! [`DisplaySetRegistry::display_set_state`] を使い、範囲取得には
+//! [`DisplaySetRegistry::fetch_range`] を使います。どちらも単独ソースと統合
+//! 表示集合を同じ入口で扱うため、この関数に統合表示集合の分岐はありません
+//! （以前は `source_id` の逆引きで表示集合を解決しており、`source_id` を持たない
+//! 統合表示集合では必ず失敗していました。Issue #37）。
+//!
+//! **コピーする列は統合表示でも「行番号・日時・本文」のままです。** 統合表示の
+//! 画面にだけ現れる読み込み元ラベル列（`LOG-007`）はコピーへ含めません。列の
+//! 並びは ADR-0009 が「行番号 → 日時 → 本文」で固定しており、列を増やすことは
+//! 貼り付け先の作業手順に影響する形式変更（新しい ADR を要する）にあたるため
+//! です。
+//!
 //! # 生成規則（ADR-0009）
 //!
 //! - **本文列のみの選択**（[`CopyColumns::is_body_only`]）: 原文
@@ -142,6 +168,13 @@ pub enum CopyError {
     /// メモリ予約が拒否された（`PERF-008`）。`CFG-018` の上限内でも、他の
     /// 用途でメモリ予算が逼迫している場合に発生し得る。
     MemoryReservationRejected(hakutaku_memory_accounting::ReservationRejected),
+    /// 選択範囲の本文を読み出せなかった（コピーの最中にソースが削除・置換・
+    /// 共有違反になった等。`LOG-023`／`LOG-027`）。
+    ///
+    /// 呼び出し側はクリップボードを変更してはいけません。中身の抜けた内容を
+    /// 「コピーできた」として渡さないための失敗であり（`COPY-005`）、利用者へは
+    /// 対象の状態を確かめて再試行するよう案内します。
+    SourceUnavailable,
 }
 
 impl std::fmt::Display for CopyError {
@@ -152,6 +185,12 @@ impl std::fmt::Display for CopyError {
                 write!(f, "コピーする列が1つも選択されていません。")
             }
             CopyError::MemoryReservationRejected(error) => error.fmt(f),
+            CopyError::SourceUnavailable => {
+                write!(
+                    f,
+                    "選択範囲の本文を読み出せなかったため、コピーを中止しました。"
+                )
+            }
         }
     }
 }
@@ -161,12 +200,17 @@ impl std::error::Error for CopyError {}
 /// 選択範囲からクリップボードコピーの内容を組み立てます（`COPY-001`〜
 /// `COPY-005`、`PERF-008`／`PERF-010`）。
 ///
+/// `display_set_id` は単独ソースの表示集合でも統合表示集合（P09-1）でも
+/// 構いません（モジュール doc コメント「統合表示集合のコピー」参照）。
+///
 /// `expected_generation` は呼び出し側が最後に観測した世代です。表示集合が
 /// 再構築されていた場合、[`CopyError::Fetch`]（`GenerationMismatch`）を返し
 /// ます（既存の範囲取得と同じ経路）。
 ///
 /// 上限超過は `Err` ではなく `Ok(CopyOutcome::Rejected(..))` を返します
-/// （`COPY-005` が定める、部分コピーなしの正規応答）。
+/// （`COPY-005` が定める、部分コピーなしの正規応答）。本文を読み出せなかった
+/// 場合は [`CopyError::SourceUnavailable`] で全体を失敗させます（同じく
+/// `COPY-005`。モジュール doc コメント参照）。
 pub fn assemble_copy(
     registry: &mut DisplaySetRegistry,
     display_set_id: u32,
@@ -179,24 +223,24 @@ pub fn assemble_copy(
         return Err(CopyError::NoColumnsSelected);
     }
 
-    let source_id = registry
-        .source_id_for_display_set(display_set_id)
+    // 表示集合の解決は、範囲取得（`fetch_range`）と同じ入口を使う。単独ソース
+    // から `source_id` を逆引きする方法では、`source_id` を持たない統合表示集合
+    // （P09-1）が常に「未知の表示集合」になってしまう（Issue #37）。
+    let state = registry
+        .display_set_state(display_set_id)
         .ok_or(CopyError::Fetch(FetchRangeError::UnknownDisplaySet))?;
-    let handle = registry
-        .current_handle(source_id)
-        .ok_or(CopyError::Fetch(FetchRangeError::UnknownDisplaySet))?;
-    if handle.generation != expected_generation {
+    if state.generation != expected_generation {
         return Err(CopyError::Fetch(FetchRangeError::GenerationMismatch {
             expected: expected_generation,
-            current: handle.generation,
+            current: state.generation,
         }));
     }
 
     // 行数は索引（total_items）から即時算出できる。本文の読み出しは
     // まだ一切行わない（表示外の範囲を含む選択でも同じ経路で扱える。
     // モジュール doc コメント「表示外の範囲を含む選択」参照）。
-    let start = selection.start.min(handle.total_items);
-    let effective_lines = selection.count.min(handle.total_items - start);
+    let start = selection.start.min(state.total_items);
+    let effective_lines = selection.count.min(state.total_items - start);
 
     if effective_lines > limits.max_lines {
         return Ok(CopyOutcome::Rejected(CopyRejection {
@@ -220,6 +264,11 @@ pub fn assemble_copy(
     let mut accumulated_bytes: u64 = 0;
     let mut cursor = start;
     let target_end = start + effective_lines;
+    // COPY-005: 範囲取得が本文を空の既定値で埋めた項目を検出するための基準値
+    // （モジュール doc コメント「本文を読み出せなかった場合」）。取得のたびに
+    // 比べ、増えていたらその場で全体を失敗させる（読めなかった項目より後ろを
+    // 読み進めても、結果は捨てるため無駄になる）。
+    let fallback_items_before = registry.hydrate_fallback_items();
 
     while cursor < target_end {
         let remaining = target_end - cursor;
@@ -234,6 +283,10 @@ pub fn assemble_copy(
                 },
             )
             .map_err(CopyError::Fetch)?;
+
+        if registry.hydrate_fallback_items() != fallback_items_before {
+            return Err(CopyError::SourceUnavailable);
+        }
 
         if response.items.is_empty() {
             // 索引から算出した件数より実際の項目が少ない（通常発生しない
@@ -455,6 +508,54 @@ mod tests {
                 raw_offset,
                 raw_byte_len: u32::try_from(line.len()).unwrap(),
                 comparison_key_millis: None,
+                source_line_number: index as u64 + 1,
+                continuation_count: 0,
+                unconfirmed: false,
+            });
+            content.push(b'\n');
+        }
+        std::fs::write(&file.path, &content).expect("内容を書き込めるはず");
+
+        let (opened, snapshot) =
+            hakutaku_data_source::open_and_snapshot(&file.path).expect("開けるはず");
+        drop(opened);
+        let reservation = budget
+            .reserve(snapshot.snapshot_end)
+            .expect("テストの上限は十分大きいはず");
+        registry
+            .insert_source(
+                file.path.clone(),
+                label.to_string(),
+                &pending,
+                snapshot,
+                reservation,
+                false,
+                None,
+                SelectedEncoding::Utf8,
+                crate::item::CapacityEstimate::Exact(pending.len()),
+            )
+            .expect("索引予約は十分な予算内のはず")
+    }
+
+    /// [`insert_simple_lines`] と同じ構成で、各項目に比較キー（ミリ秒。
+    /// `LOG-024`）を持たせたソースを登録します。統合表示集合（P09-1）の
+    /// 並び順（ADR-0008）をまたいだコピーを検証するために使います。
+    fn insert_lines_with_keys(
+        registry: &mut DisplaySetRegistry,
+        budget: &SourceBudget,
+        file: &TempFile,
+        label: &str,
+        lines: &[(&str, i64)],
+    ) -> crate::DisplaySetHandle {
+        let mut content = Vec::new();
+        let mut pending = Vec::new();
+        for (index, (line, key)) in lines.iter().enumerate() {
+            let raw_offset = content.len() as u64;
+            content.extend_from_slice(line.as_bytes());
+            pending.push(PendingItem {
+                raw_offset,
+                raw_byte_len: u32::try_from(line.len()).unwrap(),
+                comparison_key_millis: Some(*key),
                 source_line_number: index as u64 + 1,
                 continuation_count: 0,
                 unconfirmed: false,
@@ -1282,5 +1383,300 @@ mod tests {
             CopyOutcome::Copied(buffer) => assert_eq!(buffer.lines, 2),
             other => panic!("Copied を期待したが {other:?} だった"),
         }
+    }
+
+    // --- 統合表示集合（P09-1）のコピー（Issue #37） ---
+
+    // 受け入れ条件（COPY-001／COPY-002、`LOG-007`）: 統合表示集合の行選択を
+    // コピーでき、内容はソースをまたいで ADR-0008 の並び順になる（統合表示は
+    // source_id を持たないため、以前は必ず UnknownDisplaySet で失敗していた）。
+    #[test]
+    fn merged_display_set_row_selection_is_copied_in_merged_order() {
+        let mut registry = DisplaySetRegistry::new();
+        let source_budget = SourceBudget::new();
+        let memory_budget = MemoryBudget::new(10_000_000);
+        let file_a = TempFile::create("merged-row-a", b"placeholder");
+        let file_b = TempFile::create("merged-row-b", b"placeholder");
+
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file_a,
+            "a.log",
+            &[("a-10", 10), ("a-30", 30)],
+        );
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file_b,
+            "b.log",
+            &[("b-20", 20)],
+        );
+
+        let merged = registry.enable_merged_view().expect("成功するはず");
+        assert_eq!(merged.total_items, 3);
+
+        let outcome = assemble_copy(
+            &mut registry,
+            merged.display_set_id,
+            merged.generation,
+            CopySelection {
+                start: 0,
+                count: 3,
+                columns: body_only_columns(),
+            },
+            generous_limits(),
+            &memory_budget,
+        )
+        .expect("統合表示集合でも成功するはず");
+
+        match outcome {
+            CopyOutcome::Copied(buffer) => {
+                assert_eq!(
+                    buffer.text, "a-10\nb-20\na-30",
+                    "比較キー昇順（ソースをまたぐ並び）でコピーされるはず"
+                );
+                assert_eq!(buffer.lines, 3);
+            }
+            other => panic!("Copied を期待したが {other:?} だった"),
+        }
+    }
+
+    // 受け入れ条件（COPY-001、ADR-0009）: 統合表示集合のセル範囲コピーも、
+    // 単独ソースと同じ列（行番号 → 日時 → 本文）・同じ quoted TSV になる
+    // （統合表示の画面にだけある読み込み元ラベル列は含めない）。
+    #[test]
+    fn merged_display_set_cell_range_uses_the_same_columns_as_a_single_source() {
+        let mut registry = DisplaySetRegistry::new();
+        let source_budget = SourceBudget::new();
+        let memory_budget = MemoryBudget::new(10_000_000);
+        let file_a = TempFile::create("merged-cell-a", b"placeholder");
+        let file_b = TempFile::create("merged-cell-b", b"placeholder");
+
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file_a,
+            "a.log",
+            &[("a-10", 10)],
+        );
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file_b,
+            "b.log",
+            &[("b-20", 20)],
+        );
+
+        let merged = registry.enable_merged_view().expect("成功するはず");
+
+        let outcome = assemble_copy(
+            &mut registry,
+            merged.display_set_id,
+            merged.generation,
+            CopySelection {
+                start: 0,
+                count: 2,
+                columns: CopyColumns {
+                    line_number: true,
+                    timestamp: true,
+                    raw_text: true,
+                },
+            },
+            generous_limits(),
+            &memory_budget,
+        )
+        .expect("統合表示集合でも成功するはず");
+
+        match outcome {
+            CopyOutcome::Copied(buffer) => {
+                // 各ソースの1行目どうしのため、行番号はどちらも 1。日時書式が
+                // 未指定のソースのため日時セルは空。読み込み元ラベルの列は
+                // 増えない（3列のまま）。
+                assert_eq!(buffer.text, "1\t\ta-10\n1\t\tb-20");
+                assert_eq!(buffer.lines, 2);
+            }
+            other => panic!("Copied を期待したが {other:?} だった"),
+        }
+    }
+
+    // 受け入れ条件: 統合表示集合の世代不一致（ON のまま対象を開いた・閉じた
+    // 場合に起きる）も、単独ソースと同じ既存のエラー経路で返る。
+    #[test]
+    fn merged_display_set_generation_mismatch_reuses_the_existing_fetch_error() {
+        let mut registry = DisplaySetRegistry::new();
+        let source_budget = SourceBudget::new();
+        let memory_budget = MemoryBudget::new(10_000_000);
+        let file_a = TempFile::create("merged-gen-a", b"placeholder");
+        let file_b = TempFile::create("merged-gen-b", b"placeholder");
+
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file_a,
+            "a.log",
+            &[("a-10", 10)],
+        );
+        let merged = registry.enable_merged_view().expect("成功するはず");
+
+        // 統合表示 ON のまま別の対象を開くと、統合表示集合は作り直されて世代が
+        // 1つ進む（`sync_merged_view`）。フロントエンドが持つ古い世代での
+        // コピー要求はここで弾かれる。
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file_b,
+            "b.log",
+            &[("b-20", 20)],
+        );
+
+        let error = assemble_copy(
+            &mut registry,
+            merged.display_set_id,
+            merged.generation,
+            CopySelection {
+                start: 0,
+                count: 1,
+                columns: body_only_columns(),
+            },
+            generous_limits(),
+            &memory_budget,
+        )
+        .expect_err("世代不一致はエラーになるはず");
+
+        assert_eq!(
+            error,
+            CopyError::Fetch(FetchRangeError::GenerationMismatch {
+                expected: merged.generation,
+                current: merged.generation + 1,
+            })
+        );
+    }
+
+    // 受け入れ条件: 統合表示を OFF にした後の古い display_set_id は、既存の
+    // 「未知の表示集合」経路になる（統合表示の識別子を無条件に受理しない）。
+    #[test]
+    fn disabled_merged_display_set_is_an_unknown_display_set() {
+        let mut registry = DisplaySetRegistry::new();
+        let source_budget = SourceBudget::new();
+        let memory_budget = MemoryBudget::new(10_000_000);
+        let file = TempFile::create("merged-disabled", b"placeholder");
+
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file,
+            "a.log",
+            &[("a-10", 10)],
+        );
+        let merged = registry.enable_merged_view().expect("成功するはず");
+        registry.disable_merged_view();
+
+        let error = assemble_copy(
+            &mut registry,
+            merged.display_set_id,
+            merged.generation,
+            CopySelection {
+                start: 0,
+                count: 1,
+                columns: body_only_columns(),
+            },
+            generous_limits(),
+            &memory_budget,
+        )
+        .expect_err("破棄済みの表示集合はエラーになるはず");
+        assert_eq!(error, CopyError::Fetch(FetchRangeError::UnknownDisplaySet));
+    }
+
+    // --- 本文を読み出せなかった場合（COPY-005、Issue #37） ---
+
+    // 受け入れ条件（COPY-005）: コピーの最中にソースが削除されると、範囲取得の
+    // 既定値（空の本文）が黙ってクリップボードへ渡らず、コピー全体が失敗する。
+    #[test]
+    fn copy_fails_when_the_body_cannot_be_read_instead_of_copying_empty_text() {
+        let mut registry = DisplaySetRegistry::new();
+        let source_budget = SourceBudget::new();
+        let memory_budget = MemoryBudget::new(10_000_000);
+        let file = TempFile::create("body-unavailable", b"placeholder");
+
+        let handle = insert_simple_lines(
+            &mut registry,
+            &source_budget,
+            &file,
+            "a.log",
+            &["alpha", "beta"],
+        );
+
+        // 索引は登録済みのまま、実ファイルだけが消える（LOG-023 の削除検知が
+        // 範囲取得の中で起きる状況をそのまま作る）。
+        std::fs::remove_file(&file.path).expect("削除できるはず");
+
+        let error = assemble_copy(
+            &mut registry,
+            handle.display_set_id,
+            handle.generation,
+            CopySelection {
+                start: 0,
+                count: 2,
+                columns: body_only_columns(),
+            },
+            generous_limits(),
+            &memory_budget,
+        )
+        .expect_err("本文を読み出せない場合はエラーになるはず");
+
+        assert_eq!(error, CopyError::SourceUnavailable);
+        assert_eq!(
+            memory_budget.outstanding_reserved_bytes(),
+            0,
+            "失敗経路では予約が行われないはず（PERF-010、部分コピーなし）"
+        );
+    }
+
+    // 受け入れ条件（COPY-005）: 統合表示集合でも、参加ソースの1つが読み出せなく
+    // なった時点でコピー全体が失敗する（読める側のソースの内容だけを黙って
+    // コピーしない）。
+    #[test]
+    fn merged_copy_fails_when_one_member_source_cannot_be_read() {
+        let mut registry = DisplaySetRegistry::new();
+        let source_budget = SourceBudget::new();
+        let memory_budget = MemoryBudget::new(10_000_000);
+        let file_a = TempFile::create("merged-unavailable-a", b"placeholder");
+        let file_b = TempFile::create("merged-unavailable-b", b"placeholder");
+
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file_a,
+            "a.log",
+            &[("a-10", 10)],
+        );
+        insert_lines_with_keys(
+            &mut registry,
+            &source_budget,
+            &file_b,
+            "b.log",
+            &[("b-20", 20)],
+        );
+        let merged = registry.enable_merged_view().expect("成功するはず");
+
+        std::fs::remove_file(&file_b.path).expect("削除できるはず");
+
+        let error = assemble_copy(
+            &mut registry,
+            merged.display_set_id,
+            merged.generation,
+            CopySelection {
+                start: 0,
+                count: 2,
+                columns: body_only_columns(),
+            },
+            generous_limits(),
+            &memory_budget,
+        )
+        .expect_err("参加ソースを読み出せない場合はエラーになるはず");
+
+        assert_eq!(error, CopyError::SourceUnavailable);
+        assert_eq!(memory_budget.outstanding_reserved_bytes(), 0);
     }
 }
