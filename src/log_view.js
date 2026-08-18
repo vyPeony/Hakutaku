@@ -20,6 +20,27 @@
 // Tauri の IPC 呼び出しは src/main.js と同じ理由で
 // window.__TAURI_INTERNALS__.invoke を直接使う。
 //
+// # 範囲取得応答の適用条件（Issue #34）
+//
+// 範囲取得（`fetch_log_range`）は非同期であり、往復の最中にタブの切り替えや
+// 再読み込み（`reload_target`。表示集合 ID を保ったまま世代だけが進む）が起こり
+// 得る。そのため、要求は発行した時点の表示集合 ID と世代を束ねた
+// `ChunkFetchRequest` として扱い、**成功・失敗のどちらの応答も、その文脈が現在
+// の表示と一致する場合にだけ適用する**。一致しない応答は適用せず捨てる。適用して
+// しまうと、総行数・世代・本文を古い表示集合や古い世代の値へ巻き戻し、
+// 再読み込み後の表示が次の世代不一致まで誤った内容のままになる（`LOG-028`）。
+//
+// 捨てた分の取り直しは、チャンク取得が決着するたびに予約する再描画
+// （`ensureChunksLoaded` の `finally`）が現在の文脈で改めて要求するため、
+// 取りこぼしにはならない。表示集合の切り替えと世代の更新では、取得中の登録
+// （`state.inFlightChunkFetches`）も破棄する（IPC にキャンセル手段が無く、古い
+// 登録を残すと新しい文脈の取得が「二重取得」と誤判定されて抑止されるため）。
+//
+// 取得に失敗したチャンクは `state.failedChunkFetches` へ記録し、行の文言を
+// 「（読み込み中…）」と区別できる失敗表示へ変えたうえで、短いバックオフを置いて
+// 自動的に取り直す。通知は一連の失敗の1件目だけに出す（同じ文の通知を積み増さない。
+// `src/banner.js` の集約方針と同じ趣旨）。
+//
 // # 形式別ビューアの差し込み口（P07-1）
 //
 // このモジュールは「形式別ビューア」の実装の1つ（テキストログ向け）です。
@@ -146,6 +167,25 @@ const BUFFER_ROWS = 50;
 const ROW_HEIGHT_PX = 22;
 
 /**
+ * 取得に失敗したチャンクを自動で取り直すまでの最短待ち時間（ミリ秒。Issue #34）。
+ *
+ * 失敗した行を放置しないためには自動の再取得が要るが、失敗のたびに即座に取り直す
+ * と、失敗が続く間 IPC を叩き続けるホットループになる（`PERF-014` が求める端末の
+ * 負荷抑制にも反する）。人が「反応が無い」と感じない程度に短く、かつ連続失敗時に
+ * 往復を積み上げない値としてこの初期待ち時間を置く。
+ */
+const FETCH_RETRY_BASE_DELAY_MS = 1_000;
+
+/**
+ * 連続失敗時に伸ばす待ち時間の上限（ミリ秒。Issue #34）。
+ *
+ * 待ち時間は失敗のたびに倍にしていく（恒久的な失敗——表示集合が消えた等——で
+ * 無駄な往復を続けないため）が、上限を設けないと一時的な失敗から復帰したときに
+ * 何分も待たされる。復帰の検知が遅れすぎない範囲で頭打ちにする。
+ */
+const FETCH_RETRY_MAX_DELAY_MS = 30_000;
+
+/**
  * @typedef {Object} LogItemDto `fetch_log_range` 応答の1項目
  * （`src-tauri/src/log_view.rs` の `LogItemDto` の JSON 表現）。
  * @property {number} source_id
@@ -191,8 +231,25 @@ const state = {
   retentionLimits: { maxRows: 10_000, maxBytes: 64 * 1024 * 1024 },
   /** @type {Map<number, CachedChunk>} chunkIndex -> チャンク（行データの唯一の保持点）。 */
   chunkCache: new Map(),
-  /** @type {Map<number, Promise<void>>} chunkIndex -> 取得中の Promise（二重取得防止）。 */
+  /**
+   * @type {Map<number, Promise<void>>} chunkIndex -> 取得中の Promise（二重取得
+   * 防止）。表示集合の切り替え・世代の更新では
+   * `forgetInFlightChunkFetches` で登録ごと破棄する（Issue #34）。
+   */
   inFlightChunkFetches: new Map(),
+  /**
+   * @type {Map<number, { attempts: number, retryAtMs: number }>} chunkIndex ->
+   * 取得に失敗したチャンクの再試行予定（Issue #34）。`attempts` は連続失敗回数
+   * （バックオフの算出用）、`retryAtMs` は次に取り直してよい時刻
+   * （`Date.now()` 基準）。行データは持たないため、PERF-012 が禁じる
+   * 「行データの累積」には当たらない（上限は可視範囲のチャンク数程度）。
+   */
+  failedChunkFetches: new Map(),
+  /**
+   * @type {ReturnType<typeof setTimeout> | null} バックオフ明けに再描画
+   * （＝自動再取得）を起こすためのタイマー。常に1本だけ持つ。
+   */
+  retryTimerId: null,
   /**
    * @type {Set<number>} 一度でもキャッシュしたことのあるチャンク番号（再取得
    * 回数の判定用）。行データそのものではなく小さな整数の集合であり、上限は
@@ -332,6 +389,11 @@ export function initLogView(retentionLimits) {
  */
 export function activateDisplaySet(descriptor) {
   clearCache();
+  // 前の表示集合へ向けて発行済みの取得は、応答が届いても捨てられる（Issue #34 の
+  // 文脈照合）。その登録を残したままだと、新しい表示集合の同じチャンク番号の取得
+  // が二重取得と誤判定されて始まらないため、登録と失敗記録もここで手放す。
+  forgetInFlightChunkFetches();
+  clearFailedChunkFetches();
   state.displaySetId = descriptor.display_set_id;
   state.generation = descriptor.generation;
   state.totalItems = Number(descriptor.total_items);
@@ -362,6 +424,8 @@ export function activateDisplaySet(descriptor) {
  */
 export function showEmptyState() {
   clearCache();
+  forgetInFlightChunkFetches();
+  clearFailedChunkFetches();
   state.displaySetId = null;
   state.generation = null;
   state.totalItems = 0;
@@ -388,15 +452,73 @@ function updateTotalItemsLabel() {
 
 /**
  * キャッシュ済みの全チャンクを破棄する（新しいファイルを開いた時、世代不一致を
- * 検出した時に呼び出す）。破棄済みチャンクを取得中だった `inFlightChunkFetches`
- * の Promise はそのまま残す。到着時に `fetchChunk` 冒頭の世代チェックで
- * 自然に無視される（キャンセル手段が無いため。詳細は `fetchChunk` 参照）。
+ * 検出した時に呼び出す）。取得中の Promise には触れない（IPC にキャンセル手段が
+ * 無いため）。到着した応答は `fetchChunk` の文脈照合（`isRequestContextCurrent`）
+ * で捨てられる。取得中の**登録**は別途 `forgetInFlightChunkFetches` で破棄する
+ * （この関数と呼び出し箇所が同じでも役割が違うため分けている。Issue #34）。
  */
 function clearCache() {
   for (const chunk of state.chunkCache.values()) {
     retentionStats.recordChunkEvicted(chunk.items.length, chunk.byteCount);
   }
   state.chunkCache.clear();
+}
+
+/**
+ * 取得中チャンクの登録（二重取得の抑止）を全て取り消す（Issue #34）。
+ *
+ * 進行中の取得そのものは止められない（IPC にキャンセル手段が無い）。止められない
+ * まま登録を残すと、切り替え後の表示集合・世代で同じチャンク番号を取得しようと
+ * したときに「取得中」と誤判定して抑止してしまい、古い応答が文脈照合で捨てられた
+ * 後は誰も取り直さない（行が「（読み込み中…）」のまま残る）。登録だけを手放し、
+ * 古い取得の結果は文脈照合で捨てる。
+ */
+function forgetInFlightChunkFetches() {
+  state.inFlightChunkFetches.clear();
+}
+
+/**
+ * 取得失敗の記録と、バックオフ明けの再描画予約を破棄する（Issue #34）。
+ * 表示集合の切り替えと世代の更新では、失敗はその古い内容に対するものであり、
+ * 新しい内容の表示・再取得判断へ持ち越さない。
+ */
+function clearFailedChunkFetches() {
+  state.failedChunkFetches.clear();
+  if (state.retryTimerId !== null) {
+    clearTimeout(state.retryTimerId);
+    state.retryTimerId = null;
+  }
+}
+
+/**
+ * @typedef {Object} DisplayContext IPC 要求を発行した時点の表示文脈
+ * （Issue #34）。応答の適用可否は、この2つが現在の `state` と一致するかで
+ * 判定する。表示集合 ID だけでは足りない（`reload_target` は表示集合 ID を
+ * 保ったまま世代を進めるため、世代を照合しないと再読み込み直前の応答を
+ * 「同じ表示集合のもの」として適用してしまう）。
+ * @property {number} displaySetId
+ * @property {number} generation
+ */
+
+/**
+ * @typedef {DisplayContext & { chunkIndex: number }} ChunkFetchRequest
+ * 1チャンク分の範囲取得要求（`fetchChunk` の引数）。
+ */
+
+/**
+ * 要求発行時の文脈が、現在表示している内容と一致するか（Issue #34）。
+ *
+ * 一致しない = その要求の応答は、既に画面に無い表示集合または世代の内容を
+ * 指している。成功応答なら適用せず捨て、失敗応答なら現在の表示の状態
+ * （キャッシュ・世代・通知）へ一切反映しない。
+ *
+ * @param {DisplayContext} context
+ * @returns {boolean}
+ */
+function isRequestContextCurrent(context) {
+  return (
+    state.displaySetId === context.displaySetId && state.generation === context.generation
+  );
 }
 
 /** requestAnimationFrame で描画を1フレームにまとめる（連続スクロール時の過剰な再描画を防ぐ）。 */
@@ -510,9 +632,21 @@ function runPostFetchEvictionPass() {
  * 必要なチャンクのうち、未取得かつ取得中でないものの取得を開始する
  * （取得中チャンクの二重取得防止）。
  *
+ * 直前に取得へ失敗したチャンクは、バックオフが明けるまで取り直さない
+ * （Issue #34）。明ける時刻には `scheduleFailedChunkRetry` が再描画を予約する
+ * ため、利用者が操作しなくても自動で取り直される。
+ *
  * @param {number[]} chunkIndices
  */
 function ensureChunksLoaded(chunkIndices) {
+  if (state.displaySetId === null || state.generation === null) {
+    return;
+  }
+
+  const nowMs = Date.now();
+  /** @type {number | null} 再試行待ちのうち最も早い時刻。 */
+  let earliestRetryAtMs = null;
+
   for (const chunkIndex of chunkIndices) {
     if (state.chunkCache.has(chunkIndex)) {
       continue;
@@ -520,13 +654,103 @@ function ensureChunksLoaded(chunkIndices) {
     if (state.inFlightChunkFetches.has(chunkIndex)) {
       continue;
     }
-    const fetchPromise = fetchChunk(chunkIndex)
-      .catch((error) => handleFetchChunkError(error))
+    const failure = state.failedChunkFetches.get(chunkIndex);
+    if (failure !== undefined && nowMs < failure.retryAtMs) {
+      earliestRetryAtMs =
+        earliestRetryAtMs === null
+          ? failure.retryAtMs
+          : Math.min(earliestRetryAtMs, failure.retryAtMs);
+      continue;
+    }
+
+    /** @type {ChunkFetchRequest} */
+    const request = {
+      chunkIndex,
+      displaySetId: state.displaySetId,
+      generation: state.generation,
+    };
+    const fetchPromise = fetchChunk(request)
+      .catch((error) => handleFetchChunkError(error, request))
       .finally(() => {
-        state.inFlightChunkFetches.delete(chunkIndex);
+        // 文脈が変わり、同じチャンク番号の取得が既に登録し直されている場合に
+        // そちらを巻き添えで消さないよう、自分の登録だけを取り消す。
+        if (state.inFlightChunkFetches.get(chunkIndex) === fetchPromise) {
+          state.inFlightChunkFetches.delete(chunkIndex);
+        }
+        // 登録を外した**後**に再描画を予約する（順序依存。先に予約すると、その
+        // 描画はこのチャンクをまだ「取得中」と見なして取り直さない）。文脈違いで
+        // 応答を捨てた場合に、現在の文脈で取得をやり直す契機はこれ一つ
+        // （Issue #34）。多重スケジュールは `scheduleRender` が防ぐ。
+        scheduleRender();
       });
     state.inFlightChunkFetches.set(chunkIndex, fetchPromise);
   }
+
+  scheduleFailedChunkRetry(earliestRetryAtMs, nowMs);
+}
+
+/**
+ * 失敗したチャンクのバックオフが明けた時点で再描画（＝自動再取得）が起きるよう、
+ * タイマーを1本だけ張り直す（Issue #34）。
+ *
+ * 描画はスクロールなどの契機がなければ起こらないため、これが無いと失敗した行は
+ * 利用者が操作するまで失敗表示のまま残る。予約先は常に絶対時刻（`retryAtMs`）
+ * であり、描画のたびに張り直しても再試行が先送りされることはない。
+ *
+ * @param {number | null} retryAtMs 再試行待ちのうち最も早い時刻。待機中が無ければ null。
+ * @param {number} nowMs
+ */
+function scheduleFailedChunkRetry(retryAtMs, nowMs) {
+  if (state.retryTimerId !== null) {
+    clearTimeout(state.retryTimerId);
+    state.retryTimerId = null;
+  }
+  if (retryAtMs === null) {
+    return;
+  }
+  state.retryTimerId = setTimeout(
+    () => {
+      state.retryTimerId = null;
+      scheduleRender();
+    },
+    Math.max(0, retryAtMs - nowMs),
+  );
+}
+
+/**
+ * チャンク取得の失敗を記録し、失敗表示と自動再取得の契機を作る（Issue #34）。
+ *
+ * @param {number} chunkIndex
+ * @returns {boolean} 一連の失敗（ストリーク）の1件目か。通知はこの場合だけ出す。
+ */
+function recordChunkFetchFailure(chunkIndex) {
+  // 通知をストリークの1件目に限る理由: 可視範囲の複数チャンクは同時に失敗し、
+  // さらに自動再取得も失敗を繰り返すため、失敗のたびに通知すると同じ文の回数表示
+  // （`src/banner.js` の集約）が際限なく伸び続ける。全て復旧すればストリークは
+  // 終わり、次の失敗はまた1件目として通知される。
+  const isFirstOfStreak = state.failedChunkFetches.size === 0;
+  const attempts = (state.failedChunkFetches.get(chunkIndex)?.attempts ?? 0) + 1;
+  const delayMs = Math.min(
+    FETCH_RETRY_BASE_DELAY_MS * 2 ** (attempts - 1),
+    FETCH_RETRY_MAX_DELAY_MS,
+  );
+  state.failedChunkFetches.set(chunkIndex, { attempts, retryAtMs: Date.now() + delayMs });
+  // 失敗した行を「（読み込み中…）」のまま放置せず、すぐ失敗表示へ切り替える
+  // （この再描画が `scheduleFailedChunkRetry` の予約も張り直す）。
+  scheduleRender();
+  return isFirstOfStreak;
+}
+
+/**
+ * 指定した行のチャンクが取得に失敗し、再試行待ちかどうか（Issue #34）。
+ * 行の本文が未取得である理由が「まだ届いていない」のか「失敗して待っている」の
+ * かを、`buildRowElement` が文言で区別するために使う。
+ *
+ * @param {number} rowIndex
+ * @returns {boolean}
+ */
+function hasFailedChunkFetch(rowIndex) {
+  return state.failedChunkFetches.has(chunkIndexForRow(rowIndex, CHUNK_SIZE));
 }
 
 /**
@@ -539,9 +763,17 @@ function ensureChunksLoaded(chunkIndices) {
  * 保証しているため、0件の応答は「これ以上データが無い」ことを意味し、ここで
  * 打ち切ってよい。
  *
- * @param {number} chunkIndex
+ * 応答を適用する条件は2つ（Issue #34。モジュール冒頭のコメント「範囲取得応答の
+ * 適用条件」参照）。往復のたびに両方を確認する。
+ *   1. 要求時の文脈（表示集合 ID・世代）が現在の表示と一致すること。一致しない
+ *      応答は、集めた分ごと捨てる
+ *   2. 応答が契約どおりであること（`findRangeResponseViolation`）。違反した応答は
+ *      成功として扱わず、取得失敗と同じ経路へ倒す
+ *
+ * @param {ChunkFetchRequest} request
  */
-async function fetchChunk(chunkIndex) {
+async function fetchChunk(request) {
+  const { chunkIndex } = request;
   const { start: chunkStart, count: desiredCount } = computeChunkRange(
     chunkIndex,
     CHUNK_SIZE,
@@ -551,8 +783,6 @@ async function fetchChunk(chunkIndex) {
     return;
   }
 
-  const displaySetId = state.displaySetId;
-  const requestGeneration = state.generation;
   const wasCachedBefore = state.everCachedChunkIndices.has(chunkIndex);
 
   /** @type {LogItemDto[]} */
@@ -565,8 +795,8 @@ async function fetchChunk(chunkIndex) {
     let response;
     try {
       response = await invokeFetchLogRange({
-        displaySetId,
-        expectedGeneration: requestGeneration,
+        displaySetId: request.displaySetId,
+        expectedGeneration: request.generation,
         start: cursor,
         maxItems: targetEnd - cursor,
       });
@@ -574,18 +804,38 @@ async function fetchChunk(chunkIndex) {
       retentionStats.recordFetchEnd();
     }
 
-    // 取得の往復中に表示集合そのものが切り替わっていたら（別のファイルを
-    // 開いた等）、この応答はもう不要。捨てる。
-    if (state.displaySetId !== displaySetId) {
+    // 往復の最中に表示集合が切り替わった（別のファイルを開いた・タブを切り替え
+    // た）、または世代が進んだ（再読み込み・世代不一致からの復旧）場合、この応答
+    // はもう画面に無い内容を指している。集めた分ごと捨てる（Issue #34）。
+    // 現在の文脈での取得は、この取得が決着した後の再描画（`ensureChunksLoaded`
+    // の `finally`）が改めて発行するため、取りこぼしにはならない。
+    if (!isRequestContextCurrent(request)) {
       return;
     }
-    syncFromResponse(response);
+
+    const violation = findRangeResponseViolation(response, request, cursor);
+    if (violation !== null) {
+      throw new Error(`範囲取得の応答が契約に反しています（${violation}）。`);
+    }
+
+    syncTotalItemsFromResponse(response);
 
     if (response.items.length === 0) {
+      if (cursor < state.totalItems) {
+        // 「要求開始位置が総項目数未満なら少なくとも1件は返す」という契約に反する
+        // （直前の同期で総行数が縮んで cursor がその外へ出た場合は、0件が正しい）。
+        // このまま黙って戻ると、チャンクは未取得のまま失敗記録も残らないため、
+        // 取得完了時の再描画が同じ要求を延々と出し続けるホットループになる。
+        // 失敗として扱い、バックオフと失敗表示に乗せる（Issue #34）。
+        throw new Error(
+          `範囲取得の応答が契約に反しています（開始位置 ${cursor} は総行数 ${state.totalItems} 未満なのに0件です）。`,
+        );
+      }
       break;
     }
     collected.push(...response.items);
-    cursor = response.start + response.items.length;
+    // `response.start === cursor` は検証済み（`findRangeResponseViolation`）。
+    cursor += response.items.length;
 
     if (!response.truncated) {
       break;
@@ -599,6 +849,9 @@ async function fetchChunk(chunkIndex) {
   const byteCount = sumRawTextBytes(collected);
   state.chunkCache.set(chunkIndex, { start: chunkStart, items: collected, byteCount });
   state.everCachedChunkIndices.add(chunkIndex);
+  // 取得できたので、失敗表示とバックオフの根拠も畳む（次に失敗したときは
+  // 1回目からやり直す。Issue #34）。
+  state.failedChunkFetches.delete(chunkIndex);
   retentionStats.recordChunkCached(collected.length, byteCount);
   if (wasCachedBefore) {
     // このチャンク番号は以前にもキャッシュされていた（＝破棄後の再取得）。
@@ -613,43 +866,102 @@ async function fetchChunk(chunkIndex) {
 }
 
 /**
- * `fetch_log_range` の応答から、表示集合の総数・世代を最新へ同期する
- * （再構築があった場合に備える。契約に織り込む4点の4）。
+ * 範囲取得応答が契約どおりかを判定する（Issue #34）。契約の正本は
+ * `src-tauri/src/log_view.rs` の `fetch_log_range`（世代が一致する場合だけ成功を
+ * 返し、応答の `start` は要求した開始位置と一致する）。
  *
- * @param {{ generation: number, total_items: number }} response
+ * 検査するのは、違反したまま表示へ流すと**無言で誤った本文を見せてしまう**項目
+ * だけ。`start` がずれた応答をそのまま `chunkStart` として格納すると、行番号と
+ * 本文が1行ずれた表示になり、利用者にはそれと分からない。世代のずれも同様に、
+ * 別世代の本文を現在の世代の内容として並べてしまう。
+ *
+ * @param {{ generation: number, start: number, items: LogItemDto[] }} response
+ * @param {ChunkFetchRequest} request
+ * @param {number} expectedStart この往復で要求した開始位置。
+ * @returns {string | null} 違反の説明。契約どおりなら `null`。
  */
-function syncFromResponse(response) {
+function findRangeResponseViolation(response, request, expectedStart) {
+  if (!response || !Array.isArray(response.items)) {
+    return "items が配列ではありません";
+  }
+  if (Number(response.generation) !== request.generation) {
+    return `世代が要求と異なります（要求 ${request.generation}、応答 ${response.generation}）`;
+  }
+  if (Number(response.start) !== expectedStart) {
+    return `開始位置が要求と異なります（要求 ${expectedStart}、応答 ${response.start}）`;
+  }
+  return null;
+}
+
+/**
+ * `fetch_log_range` の応答から、表示集合の総行数を最新へ同期する（読み込み中の
+ * 伸長に追随するため。契約に織り込む4点の4）。
+ *
+ * **世代はここで代入しない**（Issue #34）。成功応答は要求した世代と同じ世代の
+ * 内容しか返さない（世代が一致しなければ `generation_mismatch` になる。
+ * `src-tauri/src/log_view.rs`）ため、応答から世代を代入しても現在値と同じか、
+ * 遅れて届いた古い応答による巻き戻しにしかならない。世代を進めるのは表示集合の
+ * 切り替え（`activateDisplaySet`）と世代不一致からの復旧
+ * （`handleGenerationMismatch`）だけに限る。
+ *
+ * 呼び出し側は、要求時の文脈が現在の表示と一致することを確認済みであること
+ * （`isRequestContextCurrent`）。同じ世代の中で総行数が変わるのは読み込みの進行
+ * による伸長であり、この同期は巻き戻しにならない。
+ *
+ * @param {{ total_items: number }} response
+ */
+function syncTotalItemsFromResponse(response) {
   const totalItems = Number(response.total_items);
   if (totalItems !== state.totalItems) {
     state.totalItems = totalItems;
     updateTotalItemsLabel();
   }
-  if (response.generation !== state.generation) {
-    state.generation = response.generation;
-  }
 }
 
 /**
  * チャンク取得の失敗を処理する。`generation_mismatch` は世代の再取得フロー
- * （契約に織り込む4点の4）、それ以外はエラーバナー表示にとどめる。
+ * （契約に織り込む4点の4）、それ以外は失敗として記録し（自動再取得と失敗表示。
+ * Issue #34）、ストリークの1件目だけエラーバナーを出す。
+ *
+ * 失敗も、要求を発行した時点の文脈に束ねて扱う（Issue #34）。往復の最中にタブを
+ * 切り替えた・再読み込みした場合、失敗したのは今表示している内容ではないため、
+ * 現在の表示のキャッシュ・世代・通知には一切触れない。触れると、今のタブが毎回
+ * 世代不一致になって余計な往復が続いたり、今のタブとは無関係なバナーが出たりする。
  *
  * @param {unknown} error
+ * @param {ChunkFetchRequest} request
  */
-function handleFetchChunkError(error) {
+function handleFetchChunkError(error, request) {
+  if (!isRequestContextCurrent(request)) {
+    // 発生元の表示集合・世代は既に画面上に無い。原因調査のためコンソールへは
+    // 残しつつ、現在の表示へは何も反映しない（バナーも出さない）。
+    console.warn(
+      "既に切り替わった表示集合・世代の範囲取得が失敗しました（現在の表示へは反映しません）:",
+      error,
+    );
+    return;
+  }
+
   if (error && typeof error === "object" && "kind" in error) {
     if (error.kind === "generation_mismatch") {
-      handleGenerationMismatch(error.current);
+      // 自己修復の経路。失敗として記録せず（バックオフを挟むと復旧が遅れる）、
+      // 世代を進めた直後の再描画が現在の世代で取得し直す。
+      handleGenerationMismatch(error.current, request);
       return;
     }
     if (error.kind === "unknown_display_set") {
-      showErrorBanner(
-        "表示中のログの内部状態が見つからないため、表示を更新できません。もう一度ファイルを開き直してください。",
-      );
+      if (recordChunkFetchFailure(request.chunkIndex)) {
+        showErrorBanner(
+          "表示中のログの内部状態が見つからないため、表示を更新できません。もう一度ファイルを開き直してください。",
+        );
+      }
       return;
     }
   }
   console.error("範囲取得に失敗しました:", error);
-  showErrorBanner("ログの範囲取得に失敗しました。もう一度お試しください。");
+  if (recordChunkFetchFailure(request.chunkIndex)) {
+    showErrorBanner("ログの範囲取得に失敗しました。もう一度お試しください。");
+  }
 }
 
 /**
@@ -657,16 +969,30 @@ function handleFetchChunkError(error) {
  * `LOG-028` の下地）。表示集合の再構築コマンドは無いため、`fetch_log_range`
  * の `generation_mismatch` 応答が返す `current` 値をまず反映し、キャッシュを
  * 全破棄したうえで、直後の再描画がトリガーする再取得の応答で総数
- * （`total_items`）を確定させる（`syncFromResponse`）。
+ * （`total_items`）を確定させる（`syncTotalItemsFromResponse`）。
+ *
+ * `context` は不一致を検出した要求を発行した時点の表示文脈。これが現在の表示と
+ * 一致する場合にだけ復旧を行う（Issue #34）。一致を確認せずに `current` を代入
+ * すると、別のタブ（表示集合）で起きた不一致の世代を今のタブへ書き込んでしまい、
+ * 以後そのタブは毎回世代不一致になって余分な往復を繰り返す。要求時の文脈が現在と
+ * ずれている場合には「既に他の取得が復旧済み」も含まれる（その場合も何もしない）。
  *
  * @param {number} currentGeneration
+ * @param {DisplayContext} context
  */
-function handleGenerationMismatch(currentGeneration) {
+function handleGenerationMismatch(currentGeneration, context) {
+  if (!isRequestContextCurrent(context)) {
+    return;
+  }
   if (state.generation === currentGeneration) {
-    // 既に他の取得が復旧済み。
+    // 要求時と現在の世代が同じなのに不一致が返る場合（契約違反）。破棄も再取得も
+    // 意味が無いため何もしない。
     return;
   }
   clearCache();
+  // 旧世代へ向けた取得の登録と、旧世代に対する失敗の記録は持ち越さない。
+  forgetInFlightChunkFetches();
+  clearFailedChunkFetches();
   state.generation = currentGeneration;
   scheduleRender();
 }
@@ -865,7 +1191,12 @@ function buildRowElement(rowIndex) {
   const text = document.createElement("span");
   text.className = "log-row__text";
   if (!item) {
-    text.textContent = "（読み込み中…）";
+    // Issue #34: 未取得の理由が「まだ届いていない」のか「取得に失敗して再試行を
+    // 待っている」のかを、利用者が文言で見分けられるようにする（失敗した行を
+    // 「（読み込み中…）」のまま放置しない）。
+    text.textContent = hasFailedChunkFetch(rowIndex)
+      ? "（取得に失敗しました。自動で再試行します）"
+      : "（読み込み中…）";
   } else if (item.continuation_count > 0) {
     // 折りたたみ方式（virtual_scroll.js 冒頭のコメント参照）: 行一覧には1行目
     // だけを表示する。全文（改行付き）は詳細パネルで確認できる。
@@ -1124,11 +1455,16 @@ async function handleCopyRequest() {
     return;
   }
 
+  // 範囲取得と同じく、要求を発行した時点の文脈を束ねる（Issue #34）。コピーの
+  // 往復中にタブを切り替えられても、失敗の処理を別のタブの状態へ適用しない。
+  /** @type {DisplayContext} */
+  const context = { displaySetId: state.displaySetId, generation: state.generation };
+
   state.copyInFlight = true;
   try {
     const response = await invokeCopySelection({
-      displaySetId: state.displaySetId,
-      generation: state.generation,
+      displaySetId: context.displaySetId,
+      generation: context.generation,
       start: range.start,
       count: range.count,
       columns: state.copyColumns,
@@ -1144,7 +1480,7 @@ async function handleCopyRequest() {
       showErrorBanner(formatCopyRejectionMessage(response.rejected));
     }
   } catch (error) {
-    handleCopySelectionError(error);
+    handleCopySelectionError(error, context);
   } finally {
     state.copyInFlight = false;
   }
@@ -1153,13 +1489,20 @@ async function handleCopyRequest() {
 /**
  * `copy_selection` の失敗（Rust 側の `Result::Err`）を処理する。
  *
+ * `context` は要求を発行した時点の表示文脈。`handleGenerationMismatch` へ渡し、
+ * 別の表示集合・別の世代の `current` を今のタブへ代入しないようにする
+ * （Issue #34）。通知そのものは文脈がずれていても出す。コピーは利用者の明示的な
+ * 操作（Ctrl+C）であり、結果を黙って捨てると「コピーできたのか」が分からなく
+ * なるため（範囲取得の失敗が背景処理であるのとは事情が異なる）。
+ *
  * @param {unknown} error
+ * @param {DisplayContext} context
  */
-function handleCopySelectionError(error) {
+function handleCopySelectionError(error, context) {
   if (error && typeof error === "object" && "kind" in error) {
     switch (error.kind) {
       case "generation_mismatch":
-        handleGenerationMismatch(error.current);
+        handleGenerationMismatch(error.current, context);
         showErrorBanner(
           "表示内容が更新されたため、コピーできませんでした。選択し直してもう一度お試しください。",
         );
