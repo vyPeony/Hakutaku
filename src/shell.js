@@ -31,6 +31,11 @@
 // `list_targets` を**読み込み中の対象がある間だけ 500ms 間隔でポーリング**
 // することで検出する。
 //
+// ポーリングと利用者操作は同じ再取得経路（`refreshTargets`）を共有する。要求が
+// 重なったときの取りこぼし防止と、`list_targets` が失敗し続ける場合の収束
+// （通知の抑制と自動更新の停止）は、`refreshTargets` と
+// `handleListTargetsFailure` の doc コメントを参照（Issue #35）。
+//
 // ## イベント（`hakutaku://load-progress`／`hakutaku://load-outcome`）ではなく
 // ## ポーリングを採用した理由
 //
@@ -88,6 +93,16 @@ import { showErrorBanner, showInfoBanner } from "./banner.js";
 /** 読み込み中の対象がある間のポーリング間隔（ミリ秒）。P07-2。 */
 const POLL_INTERVAL_MS = 500;
 
+/**
+ * `list_targets` の連続失敗をここまで許し、達したらポーリングを止める
+ * （Issue #35）。500ms 間隔のため、約2.5秒ぶんの再試行にあたる。
+ *
+ * 1回の失敗で止めないのは、一時的な失敗（要求が重なった瞬間の取りこぼし等）で
+ * 読み込み完了を検出できなくなるのを避けるためであり、無制限に続けないのは、
+ * 復帰の見込みが無いまま通知と読み上げだけが増え続けるのを避けるためである。
+ */
+const LIST_TARGETS_FAILURE_LIMIT = 5;
+
 /** モジュール内部状態。 */
 const state = {
   /** @type {string[]} `get_config_status` の `data_source_names`（CFG-003／PROD-006）。 */
@@ -130,6 +145,24 @@ const state = {
   datetimeFormats: [],
   /** @type {boolean} `refreshTargets` の多重実行防止（ポーリングと手動更新の重複対策）。 */
   refreshInFlight: false,
+  /**
+   * @type {boolean} 実行中の `refreshTargets` へ「終わったらもう一巡する」
+   * ことを予約する（Issue #35）。利用者操作由来の要求だけが立てる
+   * （`refreshTargets` の doc コメント）。
+   */
+  refreshQueued: false,
+  /**
+   * @type {Promise<void> | null} 実行中の `refreshTargets` の周回。予約した
+   * 呼び出し側が「自分の要求ぶんの再取得が終わるまで」待てるようにするため
+   * 保持する（`handleReloadTargetClick` のように、待った後で
+   * `state.sessionTargets` を読む経路がある）。
+   */
+  refreshLoop: null,
+  /**
+   * @type {number} `list_targets` の連続失敗回数（Issue #35）。取得の成功と、
+   * 利用者操作由来の再取得要求でリセットする。
+   */
+  listTargetsFailureStreak: 0,
   /**
    * @type {boolean} 時系列統合表示（P09-1、`LOG-007`〜`LOG-008`）
    * が現在 ON かどうか。ON の間はタブバーに統合タブ1つだけを表示し
@@ -311,6 +344,13 @@ async function handleReloadTargetClick(targetId) {
             source_label: tab.title,
           });
         }
+        // 再読み込み後に生表示へ退避したかどうかは `list_targets` からしか
+        // 分からない（`reload_target` の応答には含まれない）。したがってここは
+        // 上の `await refreshTargets()` が反映したスナップショットを読む必要が
+        // あり、再取得が取りこぼされると再読み込み前の状態を見て通知を落とす
+        // （Issue #35。`refreshTargets` は予約により、待ち終えた時点で今回の
+        // 再読み込みより後に取得した一覧を反映している。取得自体が失敗した
+        // 場合だけは前回の一覧のままで、その失敗は別途バナーで伝わる）。
         const session = state.sessionTargets.find(
           (candidate) => candidate.target_id === targetId,
         );
@@ -454,27 +494,135 @@ export function initShell({ retentionLimits, dataSourceNames }) {
 /**
  * 対象一覧を再取得し、左ペインを再描画する。読み込み中の対象が無くなれば
  * ポーリングを止め、あれば継続する（P07-2、`syncPolling`）。
+ *
+ * `list_targets` の要求は常に高々1本しか走らせない（`state.refreshInFlight`）。
+ * 重なった要求の扱いは出所で分ける（Issue #35）。
+ *
+ * - ポーリング（`polled: true`）: 捨てる。次のティックが来るため取りこぼしに
+ *   ならず、取得に 500ms 以上かかる環境で要求を積み上げずに済む
+ * - 利用者操作（既定）: `state.refreshQueued` へ予約し、実行中の周回が
+ *   終わった後に必ずもう一巡する。捨てると、開いたばかりの対象が一覧にも
+ *   タブにも現れないまま誰も監視しない状態になり得る（Issue #35 の競合）。
+ *   呼び出し側は `await` で「自分の要求ぶんの再取得が終わった状態」まで
+ *   待てる
+ *
+ * 利用者操作由来の要求は、連続失敗で止まった自動更新を再開する手段も兼ねる
+ * （`handleListTargetsFailure`）。そのため、ここで連続失敗の数え直しをする。
+ *
+ * @param {{ polled?: boolean }} [options] `polled` はポーリングのティック由来
+ *   （利用者操作ではない）であることを示す。
  */
-async function refreshTargets() {
-  if (state.refreshInFlight) {
-    // ポーリングと手動更新（開く・再試行・キャンセル操作直後）が重なった
-    // 場合の二重実行を防ぐ。
-    return;
+async function refreshTargets({ polled = false } = {}) {
+  if (!polled) {
+    state.listTargetsFailureStreak = 0;
   }
-  state.refreshInFlight = true;
-  try {
-    try {
-      state.sessionTargets = await invokeListTargets();
-    } catch (error) {
-      console.error("list_targets の呼び出しに失敗しました:", error);
-      showErrorBanner("参照対象一覧の取得に失敗しました。");
+
+  if (state.refreshInFlight) {
+    if (polled) {
       return;
     }
-    processCompletedAutoActivations();
-    renderTargetList();
-    syncPolling();
+    state.refreshQueued = true;
+    await state.refreshLoop;
+    return;
+  }
+
+  state.refreshInFlight = true;
+  state.refreshLoop = runRefreshLoop();
+  await state.refreshLoop;
+}
+
+/**
+ * `refreshTargets` の周回本体。予約（`state.refreshQueued`）が立っている限り
+ * 再取得を繰り返す（Issue #35）。
+ *
+ * 予約が立つのは利用者操作由来の要求だけなので、繰り返しの回数は利用者の
+ * 操作回数で頭打ちになり、失敗が続く場合も `LIST_TARGETS_FAILURE_LIMIT` が
+ * 上限として効く。
+ */
+async function runRefreshLoop() {
+  try {
+    do {
+      // 予約の消化は、この周回の `list_targets` を送る前に行う。応答を
+      // 受け取った後に消化すると、取得中に入った予約まで消してしまう。
+      state.refreshQueued = false;
+      await applyTargetsSnapshot();
+    } while (state.refreshQueued);
   } finally {
     state.refreshInFlight = false;
+    state.refreshQueued = false;
+    state.refreshLoop = null;
+  }
+}
+
+/**
+ * `list_targets` を1回呼び、応答を状態と画面へ反映する（`refreshTargets` の
+ * 1周ぶん）。
+ */
+async function applyTargetsSnapshot() {
+  /** @type {TargetSessionDto[]} */
+  let targets;
+  try {
+    targets = await invokeListTargets();
+  } catch (error) {
+    console.error("list_targets の呼び出しに失敗しました:", error);
+    handleListTargetsFailure();
+    return;
+  }
+  state.listTargetsFailureStreak = 0;
+
+  if (state.refreshQueued) {
+    // 取得中に利用者操作（対象を開く・再試行・閉じる等）が割り込んだ。この
+    // 応答はその操作より前のスナップショットであり、開いたばかりの対象を
+    // 含まないことがある。そのまま適用すると
+    // `processCompletedAutoActivations` が「一覧から消えた」と誤って追跡を
+    // やめ、`syncPolling` も「読み込み中は無い」と誤ってポーリングを止める
+    // （Issue #35）。適用せず、直後の周回で取り直す。
+    //
+    // 連番で新旧を判定していないのは、`list_targets` の要求が常に高々1本で
+    // （`refreshTargets`）応答同士が追い越さないためである。応答が古くなる
+    // 経路はこの割り込みだけなので、割り込みの有無（予約）で判定できる。
+    return;
+  }
+
+  state.sessionTargets = targets;
+  processCompletedAutoActivations();
+  renderTargetList();
+  syncPolling();
+}
+
+/**
+ * `list_targets` の失敗を数え、通知と自動更新の停止を判断する（Issue #35）。
+ *
+ * 失敗のたびに通知すると、500ms ごとの再取得が失敗し続ける間、集約バナー
+ * （Issue #11）の「（N回目）」が毎秒2ずつ増え、`role="alert"` の更新による
+ * 読み上げも止まらない。「一覧を取得できない」ことは1回伝われば十分なので、
+ * 失敗が途切れず続く間（ストリーク）の初回だけ通知する。
+ */
+function handleListTargetsFailure() {
+  state.listTargetsFailureStreak += 1;
+  if (state.listTargetsFailureStreak === 1) {
+    showErrorBanner("参照対象一覧の取得に失敗しました。");
+  }
+
+  if (state.listTargetsFailureStreak >= LIST_TARGETS_FAILURE_LIMIT) {
+    if (state.pollTimer !== null) {
+      // 復帰の見込みが薄いまま 500ms ごとの再取得を続けても、通知と読み上げが
+      // 増え続けるだけになる。自動更新は止め、止めたこと自体と再開手段を
+      // 1回だけ伝える（この文面のバナーは、止めた瞬間にしか出ない）。
+      stopPolling();
+      showErrorBanner(
+        "参照対象一覧の取得に繰り返し失敗したため、読み込み状況の自動更新を停止しました。" +
+          "「ファイルを開く」や一覧の「再試行」「再読み込み」などの操作を行うと再開します。",
+      );
+    }
+    return;
+  }
+
+  // 上限に達するまでは再取得の機会を残す。完了待ちの対象があるのにポーリングが
+  // 止まっていると（対象を開いた直後の1回目の再取得が失敗した場合など）、その
+  // 対象の読み込み完了を検出する担い手がいなくなるため、ここで確保する。
+  if (state.pendingAutoActivate.size > 0) {
+    ensurePolling();
   }
 }
 
@@ -556,7 +704,13 @@ function syncPolling() {
   const hasLoadingTarget = state.sessionTargets.some(
     (session) => session.status.kind === "loading",
   );
-  if (hasLoadingTarget) {
+  // 完了待ち（`pendingAutoActivate`）を判定へ含めるのは、その完了を検出する
+  // 担い手がこのポーリングしか無いためである（Issue #35）。直前の
+  // `processCompletedAutoActivations` が済んでいれば、残っている対象は一覧で
+  // まだ `loading` のものだけなので通常は `hasLoadingTarget` と一致するが、
+  // この関数だけで「誰にも監視されない対象を残さない」不変条件が成り立つ形に
+  // しておく。
+  if (hasLoadingTarget || state.pendingAutoActivate.size > 0) {
     ensurePolling();
   } else {
     stopPolling();
@@ -568,7 +722,7 @@ function ensurePolling() {
     return;
   }
   state.pollTimer = setInterval(() => {
-    refreshTargets();
+    refreshTargets({ polled: true });
   }, POLL_INTERVAL_MS);
 }
 
