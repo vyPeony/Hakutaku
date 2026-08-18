@@ -198,7 +198,11 @@ function invokeOpenLogFile(manualProfile, manualDatetimeFormat) {
  * @param {string} name
  * @param {string | null} [manualProfile] `LOG-022`、P07-2。
  * @param {string | null} [manualDatetimeFormat] `LOG-022`。
- * @returns {Promise<{ kind: "loading" | "failed", [key: string]: unknown }>}
+ * @returns {Promise<{
+ *   kind: "loading" | "already_open" | "failed",
+ *   [key: string]: unknown,
+ * }>} `already_open` は、同じ名前の対象が既に開かれている（読み込み中または
+ *   読み込み済み）ため新しい読み込みを開始しなかった場合（Issue #31）。
  */
 function invokeOpenConfigDataSource(name, manualProfile, manualDatetimeFormat) {
   return window.__TAURI_INTERNALS__.invoke("open_config_data_source", {
@@ -216,7 +220,11 @@ function invokeOpenConfigDataSource(name, manualProfile, manualDatetimeFormat) {
  * @param {string | null} [manualDatetimeFormat] `LOG-022`。同じ操作
  *   の「日時書式」選択。プロファイルの `datetime_format` 設定より優先される
  *   （`hakutaku_core::LoadControl::manual_datetime_format`）。
- * @returns {Promise<{ kind: "loading" | "failed" | "not_found", [key: string]: unknown }>}
+ * @returns {Promise<{
+ *   kind: "loading" | "failed" | "not_found" | "already_loading",
+ *   [key: string]: unknown,
+ * }>} `already_loading` は、対象が読み込み中で再試行を受け付けなかった場合
+ *   （Issue #31。`reload_target` が `Ready` 以外を拒否するのと対称）。
  */
 function invokeRetryTarget(targetId, manualProfile, manualDatetimeFormat) {
   return window.__TAURI_INTERNALS__.invoke("retry_target", {
@@ -847,6 +855,14 @@ async function handleOpenConfiguredRow(name) {
   state.pendingKeys.add(pendingKey);
   try {
     const response = await invokeOpenConfigDataSource(name);
+    if (response.kind === "already_open") {
+      // 同じ名前の対象が既に開かれていた（Issue #31。Rust 側は新しい読み込みを
+      // 始めない）。一覧を同期し、既にタブがあればそれへ切り替えるだけにする
+      // （読み込み中でタブがまだ無い場合は、ポーリングが完了を検出する）。
+      await refreshTargets();
+      activateExistingTab(/** @type {number} */ (response.target_id));
+      return;
+    }
     await applyLoadAttemptResponse(response);
   } catch (error) {
     console.error("open_config_data_source の呼び出しに失敗しました:", error);
@@ -878,9 +894,11 @@ async function handleRetryClick(targetId, manualProfile, manualDatetimeFormat) {
   state.pendingKeys.add(pendingKey);
   try {
     const response = await invokeRetryTarget(targetId, manualProfile, manualDatetimeFormat);
-    if (response.kind === "not_found") {
-      // 一覧から既に除去されていた（他操作との競合。ERR-001 の考え方に従い、
-      // 静かに一覧を再同期するだけに留める）。
+    if (response.kind === "not_found" || response.kind === "already_loading") {
+      // "not_found" は一覧から既に除去されていた場合、"already_loading" は
+      // 既に読み込み中で再試行を受け付けられない場合（Issue #31）。どちらも
+      // 他操作との競合であり、ERR-001 の考え方に従って静かに一覧を再同期する
+      // だけに留める（読み込み中の行にはキャンセルボタンが出ている）。
       await refreshTargets();
       return;
     }
@@ -950,6 +968,10 @@ async function handleCancelClick(targetId) {
  * `loading` / `failed` を共通の形（`target_id`・`error` 等）で返す
  * （P07-2 により非同期化。読み込みそのものが完了する前に応答するため、
  * 従来の `opened` は廃止した）。ここで一括して処理する。
+ *
+ * `loading` 以外はすべて `failed` として扱うため、**それ以外の `kind`
+ * （`not_found`・`already_open`・`already_loading`）は呼び出し側で先に
+ * 処理してからこの関数へ渡すこと**（Issue #31 で追加した2つを含む）。
  *
  * @param {{ kind: "loading" | "failed", [key: string]: unknown }} response
  */
