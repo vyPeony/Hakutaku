@@ -7,7 +7,7 @@
 //! # 再入禁止（ADR-0003 の判断の基準）
 //!
 //! `GlobalAlloc` の各メソッドの内部では、原子操作（`AtomicUsize` への
-//! `fetch_add` / `fetch_sub` / `compare_exchange_weak`）以外を一切行いません。
+//! `fetch_add` / `fetch_update` / `compare_exchange_weak`）以外を一切行いません。
 //! 確保、ロック取得、ログ出力、`panic!` はすべて禁止です。これらを行うと、
 //! アロケータの呼び出し中にアロケータ自身が再入され、無限再帰やデッドロックを
 //! 起こします。
@@ -100,12 +100,26 @@ fn record_alloc(size: usize) {
     update_peak(previous + size);
 }
 
-/// 解放を計上する。原子的な減算だけを行う。
+/// 解放を計上する。**下限 0 で飽和**する原子的な減算だけを行い、確保・ロック・
+/// ログ出力は一切行わない（再入禁止）。
+///
+/// `fetch_sub` は現在値より大きい解放が来ると巻き戻る（wrap）ため、`ALLOCATED_BYTES`
+/// が一度でも `usize::MAX` 近傍へ張り付くと、以後
+/// [`crate::MemoryBudget::reserve`] の判定式（`allocated + reserved + 要求量
+/// <= 予算`）が必ず偽になり、あらゆる予約が恒久的に拒否されて回復できません
+/// （Issue #40）。予約側の解放（`MemoryBudget::release_reserved`）が
+/// `saturating_sub` なのと非対称だったのを揃え、飽和させて回復可能にします。
+///
+/// `fetch_update` は内部で `compare_exchange_weak` のループになるだけで、確保も
+/// ロックも `panic!` も行わないため、アロケータ内で使えます。クロージャは常に
+/// `Some` を返すので `Err` にはなりません。
 fn record_dealloc(size: usize) {
     if size == 0 {
         return;
     }
-    ALLOCATED_BYTES.fetch_sub(size, Ordering::Relaxed);
+    let _ = ALLOCATED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(size))
+    });
 }
 
 /// `PEAK_BYTES` を `candidate` 以上に維持する。CAS ループのみで、ロック・確保を
@@ -160,5 +174,38 @@ mod tests {
         // より大きい値ではさらに更新される。
         update_peak(baseline + 200);
         assert_eq!(PEAK_BYTES.load(Ordering::Relaxed), baseline + 200);
+    }
+
+    // 受け入れ条件（Issue #40）: 現在値を超える解放が計上されても `usize` の
+    // 巻き戻り（wrap）を起こさず 0 で飽和し、その後も予約が通る（全予約が
+    // 恒久的に拒否される状態に陥らない）。
+    //
+    // このテストバイナリ（cargo test --lib）には CountingAllocator が
+    // グローバルアロケータとして設置されていないため、ALLOCATED_BYTES は
+    // このテストが直接呼ぶ record_dealloc でしか変化しない。さらに、他の
+    // テスト（グローバル計装値を 0 と仮定する budget.rs 側のしきい値テスト）へ
+    // 影響を残さないよう、値を**増やす操作は一切行わない**（飽和が効いていれば
+    // 0 のまま、効いていなければ巻き戻って検出できる）。通常の減算が正しく効く
+    // ことは、実アロケータを設置した tests/global_allocator_accounting.rs の
+    // `allocated_bytes_tracks_vec_allocation_and_deallocation` が確認する。
+    #[test]
+    fn record_dealloc_saturates_at_zero_and_keeps_reservations_working() {
+        let before = ALLOCATED_BYTES.load(Ordering::Relaxed);
+
+        // 現在値より確実に大きい解放を計上する（会計の不整合の再現）。
+        record_dealloc(before + 1_000_000);
+        assert_eq!(
+            allocated_bytes(),
+            0,
+            "過剰な解放は巻き戻らず 0 で飽和するはず"
+        );
+
+        // usize::MAX 近傍へ張り付いていれば、この予約は必ず拒否される
+        // （reserve の判定式が allocated を含むため）。
+        let budget = crate::budget::MemoryBudget::new(1000);
+        let token = budget
+            .reserve(1000)
+            .expect("会計値が 0 なら、予算ちょうどの予約は通るはず");
+        drop(token);
     }
 }

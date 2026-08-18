@@ -17,6 +17,22 @@
 //!   自動的に `allocated_bytes` へ計上します（二重計上の回避）。
 //! - 未消費の予約は [`ReservationToken`] の `Drop` で自動的に解放されます。
 //!
+//! # 予約と実確保が二重に数えられる時間窓（既知の性質）
+//!
+//! [`MemoryBudget::reserve`] が成功した時点で要求量が
+//! `outstanding_reserved_bytes` に載り、その予約の下で実際に確保を行うと、同じ
+//! メモリが `allocated_bytes`（アロケータの計装）にも載ります。
+//! [`ReservationToken::mark_allocated`] を呼ぶまでの間、**この2つは同じメモリを
+//! 二重に数えます**。判定式は両者の和を使うため、この時間窓の中では使用量を
+//! 最大で確保済みの量だけ過大に見積もり、予約が本来より早く拒否されたり、
+//! ソフトしきい値へ本来より早く到達したりし得ます。
+//!
+//! これは安全側（過大評価）へ倒す設計であり、予算超過を見逃す方向には働きま
+//! せん。時間窓を短く保つのは予約トークンを所有する呼び出し側の責務で、実確保の
+//! **直後**に [`ReservationToken::mark_allocated`] を呼んでください（ADR-0003
+//! 「帰属（振り替え）」）。確保に失敗した場合は呼ばずにトークンを破棄すると、
+//! 予約全量が戻ります。
+//!
 //! # ソフトしきい値との関係（P02-3）
 //!
 //! [`MemoryBudget`] はソフトしきい値の状態（[`crate::threshold::ThresholdState`]）
@@ -215,6 +231,13 @@ impl MemoryBudget {
 
     /// 予算を上書きします。呼び出し契約は [`set_global_budget_bytes`] の
     /// doc コメントを参照してください。
+    ///
+    /// **この関数はソフトしきい値を再評価しません。** 新しい予算が判定へ反映
+    /// されるのは次回の判定（[`Self::reserve`]・
+    /// [`ReservationToken::mark_allocated`]・[`Self::check_soft_threshold`]）
+    /// からで、それまで [`Self::prefetch_paused`] は変更前の予算に基づく古い
+    /// 判定結果のままです。予算を下げた直後など、その場で反映したい場合は
+    /// [`Self::check_soft_threshold`] を明示的に呼んでください。
     pub fn set_budget_bytes(&self, budget_bytes: usize) {
         self.budget_bytes.store(budget_bytes, Ordering::Relaxed);
     }
@@ -230,6 +253,11 @@ impl MemoryBudget {
     ///
     /// 有効範囲は 1〜100 です。範囲外（`0` または `101` 以上）は
     /// [`InvalidSoftThresholdPercent`] で拒否し、値は変更しません。
+    ///
+    /// [`Self::set_budget_bytes`] と同じく、**この関数はソフトしきい値を再評価
+    /// しません。** 新しい割合が反映されるのは次回の判定からで、それまで
+    /// [`Self::prefetch_paused`] は変更前の割合に基づく古い判定結果のままです。
+    /// その場で反映したい場合は [`Self::check_soft_threshold`] を呼んでください。
     pub fn set_soft_threshold_percent(
         &self,
         percent: u8,
@@ -238,9 +266,13 @@ impl MemoryBudget {
     }
 
     /// 先読み停止フラグです。消費側（P06・P08）はこれを読んで、しきい値超過中は
-    /// 新規の先読みを止めてください。しきい値を下回ると自動的に解除されます
-    /// （[`Self::check_soft_threshold`] などによる再評価が必要です。`Drop` は
-    /// 自動では再評価しません）。
+    /// 新規の先読みを止めてください。
+    ///
+    /// 値は**直近に完了したしきい値判定の結果**そのものです（Issue #40）。
+    /// しきい値を下回れば解除されますが、それには判定の実行が必要です
+    /// （[`Self::reserve`]・[`ReservationToken::mark_allocated`]・
+    /// [`Self::check_soft_threshold`] のいずれか）。トークンの `Drop` や
+    /// 予算・割合の変更は、それ自体では再評価しません。
     #[must_use]
     pub fn prefetch_paused(&self) -> bool {
         self.threshold.prefetch_paused()
@@ -252,10 +284,20 @@ impl MemoryBudget {
     /// 担当です。** ここは呼び出す枠組みだけを提供します。複数回呼ぶと、登録
     /// された全ての処理が到達のたびに（エッジ検出で1回だけ）呼ばれます。
     ///
-    /// # 注意
+    /// # 解放処理から会計 API を呼ぶ場合
     ///
-    /// 解放処理の内部からこの関数を再び呼ばないでください。内部ロックへ
-    /// 再入し、デッドロックします。
+    /// 解放処理は、登録簿のロックを手放した状態で呼ばれます（Issue #40）。
+    /// そのため、解放処理の内部からこの関数や [`Self::check_soft_threshold`]、
+    /// [`Self::reserve`] を呼び直しても、この型の内部ロックで自ロックすることは
+    /// ありません。ただし解放処理の実行中に追加した処理は、その回の発火では
+    /// 呼ばれず、次回の到達から呼ばれます。
+    ///
+    /// **呼び出し側自身のロックについては、依然として注意が必要です。** 解放
+    /// 処理は [`Self::reserve`] / [`ReservationToken::mark_allocated`] の内部から
+    /// 呼ばれるため、呼び出し側がロックを保持したままメモリ予約を行う経路が
+    /// あるなら、解放処理からそのロックを取ると再入してデッドロックします
+    /// （`src-tauri` はフラグを立てるだけにして、実際の解放を後から安全な地点で
+    /// 行う遅延方式でこれを避けています）。
     pub fn register_release_handler(&self, handler: Box<dyn Fn() + Send + Sync>) {
         self.threshold.register_release_handler(handler);
     }
@@ -928,6 +970,62 @@ mod tests {
         assert!(budget.prefetch_paused());
 
         drop(second_token);
+    }
+
+    // 受け入れ条件（Issue #40）: しきい値到達で呼ばれた解放処理の内部から
+    // 公開 API（解放処理の追加登録、明示的なしきい値確認、予約）へ再入しても
+    // デッドロックしない。
+    //
+    // 解放処理を登録簿のロック保持中に呼ぶ実装では、ハンドラ内の
+    // register_release_handler が同じ Mutex を取り直してハングするため、
+    // 時間制限つきの待機が発火してこのテストは失敗する。
+    #[test]
+    fn release_handler_reentering_public_api_does_not_deadlock() {
+        let budget = Arc::new(MemoryBudget::new(1000));
+        budget
+            .set_soft_threshold_percent(50)
+            .expect("50は有効な割合のはず");
+
+        // 解放処理は `'static` である必要があるため、`Arc` の循環参照（予算
+        // 自身が解放されなくなる）を避けて `Weak` を捕捉する。
+        let weak = Arc::downgrade(&budget);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_handler = Arc::clone(&call_count);
+        budget.register_release_handler(Box::new(move || {
+            let Some(budget) = weak.upgrade() else {
+                return;
+            };
+            // 実配線（src-tauri）はフラグを立てるだけだが、ここでは会計 API へ
+            // 再入する最悪の形を意図的に作る。いずれも既に armed が倒れている
+            // ため、ここから解放処理が再発火して無限再帰することはない。
+            budget.register_release_handler(Box::new(|| {}));
+            let _ = budget.check_soft_threshold();
+            drop(budget.reserve(1));
+            call_count_handler.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        // デッドロックした場合にテストが永久にハングしないよう、別スレッドで
+        // 実行して時間制限つきで完了を待つ。
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_budget = Arc::clone(&budget);
+        let worker = thread::spawn(move || {
+            // 予算1000、しきい値50% = 500バイト。600バイトの予約で跨ぐ。
+            let token = worker_budget
+                .reserve_with_allocated_snapshot(600, 0)
+                .expect("予算内なので予約は成功するはず");
+            drop(token);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("解放処理からの再入でデッドロックしている（10秒以内に完了しない）");
+        worker.join().expect("パニックしないはず");
+
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            1,
+            "到達エッジで解放処理が1回だけ呼ばれ、再入も完了しているはず"
+        );
     }
 
     // 受け入れ条件: 予約の拒否イベントが通知先へ届く（テスト用の通知先を
