@@ -195,8 +195,21 @@ jobs:
         shell: pwsh
 
   # 常に実行し、常に結果を返す集約ジョブ。`main` のブランチ保護は、個別のジョブでは
-  # なくこのジョブを必須ステータスチェックに指定している。省略（skipped）は失敗として
-  # 扱わない。
+  # なくこのジョブを必須ステータスチェックに指定している。
+  #
+  # 判定は、通してよい組み合わせだけを列挙するホワイトリスト方式にする（Issue #59）。
+  # 「失敗を表す値が現れたら落とす」拒否リスト方式は、想定した失敗値が needs へ必ず
+  # 現れることを前提にしている。実際には、GitHub 側の障害でアクションを取得できず
+  # 「Set up job」段階で終わった lint-test と build が、この集約ジョブの
+  # `needs.*.result` では `failure` として観測されず、拒否リストを素通りして必須
+  # チェックが成功した（run 32043926092）。列挙にない値は、空文字や未知の値も含めて
+  # すべて失敗へ倒す。
+  #
+  # 省略（skipped）は無条件には許可しない。無条件に許可すると、上の事象のように
+  # 実行されるはずのジョブが省略に見えた場合まで通してしまう。lint-test と build には
+  # 各ジョブの `if:` と同じ条件（`changes.outputs.run`）を課し、実行されるはずのときは
+  # `success` だけを、`changes` が意図して省略したはずのときは `skipped` だけを許可
+  # する。省略が正当なのは後者だけであり、両者は `changes` の出力で区別できる。
   #
   # 必須チェックはジョブの表示名と文字列一致で照合される。下の `name:` を変えると、
   # 保護設定を更新するまで必須チェックが報告されず、すべての PR がマージできなくなる。
@@ -209,11 +222,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - env:
-          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          # 判定の材料を個別にログへ残す。上の事象では最終的な真偽値しか記録が無く、
+          # どのジョブのどの値が素通りの原因だったかを事後に特定できなかった。
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_RUN: ${{ needs.changes.outputs.run }}
+          LINT_TEST_RESULT: ${{ needs.lint-test.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          PASSED: >-
+            ${{ needs.changes.result == 'success'
+            && needs.quality.result == 'success'
+            && ((needs.changes.outputs.run == 'true'
+            && needs.lint-test.result == 'success' && needs.build.result == 'success')
+            || (needs.changes.outputs.run != 'true'
+            && needs.lint-test.result == 'skipped' && needs.build.result == 'skipped')) }}
         run: |
           set -euo pipefail
-          if [ "$FAILED" = "true" ]; then
-            echo "先行ジョブが失敗または中止されました。"
+          echo "changes.result=${CHANGES_RESULT}"
+          echo "changes.outputs.run=${CHANGES_RUN}"
+          echo "lint-test.result=${LINT_TEST_RESULT}"
+          echo "build.result=${BUILD_RESULT}"
+          echo "quality.result=${QUALITY_RESULT}"
+          echo "判定=${PASSED}"
+          if [ "$PASSED" != "true" ]; then
+            echo "許可した組み合わせに一致しないため、CI を失敗として扱います。"
             exit 1
           fi
           echo "CI は成功、または実行対象がありませんでした。"
