@@ -11,9 +11,12 @@
 //! # 手順の対応
 //!
 //! 1. 所要時間の計測を開始する（計画書「影響」節の「所要時間を記録します」）。
-//! 2. [`layout::Layout::discover`] で実行時フォルダの位置を解決する。失敗すると
-//!    診断ログの保存先も通知先パスも決められないため、[`notify::show`] で理由を
-//!    表示して [`Aborted`] を返す。
+//! 2. [`layout::Layout::discover`] で実行時フォルダの位置を解決し、
+//!    [`layout::Layout::ensure_runtime_folders_are_real_directories`] で 4 つの実行時
+//!    フォルダがリンクへ差し替えられていないことを確認する（`SEC-009`、Issue #42）。
+//!    位置を解決できないと診断ログの保存先も通知先パスも決められず、フォルダが
+//!    リンクだと書き込みが導入フォルダの外へ抜けるため、どちらも [`notify::show`] で
+//!    理由を表示して [`Aborted`] を返す。
 //! 3. [`process::current_elevation`] で起動プロセスの昇格状態を取得する（`DIAG-007`）。
 //! 4. [`config::ConfigState::load`] で `hakutaku.yaml` を読み込み、`CFG-007` の
 //!    メモリ予算（`hakutaku_memory_accounting::set_global_budget_bytes`）を
@@ -58,6 +61,9 @@ use hakutaku_diagnostics::{diag_error, diag_info, diag_warn, Diagnostics, Diagno
 
 /// 実行ファイルの位置を解決できなかった場合の終了コード（手順2）。
 pub const EXIT_CODE_LAYOUT_UNAVAILABLE: i32 = 2;
+/// 実行時フォルダ自体がリンク（シンボリックリンク・ジャンクション）へ差し替えられて
+/// いた場合の終了コード（手順2、`SEC-009`）。
+pub const EXIT_CODE_RUNTIME_FOLDER_IS_LINK: i32 = 5;
 /// Evergreen・Fixed Version のどちらの WebView2 Runtime も使用できなかった場合の
 /// 終了コード（手順7）。
 pub const EXIT_CODE_RUNTIME_UNAVAILABLE: i32 = 3;
@@ -92,6 +98,9 @@ pub struct Bootstrap {
 ///   （Evergreen・Fixed Version のいずれも解決できなかった）。
 /// - `4`（[`EXIT_CODE_WEBVIEW2_DATA_UNAVAILABLE`]）: WebView2 のユーザーデータフォルダ
 ///   を作成・書き込みできない。
+/// - `5`（[`EXIT_CODE_RUNTIME_FOLDER_IS_LINK`]）: 実行時フォルダ（`logs`／`temp`／
+///   `WebView2`／`WebView2Runtime`）のいずれかが、フォルダ自体を別の場所へのリンクへ
+///   差し替えられている（`SEC-009`）。
 ///
 /// これら以外に、Tauri 自体の起動失敗用の終了コード `1` を `src-tauri/src/lib.rs`
 /// 側で定義している（`bootstrap` モジュールの範囲外のため、ここには含めない）。
@@ -131,6 +140,19 @@ pub fn run() -> Result<Bootstrap, Aborted> {
             });
         }
     };
+
+    // 手順2の続き: 4つの実行時フォルダ自体がリンクへ差し替えられていないことを確認する
+    // （SEC-009、Issue #42）。ここで確認するのは、この後の手順が logs（手順5）・
+    // temp（手順6）・WebView2Runtime（手順8）・WebView2（手順9）へ順に書き込み始める
+    // ためであり、1つでもリンクだと書き込みが導入フォルダの外へ抜けて「導入フォルダ
+    // ごと処分すればよい」という保証が崩れる。診断ログの保存先（logs）自体も対象で
+    // あるため、診断ログを開く前に済ませ、記録は残さず通知だけで中止する。
+    if let Err(rejection) = layout.ensure_runtime_folders_are_real_directories() {
+        notify::show(&notify::runtime_folder_is_reparse_point(&rejection));
+        return Err(Aborted {
+            exit_code: EXIT_CODE_RUNTIME_FOLDER_IS_LINK,
+        });
+    }
 
     // 手順3: 起動プロセスの昇格状態を取得する（DIAG-007）。
     let elevation = process::current_elevation();
@@ -384,15 +406,18 @@ mod tests {
 
     #[test]
     fn exit_codes_are_pairwise_distinct() {
-        assert_ne!(EXIT_CODE_LAYOUT_UNAVAILABLE, EXIT_CODE_RUNTIME_UNAVAILABLE);
-        assert_ne!(
-            EXIT_CODE_RUNTIME_UNAVAILABLE,
-            EXIT_CODE_WEBVIEW2_DATA_UNAVAILABLE
-        );
-        assert_ne!(
+        let codes = [
             EXIT_CODE_LAYOUT_UNAVAILABLE,
-            EXIT_CODE_WEBVIEW2_DATA_UNAVAILABLE
-        );
+            EXIT_CODE_RUNTIME_FOLDER_IS_LINK,
+            EXIT_CODE_RUNTIME_UNAVAILABLE,
+            EXIT_CODE_WEBVIEW2_DATA_UNAVAILABLE,
+        ];
+
+        for (index, code) in codes.iter().enumerate() {
+            for other in codes.iter().skip(index + 1) {
+                assert_ne!(code, other, "終了コードが重複しています: {codes:?}");
+            }
+        }
     }
 
     #[test]
