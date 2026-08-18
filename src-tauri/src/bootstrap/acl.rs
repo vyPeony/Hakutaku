@@ -20,6 +20,11 @@
 //! - `INHERIT_ONLY_ACE` が立っている ACE は、子オブジェクトへの継承だけを目的とし
 //!   フォルダ自身には権限を与えないため、判定対象から除外する
 //!   （[`ace_applies_to_object_itself`]）。
+//! - 判定は許可 ACE だけでなく**拒否 ACE も** DACL の並び順どおりに読む
+//!   （[`evaluate_dacl`]）。Windows は DACL を先頭から順に評価し、拒否を許可より
+//!   優先するため、対象 SID への拒否 ACE が必要なアクセス権と重なっている場合は、
+//!   許可 ACE を追加しても有効にならない。この場合は付与を行わず
+//!   [`AclOutcome::BlockedByDenyAce`] を返す（`Issue #45`）。
 //! - 不足していれば ACE を追加する（[`AclOutcome::Applied`]）。
 //! - 現在の権限で変更できない場合は [`AclOutcome::Denied`] を返し、呼び出し側が
 //!   `bootstrap::notify::acl_not_applicable` で通知する。
@@ -39,14 +44,14 @@ use windows::Win32::Security::Authorization::{
     TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    EqualSid, GetAce, MapGenericMask, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE,
-    DACL_SECURITY_INFORMATION, GENERIC_MAPPING, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE,
-    PSECURITY_DESCRIPTOR, PSID,
+    EqualSid, GetAce, MapGenericMask, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, INHERIT_ONLY_ACE,
+    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
-use windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+use windows::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
 /// App Container（ALL APPLICATION PACKAGES）を表す文字列 SID。
 const APP_CONTAINER_SID: &str = "S-1-15-2-1";
@@ -56,6 +61,12 @@ const APP_CONTAINER_SID: &str = "S-1-15-2-1";
 pub enum AclOutcome {
     /// 既に App Container からアクセスできる。変更していない。
     AlreadyAccessible,
+    /// 対象 SID への拒否 ACE が、必要なアクセス権と重なっている。Windows の
+    /// 評価順（拒否が許可より優先）では許可 ACE を追加しても有効にならないため、
+    /// 付与を行わなかった。呼び出し側は「付与した」と記録せず、拒否 ACE により
+    /// 有効にならない旨と、管理者による ACL の確認が必要である旨を診断ログへ
+    /// 記録する（`Issue #45`）。
+    BlockedByDenyAce { reason: String },
     /// 不足していたので付与した（`DIST-010`）。
     Applied,
     /// 付与が必要だが現在の権限ではできない。通知が必要。
@@ -100,10 +111,14 @@ pub fn ensure_app_container_access(runtime_dir: &Path) -> AclOutcome {
         Some(ptr) => ptr,
     };
 
-    match dacl_already_grants_access(dacl_ptr, target_sid) {
-        Ok(true) => return AclOutcome::AlreadyAccessible,
-        Ok(false) => {}
-        Err(reason) => return AclOutcome::Undetermined { reason },
+    match evaluate_dacl(dacl_ptr, target_sid) {
+        DaclEvaluation::AlreadyAccessible => return AclOutcome::AlreadyAccessible,
+        DaclEvaluation::BlockedByDenyAce => {
+            return AclOutcome::BlockedByDenyAce {
+                reason: deny_ace_blocked_reason(),
+            }
+        }
+        DaclEvaluation::NeedsGrant => {}
     }
 
     match grant_access(&path_wide, dacl_ptr, target_sid) {
@@ -189,9 +204,45 @@ fn read_dacl(path_wide: &[u16]) -> Result<(LocalAllocGuard, Option<*const ACL>),
     }
 }
 
-/// 対象の DACL に、App Container 用 SID への「読み取り + 実行、継承あり」の
-/// アクセス許可が既に含まれているかを確認する。
-fn dacl_already_grants_access(dacl: *const ACL, target: PSID) -> Result<bool, String> {
+/// [`evaluate_dacl`] が返す、DACL 走査の結果。
+///
+/// ACE を DACL の並び順どおりに読み、対象 SID について「必要なアクセス権を
+/// 満たす許可 ACE」と「必要なアクセス権と重なる拒否 ACE」のどちらが先に
+/// 見つかるかで確定する。Windows は DACL を先頭から順に評価し、拒否が許可より
+/// 優先されるため、この順序どおりに読むことが判定の正しさに必要（`Issue #45`）。
+enum DaclEvaluation {
+    /// 必要なアクセス権を満たす許可 ACE が、重なる拒否 ACE より先に見つかった。
+    /// 既にアクセスできるため、呼び出し元は変更しない。
+    AlreadyAccessible,
+    /// 必要なアクセス権と重なる拒否 ACE が、それを満たす許可 ACE より先に
+    /// 見つかった。許可 ACE を追加してもこの拒否 ACE が先に評価されるため
+    /// 有効にならない。呼び出し元は付与を行ってはならない。
+    BlockedByDenyAce,
+    /// 満たす許可 ACE も、重なる拒否 ACE も見つからなかった。呼び出し元は
+    /// 許可 ACE を追加する必要がある（[`grant_access`]）。
+    NeedsGrant,
+}
+
+/// 対象の DACL を先頭（インデックス0）から走査し、App Container 用 SID に
+/// ついて「読み取り + 実行、継承あり」のアクセスが既に有効か、拒否 ACE に
+/// よって有効化できないか、あるいはどちらでもないか（許可 ACE の追加が必要）
+/// を判定する。
+///
+/// `ACCESS_ALLOWED_ACE_TYPE`・`ACCESS_DENIED_ACE_TYPE` 以外（監査 ACE など）と、
+/// `INHERIT_ONLY_ACE`（子オブジェクトへの継承だけが目的で、フォルダ自身には
+/// 適用されない ACE）は許可・拒否のどちらでも対象にしない。対象 SID と一致
+/// しない ACE も読み飛ばす。
+///
+/// 許可 ACE は、単独でマスク（[`access_mask_grants_required`]）と継承フラグ
+/// （[`ace_flags_have_required_inheritance`]）の両方を満たす場合だけ
+/// [`DaclEvaluation::AlreadyAccessible`] とする（複数 ACE にまたがる合算は
+/// 行わない。[`grant_access`] が付与する ACE 自体が単独でこの条件を満たす形で
+/// 構成されているため、往復判定と整合する）。拒否 ACE は、写像後のマスクが
+/// 必要なアクセス権のビットと少しでも重なれば
+/// [`DaclEvaluation::BlockedByDenyAce`] とする（[`deny_mask_overlaps_required`]。
+/// 拒否 ACE の継承フラグは問わない。フォルダ自身への適用可否だけが問題であり、
+/// 子への継承可否は無関係）。
+fn evaluate_dacl(dacl: *const ACL, target: PSID) -> DaclEvaluation {
     // SAFETY: dacl は read_dacl が GetNamedSecurityInfoW から取得した有効な
     // ポインタであり、呼び出し元（ensure_app_container_access）がガードを
     // 生存させている間だけ使われる。
@@ -211,42 +262,73 @@ fn dacl_already_grants_access(dacl: *const ACL, target: PSID) -> Result<bool, St
         // SAFETY: GetAce が返したポインタは、共通ヘッダー（ACE_HEADER）として
         // 読み取れることが Win32 の仕様で保証されている。
         let header = unsafe { *(ace_ptr as *const ACE_HEADER) };
-        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
-            // 拒否 ACE や監査 ACE など、許可 ACE 以外は対象にしない。
+        let ace_type = u32::from(header.AceType);
+        let is_allow = ace_type == ACCESS_ALLOWED_ACE_TYPE;
+        let is_deny = ace_type == ACCESS_DENIED_ACE_TYPE;
+        if !is_allow && !is_deny {
+            // 監査 ACE など、許可・拒否以外は対象にしない。
             continue;
         }
 
         if !ace_applies_to_object_itself(header.AceFlags) {
             // INHERIT_ONLY_ACE は子オブジェクトへの継承だけが目的であり、
-            // フォルダ自身には権限を与えない。
+            // フォルダ自身には適用されない（許可・拒否のどちらでも同じ）。
             continue;
         }
 
-        // SAFETY: AceType が ACCESS_ALLOWED_ACE_TYPE であることを確認したため、
-        // このポインタは ACCESS_ALLOWED_ACE として読み取れる。
-        let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
-
-        if !access_mask_grants_required(ace.Mask) {
-            continue;
-        }
-        if !ace_flags_have_required_inheritance(header.AceFlags) {
-            continue;
-        }
-
-        // 注: SidStart は ACCESS_ALLOWED_ACE 構造体に続く可変長 SID 領域の先頭を
-        // 指すフィールドであり、そのアドレスは有効な PSID として扱える
-        // （Win32 の標準的な取り扱い）。ポインタの構築自体はアドレス取得と
-        // 型変換だけであり、参照外し（デリファレンス）を伴わないため unsafe は不要。
-        let ace_sid = PSID(&ace.SidStart as *const u32 as *mut c_void);
+        // 注: ACCESS_ALLOWED_ACE と ACCESS_DENIED_ACE は Header・Mask・SidStart
+        // の並びが同一の形状（Win32 の仕様）であり、SidStart から SID を読み取る
+        // 手順は両者で共通化できる。SidStart は可変長 SID 領域の先頭を指す
+        // フィールドであり、そのアドレスは有効な PSID として扱える。ポインタの
+        // 構築自体はアドレス取得と型変換だけであり、参照外し（デリファレンス）
+        // を伴わないため unsafe は不要。
+        let (mask, ace_sid) = if is_allow {
+            // SAFETY: AceType が ACCESS_ALLOWED_ACE_TYPE であることを確認した
+            // ため、このポインタは ACCESS_ALLOWED_ACE として読み取れる。
+            let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
+            (ace.Mask, PSID(&ace.SidStart as *const u32 as *mut c_void))
+        } else {
+            // SAFETY: AceType が ACCESS_DENIED_ACE_TYPE であることを確認した
+            // ため、このポインタは ACCESS_DENIED_ACE として読み取れる。
+            let ace = unsafe { &*(ace_ptr as *const ACCESS_DENIED_ACE) };
+            (ace.Mask, PSID(&ace.SidStart as *const u32 as *mut c_void))
+        };
 
         // SAFETY: ace_sid は上で得た有効な SID、target は呼び出し元が保持する
         // 有効な SID である。
-        if unsafe { EqualSid(ace_sid, target) }.is_ok() {
-            return Ok(true);
+        if unsafe { EqualSid(ace_sid, target) }.is_err() {
+            continue;
+        }
+
+        if is_allow {
+            if access_mask_grants_required(mask)
+                && ace_flags_have_required_inheritance(header.AceFlags)
+            {
+                return DaclEvaluation::AlreadyAccessible;
+            }
+            // この許可 ACE 単独では不足。以降の ACE（他の許可 ACE や拒否 ACE）
+            // の確認を続ける。
+        } else if deny_mask_overlaps_required(mask) {
+            // Windows は DACL を先頭から評価し、拒否が許可より優先される。この
+            // 拒否 ACE がここまでのどの許可 ACE よりも先に必要なアクセス権と
+            // 重なったため、以降に満たす許可 ACE があっても有効にならない。
+            // 安全側に倒し、以降の ACE は確認せずここで確定する。
+            return DaclEvaluation::BlockedByDenyAce;
         }
     }
 
-    Ok(false)
+    DaclEvaluation::NeedsGrant
+}
+
+/// [`AclOutcome::BlockedByDenyAce`] の `reason` に使う、拒否 ACE により付与しても
+/// 有効にならないことの説明。呼び出し元（`bootstrap::runtime`）が対象パスを
+/// 前置して診断ログへ記録する。
+fn deny_ace_blocked_reason() -> String {
+    format!(
+        "App Container 用 SID（{APP_CONTAINER_SID}）に対する拒否 ACE が、必要な読み取り + \
+         実行のアクセス権と重なっているため、許可 ACE を追加しても有効になりません。\
+         管理者による ACL の確認が必要です。"
+    )
 }
 
 /// `SE_FILE_OBJECT`（ファイル・フォルダ）用の `GENERIC_MAPPING`。
@@ -300,6 +382,20 @@ fn access_mask_grants_required(mask: u32) -> bool {
     let required = required_access_mask();
     let mapped_mask = map_to_file_specific_mask(mask);
     mapped_mask & required == required
+}
+
+/// 拒否 ACE のアクセスマスクが、必要な読み取り + 実行のアクセス権と
+/// 少しでも重なっているかを判定する（`Issue #45`）。
+///
+/// [`access_mask_grants_required`]（許可 ACE 用。必要なビットを**すべて**
+/// 満たすかを判定する）とは条件が異なる。拒否 ACE は、必要なアクセス権の
+/// 一部とだけ重なっていても、その重なった部分は許可 ACE を追加しても有効に
+/// ならない（Windows の評価順で拒否が許可より優先されるため）。そのため
+/// 「一部でも重なる」（AND が非ゼロ）を判定条件とする。
+fn deny_mask_overlaps_required(mask: u32) -> bool {
+    let required = required_access_mask();
+    let mapped_mask = map_to_file_specific_mask(mask);
+    mapped_mask & required != 0
 }
 
 /// ACE の継承フラグに、フォルダ・オブジェクトの両方への継承
@@ -435,6 +531,8 @@ fn to_wide_null(text: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::Win32::Security::Authorization::DENY_ACCESS;
+    use windows::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 
     // 以下はマスクの写像・継承フラグ・INHERIT_ONLY_ACE の除外という
     // 純粋なロジックだけを検証する（ファイル・レジストリ等へは一切触れない）。
@@ -561,6 +659,165 @@ mod tests {
         assert!(
             matches!(second, AclOutcome::AlreadyAccessible),
             "付与直後の再判定は AlreadyAccessible を返すはずです: {second:?}"
+        );
+    }
+
+    // 以下は Issue #45(a) の検証: DACL に拒否 ACE が含まれる場合の判定・診断文言。
+    // `grant_access`（本体コード）と同じ SetEntriesInAclW / SetNamedSecurityInfoW の
+    // 手順を、grfAccessMode だけ DENY_ACCESS に変えてテスト用フォルダへ拒否 ACE を
+    // 設定する（管理者権限は不要。対象は自プロセスが所有するテスト用フォルダ）。
+
+    /// テスト専用: 対象フォルダの DACL へ、App Container 用 SID への拒否 ACE
+    /// （継承あり、指定したアクセスマスク）を追加する。
+    fn add_deny_ace_for_app_container(path: &std::path::Path, mask: u32) {
+        let path_wide = to_wide_null(&path.to_string_lossy());
+        let target_sid_guard =
+            convert_app_container_sid().expect("テスト用の App Container SID を作成できません");
+        let target_sid = PSID(target_sid_guard.0);
+
+        let (_descriptor_guard, dacl_ptr) =
+            read_dacl(&path_wide).expect("テスト用フォルダの DACL を取得できません");
+        let existing_dacl =
+            dacl_ptr.expect("テスト用フォルダ（TestFolder::new が作成）には DACL があるはずです");
+
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            // 注: 本体コードの grant_access と同じ理由（TrusteeForm が
+            // TRUSTEE_IS_SID の場合、ptstrName は PSID として扱われる）で unsafe
+            // は不要。
+            ptstrName: PWSTR(target_sid.0 as *mut u16),
+        };
+
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: mask,
+            grfAccessMode: DENY_ACCESS,
+            grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+            Trustee: trustee,
+        };
+
+        let mut new_acl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: entry はこの呼び出しの間だけ生存すればよいローカル値。
+        // existing_dacl は直前に取得した有効な DACL ポインタ（_descriptor_guard
+        // が生存している間だけ有効）。new_acl は出力専用の変数である。
+        let build_status = unsafe {
+            SetEntriesInAclW(
+                Some(std::slice::from_ref(&entry)),
+                Some(existing_dacl),
+                &mut new_acl,
+            )
+        };
+        assert!(
+            build_status.is_ok(),
+            "拒否 ACE を含む ACL を構築できません: {build_status:?}"
+        );
+
+        let new_acl_guard = LocalAllocGuard(new_acl as *mut c_void);
+
+        // SAFETY: path_wide はこの呼び出しの間だけ生存すればよい NUL 終端
+        // バッファ。new_acl は直前の SetEntriesInAclW が作成した有効な ACL。
+        let apply_status = unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(path_wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(new_acl as *const ACL),
+                None,
+            )
+        };
+        drop(new_acl_guard);
+
+        assert!(
+            apply_status.is_ok(),
+            "拒否 ACE を適用できません: {apply_status:?}"
+        );
+    }
+
+    #[test]
+    fn deny_mask_overlaps_required_detects_full_and_partial_overlap() {
+        // 受け入れ条件: 必要な読み取り+実行のアクセス権と少しでも重なる拒否
+        // マスクは重なりありと判定する（`Issue #45`）。
+        assert!(deny_mask_overlaps_required(
+            FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0
+        ));
+        // 単一ビット（FILE_EXECUTE 相当）だけの部分的な重なりでも検出する。
+        assert!(deny_mask_overlaps_required(FILE_GENERIC_EXECUTE.0));
+        assert!(deny_mask_overlaps_required(GENERIC_READ.0));
+
+        // 注意点: FILE_GENERIC_WRITE は「書き込み」の拒否のつもりでも、
+        // STANDARD_RIGHTS（READ_CONTROL・SYNCHRONIZE）を read/execute と共有して
+        // いるため、必要なアクセス権と重なると判定される。これは実際の Windows
+        // の AccessCheck でも同様（要求した SYNCHRONIZE 等のビットがこの拒否
+        // ACE によって拒否されるため）であり、誤判定ではない。
+        assert!(deny_mask_overlaps_required(FILE_GENERIC_WRITE.0));
+
+        // STANDARD_RIGHTS を含まない、読み取り+実行と重ならない単一ビット
+        // （FILE_WRITE_DATA）は重ならないと判定する。
+        assert!(!deny_mask_overlaps_required(FILE_WRITE_DATA.0));
+        assert!(!deny_mask_overlaps_required(0));
+    }
+
+    #[test]
+    fn deny_ace_blocked_reason_mentions_sid_and_administrator_action() {
+        // 受け入れ条件: 診断メッセージ（の一部）に、対象 SID と、管理者による
+        // 確認が必要である旨が含まれる（`Issue #45`。パス自体は呼び出し元の
+        // bootstrap::runtime 側が前置する）。
+        let reason = deny_ace_blocked_reason();
+        assert!(reason.contains(APP_CONTAINER_SID));
+        assert!(reason.contains("拒否 ACE"));
+        assert!(reason.contains("管理者"));
+    }
+
+    #[test]
+    fn deny_ace_overlapping_required_access_blocks_grant_and_reports_blocked() {
+        // 受け入れ条件: 対象 SID への拒否 ACE が必要なアクセス権（読み取り+
+        // 実行）と重なる場合、許可 ACE を追加せず BlockedByDenyAce を返す
+        // （`Issue #45`）。
+        let folder = TestFolder::new("deny-overlap");
+        add_deny_ace_for_app_container(&folder.path, required_access_mask());
+
+        let outcome = ensure_app_container_access(&folder.path);
+        match outcome {
+            AclOutcome::BlockedByDenyAce { reason } => {
+                assert!(reason.contains(APP_CONTAINER_SID));
+                assert!(reason.contains("管理者"));
+            }
+            other => panic!(
+                "拒否 ACE が必要なアクセス権と重なる場合は BlockedByDenyAce を返すはずです: {other:?}"
+            ),
+        }
+
+        // 拒否 ACE が残っている限り、許可 ACE を追加していないため再判定も
+        // 同じ結果になる（付与していないことの確認）。
+        let second = ensure_app_container_access(&folder.path);
+        assert!(
+            matches!(second, AclOutcome::BlockedByDenyAce { .. }),
+            "拒否 ACE が残っている限り、再判定も BlockedByDenyAce を返すはずです: {second:?}"
+        );
+    }
+
+    #[test]
+    fn deny_ace_not_overlapping_required_access_does_not_block_grant() {
+        // 受け入れ条件: 拒否 ACE が存在していても、必要なアクセス権と重ならなけ
+        // れば判定に影響せず、従来どおり付与できる（`Issue #45`。安全側に倒し
+        // 過ぎて無関係な拒否 ACE まで塞き止めないことの確認）。
+        let folder = TestFolder::new("deny-no-overlap");
+        add_deny_ace_for_app_container(&folder.path, FILE_WRITE_DATA.0);
+
+        let first = ensure_app_container_access(&folder.path);
+        assert!(
+            matches!(first, AclOutcome::Applied),
+            "重ならない拒否 ACE は無視して付与するはずです: {first:?}"
+        );
+
+        let second = ensure_app_container_access(&folder.path);
+        assert!(
+            matches!(second, AclOutcome::AlreadyAccessible),
+            "付与後の再判定は AlreadyAccessible のはずです: {second:?}"
         );
     }
 }

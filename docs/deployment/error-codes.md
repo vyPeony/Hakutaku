@@ -41,7 +41,7 @@ Hakutaku は、起動できない・処理を継続できないなどの一部�
 
 ## W2: WebView2 Runtime のエラーコード一覧
 
-WebView2 Runtime の検出・準備（起動ブートストラップ）で発生する7件です。Runtime の配置手順そのものは[WebView2 Runtime 導入手順書](./webview2-runtime-installation.md)を参照してください。
+WebView2 Runtime の検出・準備（起動ブートストラップ）で発生する8件です。Runtime の配置手順そのものは[WebView2 Runtime 導入手順書](./webview2-runtime-installation.md)を参照してください。
 
 | コード | 意味（いつ起きるか） | 対処 | 関連要件 ID |
 | --- | --- | --- | --- |
@@ -52,6 +52,7 @@ WebView2 Runtime の検出・準備（起動ブートストラップ）で発生
 | `HKT-W2-0005` | `WebView2Runtime` フォルダに対する App Container 用アクセス許可（ACL）の要否を判定できなかった。起動は中止せず、安全側に倒して Runtime の使用を続行する。 | 通常は対応不要です（起動は継続します）。この状態が繰り返し発生する場合、または後続で `HKT-W2-0006` に至る場合は、`HKT-W2-0006` の対処に従ってください。 | `DIST-010` |
 | `HKT-W2-0006` | Evergreen Runtime が既に使用できない状態で、`WebView2Runtime` フォルダへ App Container（`ALL APPLICATION PACKAGES`）用の読み取り + 実行のアクセス許可を付与しようとしたが、現在の実行権限では設定できなかった（Windows 10 環境で起こり得る）。この時点で Fixed Version Runtime も使用不可として扱われるため、起動は中止され、`HKT-W2-0007` としてもあわせて記録される。 | エクスプローラーで `WebView2Runtime` フォルダを右クリックし、「プロパティ」→「セキュリティ」タブ→「編集」または「詳細設定」からアクセス許可を追加するか、管理者権限で Hakutaku を再起動して自動設定を再試行してください（フォルダの所有者、または管理者権限を持つ利用者が操作する必要があります）。この操作はフォルダのアクセス許可（メタデータ）だけの変更であり、Runtime ファイルの内容は変更されません。 | `DIST-010` |
 | `HKT-W2-0007` | 導入済み Evergreen Runtime と、実行ファイル直下の Fixed Version Runtime のどちらも使用できず、Hakutaku を起動できなかった（起動を中止する終端のエラー）。画面には Windows 標準のメッセージボックスで、検出結果、配置先の絶対パス、対処方法が表示される。ACL 拒否（`HKT-W2-0006`）が原因の場合は、その内容を伝えるダイアログが先に表示される。 | 表示されたダイアログの案内、または[導入手順書](./webview2-runtime-installation.md)の「手順2: 配布物を展開する」形態Bに従い、Fixed Version Runtime を配置するか、Evergreen WebView2 Runtime を導入したうえで Hakutaku を再起動してください。Hakutaku は Runtime をネットワークから自動取得しないため、いずれかの方法での手動配置・導入が必要です。 | `DIST-009` |
+| `HKT-W2-0008` | Evergreen Runtime が既に使用できない状態で、`WebView2Runtime` フォルダの DACL に、App Container（`ALL APPLICATION PACKAGES`）に対する拒否 ACE があり、それが読み取り + 実行のアクセス権と重なっていた。Windows は DACL を先頭から評価し拒否を許可より優先するため、許可 ACE を追加しても有効にならない。そのため許可 ACE の追加は行わず、Fixed Version Runtime も使用不可として扱われるため、起動は中止され、`HKT-W2-0007` としてもあわせて記録される。 | `WebView2Runtime` フォルダの所有者、または管理者権限を持つ利用者が、エクスプローラーで対象フォルダを右クリックし、「プロパティ」→「セキュリティ」タブ→「詳細設定」から、`ALL APPLICATION PACKAGES`（または関連するグループ）に対する**拒否**エントリの内容を確認し、読み取り・実行を妨げている場合は見直してください。管理者権限での再起動だけでは解決しません（拒否は許可より優先されるため、権限を上げても許可 ACE の追加自体が無効化されます）。この操作はフォルダのアクセス許可（メタデータ）だけの変更であり、Runtime ファイルの内容は変更されません。 | `DIST-010` |
 
 ## CFG: 設定ファイルのエラーコード一覧
 
