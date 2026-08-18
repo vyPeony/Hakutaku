@@ -177,6 +177,18 @@ body {
   font-weight: bold;
 }
 
+/*
+ * 行末尾の可変ブロック（キャンセル／再読み込み／再試行／昇格ボタン、
+ * エラー理由、「選んで再解析」）をまとめるコンテナ（Issue #48）。
+ * src/shell.js の renderTargetList が差分更新の単位として使うために
+ * 導入したラッパーであり、見た目には関与させたくない。`display: contents`
+ * によりボックス自体を生成させず、子要素を `.target-row` の直接の子と
+ * 同じ見た目（既存のマージンによる縦積み）にする。
+ */
+.target-row__trailing {
+  display: contents;
+}
+
 .target-row__retry {
   margin: 0 12px 8px;
 }
@@ -443,6 +455,18 @@ body {
 }
 
 /*
+ * 無効なジャンプ入力の明示（Issue #48、低優先の作業項目）。空欄・範囲外など
+ * `parseJumpTargetRowIndex`（`src/virtual_scroll.js`）が `null` を返す値を
+ * 送信しようとした場合、src/log_view.js の handleJumpRequest が
+ * aria-invalid="true" を付ける。既存のエラー系配色変数をそのまま使い、新しい
+ * 色は増やさない。次の入力（handleJumpInputInput）で解除する。
+ */
+.log-toolbar__jump-input[aria-invalid="true"] {
+  border-color: var(--color-error-accent);
+  outline: 1px solid var(--color-error-accent);
+}
+
+/*
  * 仮想スクロールのビューポート（PERF-012）。#log-viewport 自体が
  * 縦横のスクロールを担う。横方向のスクロールは行を折り返さない設計
  * （white-space: pre、下記 .log-row__text）で行高を一定に保つための代償として
@@ -517,6 +541,16 @@ body {
   font-size: var(--font-size-body);
 }
 
+/*
+ * 行番号列。`flex: none`（= `flex: 0 0 auto`）のため内容（桁数）に応じて
+ * 伸びるが縮まない。7桁以上の行番号が混在する範囲（統合表示で顕著。
+ * Issue #48）では、その行だけ後続列が右へわずかにずれ得るが、これは意図的な
+ * 選択である。行番号は値そのものが利用者にとって重要な情報のため、
+ * `.log-row__source` のように max-width + ellipsis で切り詰める（＝一部の
+ * 桁が見えなくなる）と、切り詰められた行番号が別の値に見えてしまう
+ * （読み違いという実害を伴う）。桁数差による1行分未満のずれは、値を欠かさず
+ * 全桁表示することとのトレードオフとして許容する。
+ */
 .log-row__lineno {
   flex: none;
   min-width: 6ch;
@@ -544,6 +578,15 @@ body {
 .log-row__source {
   flex: none;
   min-width: 14ch;
+  /*
+   * Issue #48: max-width が無いと、`flex: none`（basis: auto）の効果で
+   * ボックスは常に読み込み元ラベルの全文の幅まで伸びてしまい、overflow /
+   * text-overflow が「隠す幅」を持てず ellipsis が一切発動しなかった
+   * （長いファイルパスの行だけ後続の本文列が大きく右へずれ、統合表示で
+   * 特に目立っていた）。min-width と同じ値で固定することで、行番号列とは
+   * 異なりこの列は常に同じ幅になり、行間の列ずれが起きない。
+   */
+  max-width: 14ch;
   overflow: hidden;
   text-overflow: ellipsis;
   color: #444;

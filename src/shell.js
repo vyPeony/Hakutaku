@@ -25,6 +25,14 @@
 // 再取得する（差分更新はしない）。この規模では往復コストより実装の単純さ・
 // 状態不整合を避けられる確実さを優先する。
 //
+// 上記の「差分更新はしない」は `list_targets` の**取得方法**についてであり、
+// 取得結果を左ペインへ**描画する** DOM 操作は差分更新にしている
+// （`renderTargetList`、Issue #48）。取得のたびに一覧全体を作り直すのは
+// 変えず、その結果を画面へ反映する段だけ、既存の DOM 要素を
+// `TargetRow.key` で対応付けて再利用する設計にした（読み込み中の対象が
+// あるあいだ 500ms ごとに全行を作り直すと、他の行のキーボードフォーカスと
+// 「選んで再解析」の選択が失われ続けるため）。
+//
 // `open_log_file`・`open_config_data_source`・`retry_target` は P07-2 で
 // 非同期化され（`src-tauri/src/targets.rs` 参照）、呼び出し直後は
 // `loading` 応答だけを返す。実際の完了・失敗・キャンセルは、このモジュールが
@@ -171,6 +179,12 @@ const state = {
    * のガードを参照）。
    */
   mergedViewEnabled: false,
+  /**
+   * @type {Map<string, TargetRowEntry>} `TargetRow.key` -> 直近に描画した
+   * DOM 要素と行データ（Issue #48）。`renderTargetList` が全再構築ではなく
+   * 差分更新を行うための対応表。`renderTargetList` の doc コメント参照。
+   */
+  targetRowElements: new Map(),
 };
 
 /** @type {{
@@ -300,7 +314,7 @@ function invokeListDatetimeFormats() {
 
 /**
  * 対象を明示的に再読み込みする（`LOG-028`、ADR-0007）。`Ready` 状態の行に
- * 常設する「再読み込み」ボタンから呼ばれる（`buildTargetRowElement`）。
+ * 常設する「再読み込み」ボタンから呼ばれる（`buildTrailingContent`）。
  *
  * `update_pending`（上限超過による前回の再読み込み拒否）が真かどうかに
  * かかわらず、いつでも呼び出せる。`update_pending` は「拒否された結果」を
@@ -915,7 +929,7 @@ async function handleRetryClick(targetId, manualProfile, manualDatetimeFormat) {
  * アクセス拒否エラー表示の「管理者として新しいウィンドウで開く」ボタンの
  * クリックハンドラー（`PRIV-002`〜`004`、P11-2）。誤用防止のため、アクセス
  * 拒否時（`row.status.accessDenied === true`）だけこのボタンが表示される
- * （`buildTargetRowElement` 参照）。
+ * （`buildTrailingContent` 参照）。
  *
  * `launch_elevated` は新しい昇格済みプロセスを起動するだけで、現在の
  * プロセス（このウィンドウ）は開いたまま維持される（`PRIV-003`）。既存の
@@ -1049,16 +1063,54 @@ async function handleTabClose(targetId) {
   await refreshTargets();
 }
 
-/** 左ペイン（参照対象一覧）を再描画する。 */
+/**
+ * 左ペイン（参照対象一覧）を再描画する。
+ *
+ * 読み込み中の対象が1件でもある間、`refreshTargets` のポーリング（500ms
+ * 間隔）のたびに呼ばれる。以前はここで `textContent = ""` により全行を
+ * 毎回作り直しており、読み込み中の対象が1件でもあると他の行のキーボード
+ * フォーカスと「選んで再解析」の select の選択値が 500ms ごとに失われて
+ * いた（Issue #48）。
+ *
+ * 現在は `TargetRow.key`（src/targets.js）を鍵に `state.targetRowElements`
+ * （key -> `TargetRowEntry`）で前回描画した DOM 要素と対応付け、
+ * (a) 既存キーの行は DOM 要素を再利用して変化した部分だけ更新
+ * （`updateTargetRowElement`）、(b) 消えたキーの行は除去、(c) 新キーの行は
+ * 挿入する。並び順は `rows`（一覧順）を正とし、既に正しい位置にある要素は
+ * 動かさない（同一ドキュメント内で `insertBefore` により位置を移すだけなら
+ * フォーカスは失われない。一度 `DocumentFragment` へ切り離してから
+ * 一括挿入する方式は、切り離した瞬間にフォーカス中の要素がブラウザにより
+ * 自動的にフォーカスを失うため採らない）。
+ */
 function renderTargetList() {
   const rows = buildTargetRows(state.dataSourceNames, state.sessionTargets);
+  const usedKeys = new Set();
+  let previousLi = null;
 
-  elements.targetList.textContent = "";
-  const fragment = document.createDocumentFragment();
   for (const row of rows) {
-    fragment.appendChild(buildTargetRowElement(row));
+    usedKeys.add(row.key);
+    let entry = state.targetRowElements.get(row.key);
+    if (entry) {
+      updateTargetRowElement(entry, row);
+    } else {
+      entry = createTargetRowEntry(row);
+      state.targetRowElements.set(row.key, entry);
+    }
+
+    const wantedNextSibling = previousLi === null ? elements.targetList.firstChild : previousLi.nextSibling;
+    if (wantedNextSibling !== entry.li) {
+      elements.targetList.insertBefore(entry.li, wantedNextSibling);
+    }
+    previousLi = entry.li;
   }
-  elements.targetList.appendChild(fragment);
+
+  // 消えたキーの行（対象が閉じられた等）を除去する。
+  for (const [key, entry] of state.targetRowElements) {
+    if (!usedKeys.has(key)) {
+      entry.li.remove();
+      state.targetRowElements.delete(key);
+    }
+  }
 }
 
 /** 状態表示の日本語ラベル（`TargetRowStatus.kind` -> 表示文字列）。 */
@@ -1123,43 +1175,149 @@ function formatLoadingProgress(progress) {
 }
 
 /**
- * 左ペイン1行分の DOM 要素を作る。
+ * @typedef {Object} TargetRowEntry `renderTargetList` の差分更新が使う、
+ * 一覧1行分の DOM 参照と直近の行データ（Issue #48）。`row.key` をキーに
+ * `state.targetRowElements` へ保持し、次回描画で同じキーの行が来たら
+ * DOM 要素を使い回す（フォーカス・「選んで再解析」の select の選択値・
+ * フォーカスを保つため）。
+ * @property {HTMLLIElement} li
+ * @property {HTMLDivElement} main クリック領域。イベントハンドラーは常に
+ *   `entry.row`（最新の行データ）を参照して分岐する（クロージャで固定の
+ *   `row` を捕まえると、DOM 再利用時に古い行データのまま動作してしまう）。
+ * @property {HTMLSpanElement} nameEl
+ * @property {HTMLSpanElement} originEl
+ * @property {HTMLSpanElement} statusEl
+ * @property {HTMLElement} trailing 行末尾の可変ブロック（キャンセル／
+ *   再読み込み／再試行／昇格ボタン、エラー理由、「選んで再解析」を
+ *   まとめて挿しかえるコンテナ。CSS は `.target-row__trailing`
+ *   〔`display: contents`〕で見た目に関与させない）。
+ * @property {string | null} trailingShape 直近に `trailing` を構築した際の
+ *   形状シグネチャ（`computeTrailingShape`）。次回描画でこの値が変わらない
+ *   限り `trailing` の中身を作り直さない。
+ * @property {TargetRow} row 直近の行データ。クリックハンドラーが参照する。
+ */
+
+/**
+ * 左ペイン1行ぶんの DOM 要素を新規に作り、`row` の内容を反映する
+ * （`renderTargetList` が初めて見る `key` に対して呼ぶ）。
  *
  * @param {TargetRow} row
+ * @returns {TargetRowEntry}
  */
-function buildTargetRowElement(row) {
+function createTargetRowEntry(row) {
   const item = document.createElement("li");
-  item.className = `target-row target-row--${row.status.kind}`;
 
   const main = document.createElement("div");
   main.className = "target-row__main";
   main.setAttribute("role", "button");
   main.tabIndex = 0;
-  main.addEventListener("click", () => handleTargetRowClick(row));
+  // entry.row を参照する（固定の row を捕まえない。TargetRowEntry の doc
+  // コメント参照）。entry はこの関数の下で組み立てるが、参照するのは
+  // クリック・キー操作が実際に発火する時点であり、その時点では既に
+  // 初期化済みのため問題ない。
+  main.addEventListener("click", () => handleTargetRowClick(entry.row));
   main.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      handleTargetRowClick(row);
+      handleTargetRowClick(entry.row);
     }
   });
 
   const name = document.createElement("span");
   name.className = "target-row__name";
-  name.textContent = row.displayName;
   main.appendChild(name);
 
   const origin = document.createElement("span");
   origin.className = "target-row__origin";
-  origin.textContent = row.origin === "configured" ? "設定" : "アドホック";
   main.appendChild(origin);
 
   const status = document.createElement("span");
-  status.className = `target-row__status target-row__status--${row.status.kind}`;
-  status.textContent = statusLabelFor(row.status);
+  status.className = "target-row__status";
   main.appendChild(status);
 
   item.appendChild(main);
 
+  const trailing = document.createElement("div");
+  trailing.className = "target-row__trailing";
+  item.appendChild(trailing);
+
+  /** @type {TargetRowEntry} */
+  const entry = {
+    li: item,
+    main,
+    nameEl: name,
+    originEl: origin,
+    statusEl: status,
+    trailing,
+    trailingShape: null,
+    row,
+  };
+
+  updateTargetRowElement(entry, row);
+  return entry;
+}
+
+/**
+ * 既存の `TargetRowEntry` を最新の `row` へ更新する（`renderTargetList` が
+ * 既知の `key` に対して呼ぶ）。DOM 要素・イベントリスナーは作り直さない。
+ *
+ * @param {TargetRowEntry} entry
+ * @param {TargetRow} row
+ */
+function updateTargetRowElement(entry, row) {
+  entry.row = row;
+  entry.li.className = `target-row target-row--${row.status.kind}`;
+  entry.nameEl.textContent = row.displayName;
+  entry.originEl.textContent = row.origin === "configured" ? "設定" : "アドホック";
+  entry.statusEl.className = `target-row__status target-row__status--${row.status.kind}`;
+  entry.statusEl.textContent = statusLabelFor(row.status);
+
+  const shape = computeTrailingShape(row);
+  if (entry.trailingShape !== shape) {
+    // ボタンの有無・種類が変わる場合だけ作り直す（`.target-row__reparse`
+    // の select を含む）。read-in の select 自体を毎回作り直すと、利用者が
+    // 選びかけていたプロファイル・日時書式や、そのセレクトへのキーボード
+    // フォーカスが失われる（Issue #48）。
+    entry.trailing.textContent = "";
+    buildTrailingContent(entry.trailing, row);
+    entry.trailingShape = shape;
+  } else {
+    // 形状は変わっていないので DOM は作り直さず、変わり得るテキスト
+    // （updatePending 由来のツールチップ、エラー理由、reparse の選択肢の
+    // 追加）だけ同期する。
+    refreshTrailingContent(entry.trailing, row);
+  }
+}
+
+/**
+ * 行末尾ブロック（ボタン群・エラー理由・「選んで再解析」）の DOM 形状を表す
+ * 文字列（Issue #48）。前回描画からこの値が変わらなければ
+ * `updateTargetRowElement` は `trailing` を作り直さない。ボタンの有無・
+ * 種類を決める入力（状態種別・対象 ID・アクセス拒否・生表示への退避）だけを
+ * 含み、同じボタン構成のまま変わり得るテキスト（進捗率、`updatePending`、
+ * エラー理由本文）は含めない（それらは `refreshTrailingContent` が作り直さず
+ * 更新する）。
+ *
+ * @param {TargetRow} row
+ * @returns {string}
+ */
+function computeTrailingShape(row) {
+  const fellBackToRawDisplay = Boolean(
+    (row.status.kind === "ready" && row.status.ready?.fellBackToRawDisplay) ||
+      (row.status.kind === "cancelled_partial" && row.status.cancelledPartial?.fellBackToRawDisplay),
+  );
+  const accessDenied = row.status.kind === "error" && Boolean(row.status.accessDenied);
+  return `${row.status.kind}|${row.targetId}|${accessDenied}|${fellBackToRawDisplay}`;
+}
+
+/**
+ * 行末尾の可変ブロックを最初から作る。`computeTrailingShape` が前回描画から
+ * 変わった場合にだけ `updateTargetRowElement` から呼ばれる。
+ *
+ * @param {HTMLElement} trailing
+ * @param {TargetRow} row
+ */
+function buildTrailingContent(trailing, row) {
   if (row.status.kind === "loading" && row.targetId !== null) {
     const targetId = row.targetId;
     const cancelButton = document.createElement("button");
@@ -1170,14 +1328,15 @@ function buildTargetRowElement(row) {
       event.stopPropagation();
       handleCancelClick(targetId);
     });
-    item.appendChild(cancelButton);
+    trailing.appendChild(cancelButton);
   }
 
   // LOG-028、ADR-0007: 「再読み込み」は Ready 状態の行に常設する
   // （update_pending の真偽に関わらず、いつでも呼び出せる操作。
   // handleReloadTargetClick の doc コメント参照）。update_pending が真の
   // ときだけ、前回の再読み込みが上限超過で反映されなかったことを付加情報
-  // として伝える。
+  // として伝える（このツールチップ文言は `refreshTrailingContent` も
+  // 同じ条件で更新する。ボタンの有無自体は変えないため作り直しの対象外）。
   if (row.status.kind === "ready" && row.targetId !== null) {
     const targetId = row.targetId;
     const updatePending = Boolean(row.status.ready?.updatePending);
@@ -1192,7 +1351,7 @@ function buildTargetRowElement(row) {
       event.stopPropagation();
       handleReloadTargetClick(targetId);
     });
-    item.appendChild(reloadButton);
+    trailing.appendChild(reloadButton);
   }
 
   if ((row.status.kind === "error" || row.status.kind === "cancelled_partial") && row.targetId !== null) {
@@ -1205,7 +1364,7 @@ function buildTargetRowElement(row) {
       event.stopPropagation();
       handleRetryClick(targetId);
     });
-    item.appendChild(retryButton);
+    trailing.appendChild(retryButton);
   }
 
   // PRIV-002〜004、P11-2: アクセス拒否時だけ「管理者として新しいウィンドウで
@@ -1220,24 +1379,115 @@ function buildTargetRowElement(row) {
       event.stopPropagation();
       handleElevateClick();
     });
-    item.appendChild(elevateButton);
+    trailing.appendChild(elevateButton);
   }
 
   if (row.status.kind === "error") {
     const reason = document.createElement("p");
     reason.className = "target-row__error-reason";
     reason.textContent = row.status.error?.reason ?? "";
-    item.appendChild(reason);
+    trailing.appendChild(reason);
   }
 
   const fellBackToRawDisplay =
     (row.status.kind === "ready" && row.status.ready?.fellBackToRawDisplay) ||
     (row.status.kind === "cancelled_partial" && row.status.cancelledPartial?.fellBackToRawDisplay);
   if (fellBackToRawDisplay && row.targetId !== null) {
-    item.appendChild(buildReparseControl(row.targetId));
+    trailing.appendChild(buildReparseControl(row.targetId));
+  }
+}
+
+/**
+ * `trailingShape` が前回描画から変わっていない行末尾ブロックの中身を、DOM を
+ * 作り直さずに最新の行データへ同期する（Issue #48）。「選んで再解析」の
+ * select は既存要素をそのまま使い、選択肢が増えていれば追加するだけに
+ * 留める（`syncReparseSelectOptions`）。ボタンの有無自体が変わる場合は
+ * `updateTargetRowElement` 側で `buildTrailingContent` による作り直しに
+ * 分岐済みのため、ここでは対象の要素が既に存在する前提で扱う。
+ *
+ * @param {HTMLElement} trailing
+ * @param {TargetRow} row
+ */
+function refreshTrailingContent(trailing, row) {
+  if (row.status.kind === "ready" && row.targetId !== null) {
+    const reloadButton = /** @type {HTMLButtonElement | null} */ (
+      trailing.querySelector(".target-row__reload")
+    );
+    if (reloadButton) {
+      const updatePending = Boolean(row.status.ready?.updatePending);
+      reloadButton.title = updatePending
+        ? "前回の再読み込みは上限超過のため反映されませんでした。他の対象を閉じてから再試行してください。"
+        : "最新の内容を反映して開き直します。追記された内容はリアルタイムには反映されません。";
+    }
   }
 
-  return item;
+  if (row.status.kind === "error") {
+    const reasonEl = trailing.querySelector(".target-row__error-reason");
+    if (reasonEl) {
+      reasonEl.textContent = row.status.error?.reason ?? "";
+    }
+  }
+
+  const fellBackToRawDisplay =
+    (row.status.kind === "ready" && row.status.ready?.fellBackToRawDisplay) ||
+    (row.status.kind === "cancelled_partial" && row.status.cancelledPartial?.fellBackToRawDisplay);
+  if (fellBackToRawDisplay && row.targetId !== null) {
+    const profileSelect = /** @type {HTMLSelectElement | null} */ (
+      document.getElementById(`reparse-profile-${row.targetId}`)
+    );
+    const formatSelect = /** @type {HTMLSelectElement | null} */ (
+      document.getElementById(`reparse-datetime-format-${row.targetId}`)
+    );
+    if (profileSelect) {
+      syncReparseSelectOptions(
+        profileSelect,
+        state.logProfileNames.map((name) => ({ value: name, text: name })),
+      );
+    }
+    if (formatSelect) {
+      syncReparseSelectOptions(
+        formatSelect,
+        state.datetimeFormats.map((format) => ({
+          value: format.id,
+          text: `${format.id}（${format.pattern}）`,
+        })),
+      );
+    }
+  }
+}
+
+/**
+ * 「選んで再解析」セレクトの選択肢を、現在の `state.logProfileNames` /
+ * `state.datetimeFormats` に同期させる（Issue #48）。select 要素そのものは
+ * `updateTargetRowElement` が差分更新で使い回すため（利用者が選びかけている
+ * 値・フォーカスを保つ）、既存の選択肢はそのまま残し、まだ無い選択肢だけを
+ * 追加する。
+ *
+ * 呼び出しが必要になる理由: `initShell` は対象一覧の初回描画と
+ * `list_log_profiles`／`list_datetime_formats` の取得を並行して行っており、
+ * 取得の完了が対象一覧の初回描画より後になることがある。生表示への退避
+ * （fell_back_to_raw_display）がその間に起きると、「選んで再解析」の
+ * セレクトが選択肢の無いまま構築され、以後の描画では
+ * `trailingShape` が変わらないため作り直されない。この関数が無いと、その
+ * 行のセレクトには永久に選択肢が反映されない。
+ *
+ * 両リストは起動直後に一度取得したら以後変わらない前提のため、削除は
+ * 行わない（`state.datetimeFormats` の doc コメント参照）。
+ *
+ * @param {HTMLSelectElement} select
+ * @param {{ value: string, text: string }[]} options
+ */
+function syncReparseSelectOptions(select, options) {
+  const existingValues = new Set(Array.from(select.options, (option) => option.value));
+  for (const option of options) {
+    if (existingValues.has(option.value)) {
+      continue;
+    }
+    const element = document.createElement("option");
+    element.value = option.value;
+    element.textContent = option.text;
+    select.appendChild(element);
+  }
 }
 
 /**
