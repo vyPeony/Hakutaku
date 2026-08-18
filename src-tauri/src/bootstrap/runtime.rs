@@ -67,6 +67,10 @@ mod error_codes {
     pub const ACL_DENIED: &str = "HKT-W2-0006";
     /// Evergreen・Fixed Version のどちらも使用できない。
     pub const RUNTIME_UNAVAILABLE: &str = "HKT-W2-0007";
+    /// `WebView2Runtime` フォルダへの拒否 ACE が App Container 用の必要な
+    /// アクセス権と重なっており、許可 ACE を追加しても有効にならない
+    /// （`Issue #45`）。
+    pub const ACL_BLOCKED_BY_DENY_ACE: &str = "HKT-W2-0008";
 }
 
 /// 起動を許可する WebView2 ブラウザーの最低版。
@@ -352,7 +356,10 @@ enum FixedVersionOutcome {
     Available(ResolvedRuntime),
     /// 見つからない、または最低要求版未満。
     NotFound(String),
-    /// 見つかったが ACL が現在の権限では設定できない。
+    /// 見つかったが ACL を有効な形で設定できない。現在の権限では設定できない
+    /// 場合（[`AclOutcome::Denied`]）と、拒否 ACE により許可 ACE を追加しても
+    /// 有効にならない場合（[`AclOutcome::BlockedByDenyAce`]、`Issue #45`）の
+    /// 両方を含む。いずれも Fixed Version は使用不可として扱う。
     AclDenied { detail: String, outcome: AclOutcome },
 }
 
@@ -464,6 +471,23 @@ fn resolve_fixed_version(
                 module = MODULE,
                 operation = "runtime.fixed_version.acl",
                 error_code = error_codes::ACL_DENIED,
+                "{detail}"
+            );
+            Some(detail)
+        }
+        AclOutcome::BlockedByDenyAce { reason } => {
+            // Windows の評価順（拒否が許可より優先）では、許可 ACE を追加しても
+            // この拒否 ACE に阻まれて有効にならない。「付与しました」とは記録
+            // せず、管理者による ACL の確認が必要である旨を記録する（Issue #45）。
+            let detail = format!(
+                "{} の App Container 用 ACL の設定は行いませんでした: {reason}",
+                runtime_dir.display()
+            );
+            diag_error!(
+                diagnostics,
+                module = MODULE,
+                operation = "runtime.fixed_version.acl",
+                error_code = error_codes::ACL_BLOCKED_BY_DENY_ACE,
                 "{detail}"
             );
             Some(detail)
