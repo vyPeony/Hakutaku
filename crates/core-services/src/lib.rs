@@ -67,8 +67,8 @@ pub use ordering::{is_already_open, plan_adhoc_batch_order};
 pub use profile_resolution::{resolve_profile, ResolutionOutcome};
 pub use registry::{
     fetch_path_metrics, reset_fetch_path_metrics, ChangeKind, DisplaySetHandle, DisplaySetRegistry,
-    FetchPathMetrics, FetchRangeError, MergedViewHandle, RebuildOutcome, SourceStatus,
-    SourceSummary,
+    DisplaySetState, FetchPathMetrics, FetchRangeError, MergedViewHandle, RebuildOutcome,
+    SourceStatus, SourceSummary,
 };
 
 /// 共通サービス層が担う責務の表示名です。

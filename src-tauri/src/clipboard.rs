@@ -20,7 +20,7 @@ use std::sync::{Arc, PoisonError};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use hakutaku_diagnostics::{diag_info, Diagnostics};
+use hakutaku_diagnostics::{diag_info, diag_warn, Diagnostics};
 
 use crate::bootstrap::config::ConfigState;
 use crate::log_view::DisplaySetRegistryState;
@@ -91,6 +91,10 @@ pub enum CopySelectionError {
     ClipboardWriteFailed {
         reason: String,
     },
+    /// `COPY-005`（Issue #37）。コピーの最中に対象のファイルが削除・置換された
+    /// 等で本文を読み出せず、中身の抜けた内容を渡さないためにコピー全体を
+    /// 中止した。クリップボードは変更していない。
+    SourceUnavailable,
 }
 
 impl From<hakutaku_core::CopyError> for CopySelectionError {
@@ -108,6 +112,7 @@ impl From<hakutaku_core::CopyError> for CopySelectionError {
                     reason: reason.to_string(),
                 }
             }
+            hakutaku_core::CopyError::SourceUnavailable => CopySelectionError::SourceUnavailable,
         }
     }
 }
@@ -118,7 +123,8 @@ impl From<hakutaku_core::CopyError> for CopySelectionError {
 /// クリップボードへ書き込みます（`COPY-005`: 拒否時はクリップボードに一切
 /// 触れません）。`display_set_id`・`generation`・`start`・`count` の意味は
 /// `fetch_log_range` と同じです（表示集合内のインデックス範囲。表示外の
-/// 範囲を含んでいても構いません）。
+/// 範囲を含んでいても構いません）。時系列統合表示の表示集合（P09-1）も
+/// `fetch_log_range` と同じくそのまま指定できます（Issue #37）。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn copy_selection(
@@ -147,7 +153,7 @@ pub fn copy_selection(
         columns: columns.into(),
     };
 
-    let outcome = {
+    let assembled = {
         let mut registry_guard = registry.0.lock().unwrap_or_else(PoisonError::into_inner);
         hakutaku_core::assemble_copy(
             &mut registry_guard,
@@ -157,8 +163,28 @@ pub fn copy_selection(
             limits,
             hakutaku_memory_accounting::global_budget(),
         )
-    }
-    .map_err(CopySelectionError::from)?;
+    };
+
+    let outcome = match assembled {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // COPY-005（Issue #37）: 本文を読み出せずに中止した場合だけ、原因
+            // 調査の手がかりとして記録する（他の失敗理由は、そのまま応答として
+            // フロントエンドの通知になる。本文はここでも記録しない）。
+            if matches!(error, hakutaku_core::CopyError::SourceUnavailable) {
+                diag_warn!(
+                    diagnostics_ref,
+                    module = "clipboard",
+                    operation = "clipboard.copy_source_unavailable",
+                    "選択範囲の本文を読み出せなかったためコピーを中止しました\
+                     （COPY-005）: display_set_id={}, 選択行数={}",
+                    display_set_id,
+                    count
+                );
+            }
+            return Err(CopySelectionError::from(error));
+        }
+    };
 
     match outcome {
         hakutaku_core::CopyOutcome::Copied(buffer) => {
@@ -353,6 +379,17 @@ mod tests {
 
         let no_columns = CopySelectionError::from(hakutaku_core::CopyError::NoColumnsSelected);
         assert!(matches!(no_columns, CopySelectionError::NoColumnsSelected));
+    }
+
+    // 受け入れ条件（COPY-005、Issue #37）: 本文を読み出せずに中止した失敗は、
+    // 上限超過の拒否とも世代不一致とも別の種別としてフロントエンドへ届く
+    // （利用者へ出す文言と次の操作が異なるため）。
+    #[test]
+    fn copy_selection_error_conversion_maps_source_unavailable() {
+        let converted = CopySelectionError::from(hakutaku_core::CopyError::SourceUnavailable);
+        assert!(matches!(converted, CopySelectionError::SourceUnavailable));
+        let json = serde_json::to_string(&converted).expect("直列化できるはず");
+        assert_eq!(json, r#"{"kind":"source_unavailable"}"#);
     }
 
     // 受け入れ条件（COPY-002）: 実際に Win32 クリップボードへ書き込み、

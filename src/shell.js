@@ -180,6 +180,14 @@ const state = {
    */
   mergedViewEnabled: false,
   /**
+   * @type {string | null} 統合表示を ON にした時点の「読み込み済みの対象」の
+   * 署名（`computeLoadedTargetsSignature`）。統合表示は押した時点の対象で
+   * 構築され、以後は自動で作り直さないため（Issue #37 の裁定: 閲覧中の統合
+   * 結果が突然変わる方が有害）、対象一覧の再取得のたびにこの署名と比べて、
+   * 統合結果へ反映されていない変化を通知する。OFF の間は `null`。
+   */
+  mergedViewTargetsSignature: null,
+  /**
    * @type {Map<string, TargetRowEntry>} `TargetRow.key` -> 直近に描画した
    * DOM 要素と行データ（Issue #48）。`renderTargetList` が全再構築ではなく
    * 差分更新を行うための対応表。`renderTargetList` の doc コメント参照。
@@ -607,9 +615,65 @@ async function applyTargetsSnapshot() {
   }
 
   state.sessionTargets = targets;
+  notifyMergedViewStalenessIfTargetsChanged();
   processCompletedAutoActivations();
   renderTargetList();
   syncPolling();
+}
+
+/**
+ * 統合表示 ON の間に「読み込み済みの対象」が変わっていたら、表示中の統合結果へ
+ * は反映されていないことを1回通知する（Issue #37、`LOG-007`）。
+ *
+ * 統合表示集合は ON にした時点の対象で構築され、対象を開く・再読み込みする・
+ * 閉じるといった変化があっても、表示中の統合結果は自動では作り直さない（閲覧
+ * 中の並びが突然変わる方が有害という裁定）。何も知らせないと `LOG-007` の
+ * 「現在開いている全ソースを横断」と食い違って見えるため、変化を検出した時点で
+ * 反映方法（入れ直し）とともに知らせる。
+ *
+ * 通知後は署名を現在値へ更新するので、同じ変化で繰り返し通知しない（500ms
+ * 間隔のポーリングのたびにバナーの「（N回目）」が増え続けない）。さらに別の
+ * 変化が起きれば、そのときにもう一度通知する。
+ */
+function notifyMergedViewStalenessIfTargetsChanged() {
+  if (!state.mergedViewEnabled) {
+    return;
+  }
+  const signature = computeLoadedTargetsSignature(state.sessionTargets);
+  if (signature === state.mergedViewTargetsSignature) {
+    return;
+  }
+  state.mergedViewTargetsSignature = signature;
+  showInfoBanner(
+    "開いている対象が変わりましたが、表示中の時系列統合表示には反映されていません。" +
+      "ツールバーの「時系列統合」を OFF にしてから ON に戻すと、現在開いている対象で" +
+      "統合表示を作り直せます。",
+  );
+}
+
+/**
+ * 統合表示へ参加し得る対象（読み込みが完了した対象）の顔ぶれを表す署名を作る。
+ *
+ * 読み込み中・エラーの対象は含めない（前者は完了時に、後者は再試行が成功した
+ * 時点で、それぞれ1回だけ変化として現れる）。世代（`generation`）を含めるのは、
+ * 再読み込み（`LOG-028`）で中身が入れ替わった対象も「変わった」として扱う
+ * ためである。並び順は `list_targets` の応答順に依存させない。
+ *
+ * @param {TargetSessionDto[]} targets
+ * @returns {string}
+ */
+function computeLoadedTargetsSignature(targets) {
+  return targets
+    .filter(
+      (session) =>
+        session.status.kind === "ready" || session.status.kind === "cancelled_partial",
+    )
+    .map(
+      (session) =>
+        `${session.target_id}:${session.status.display_set_id}:${session.status.generation}`,
+    )
+    .sort()
+    .join(",");
 }
 
 /**
@@ -703,6 +767,8 @@ function activateSessionTab(session) {
   // P09-1: 統合表示 ON の間は、ビュー領域を統合表示のまま維持する
   // （LOG-015: 統合タブ1つだけを表示する）。タブの記録（state.tabs）は
   // 更新しておき、統合表示を OFF にした時点で正しく復元できるようにする。
+  // 読み込みが完了した対象が統合結果へ入っていないことは、対象一覧の再取得
+  // 側（`notifyMergedViewStalenessIfTargetsChanged`）が通知する（Issue #37）。
   if (!state.mergedViewEnabled) {
     logViewer.activate({
       display_set_id: tab.displaySetId,
@@ -787,14 +853,22 @@ async function handleOpenFileButtonClick() {
  */
 async function handleMergedViewToggleClick() {
   elements.mergedViewToggle.disabled = true;
+  // 失敗したときにどちらの操作だったかを通知文へ反映するため、押した時点の
+  // 状態を控える（`state.mergedViewEnabled` は成功時に書き換わる）。
+  const wasEnabled = state.mergedViewEnabled;
   try {
-    if (state.mergedViewEnabled) {
+    if (wasEnabled) {
       await invokeDisableMergedView();
       state.mergedViewEnabled = false;
+      state.mergedViewTargetsSignature = null;
       restoreActiveTabView();
     } else {
       const handle = await invokeEnableMergedView();
       state.mergedViewEnabled = true;
+      // 統合表示集合は、この呼び出しの時点で開いている対象から構築される。
+      // 以後の変化を検出する基準（Issue #37）を、その構築に使われたのと同じ
+      // 一覧のスナップショットから取る。
+      state.mergedViewTargetsSignature = computeLoadedTargetsSignature(state.sessionTargets);
       logViewer.activate({
         display_set_id: handle.display_set_id,
         generation: handle.generation,
@@ -805,12 +879,53 @@ async function handleMergedViewToggleClick() {
     }
   } catch (error) {
     console.error("時系列統合表示の切り替えに失敗しました:", error);
-    showErrorBanner("時系列統合表示の切り替えに失敗しました。");
+    showMergedViewToggleError(wasEnabled, error);
   } finally {
     elements.mergedViewToggle.disabled = false;
     updateMergedViewToggleLabel();
     renderTabBar();
   }
+}
+
+/**
+ * 統合表示の切り替えに失敗したことを、`ERR-002` の要素（何が起きたか・理由・
+ * 継続可否・次の操作）を含めて通知する（Issue #37）。
+ *
+ * `enable_merged_view` は失敗理由を種別（`kind`）と実値（`reason`）に分けて
+ * 返す（`src-tauri/src/log_view.rs` の `EnableMergedViewError`）。理由を捨てて
+ * 固定文言だけを出すと、利用者は「なぜ切り替わらないのか」も「何をすれば
+ * 切り替わるのか」も分からないまま同じ操作を繰り返すことになる。
+ *
+ * @param {boolean} wasEnabled 押した時点で統合表示が ON だったか（＝解除の操作）。
+ * @param {unknown} error `invoke` が返した失敗（Rust 側の `Result::Err`）。
+ */
+function showMergedViewToggleError(wasEnabled, error) {
+  if (wasEnabled) {
+    // 解除（`disable_merged_view`）は値を返さず失敗理由も持たない。失敗しても
+    // 統合表示のまま閲覧は続けられる。
+    showErrorBanner(
+      "時系列統合表示を解除できませんでした。表示は時系列統合のまま操作できます。" +
+        "もう一度「時系列統合」を押してお試しください。",
+    );
+    return;
+  }
+
+  if (error && typeof error === "object" && "kind" in error) {
+    if (error.kind === "memory_reservation_rejected") {
+      showErrorBanner(
+        "時系列統合表示を開始できませんでした。開いている全対象を横断する並び順を" +
+          `保持するためのメモリを確保できないためです（${String(error.reason ?? "")}）。` +
+          "ファイル別タブの表示はそのまま継続できます。不要な対象のタブを閉じてから、" +
+          "もう一度「時系列統合」を押してください。",
+      );
+      return;
+    }
+  }
+
+  showErrorBanner(
+    "時系列統合表示を開始できませんでした。ファイル別タブの表示はそのまま継続できます。" +
+      "もう一度「時系列統合」を押してお試しください。",
+  );
 }
 
 /** 「時系列統合」トグルの表示ラベル・押下状態を `state.mergedViewEnabled` へ同期する。 */
@@ -1026,7 +1141,15 @@ function activateExistingTab(targetId) {
   }
   state.tabs = setActiveTab(state.tabs, targetId);
   // P09-1: 統合表示 ON の間はファイル別タブへ切り替えない（LOG-015）。
-  if (!state.mergedViewEnabled) {
+  if (state.mergedViewEnabled) {
+    // 抑止しただけでは、一覧の行やタブを押しても何も起きず「操作が効いて
+    // いない」ように見える（Issue #37）。抑止したことと解除の手順を通知する。
+    // 同じ文のバナーは1枚へ集約されるため（Issue #11）、押すたびに増えない。
+    showInfoBanner(
+      "時系列統合表示の間は、個別のファイルのタブへ切り替えられません。" +
+        "ツールバーの「時系列統合」を押して OFF にすると、選んだ対象の表示へ戻れます。",
+    );
+  } else {
     logViewer.activate({
       display_set_id: tab.displaySetId,
       generation: tab.generation,

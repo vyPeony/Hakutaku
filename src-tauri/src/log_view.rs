@@ -602,25 +602,45 @@ impl From<hakutaku_core::MergedViewHandle> for MergedViewHandleDto {
     }
 }
 
+/// `enable_merged_view` が失敗した理由です（`ERR-002`、Issue #37）。
+///
+/// 以前は理由の文字列だけを返していましたが、フロントエンドが「何が起きたか」
+/// 「なぜか」「次に何をすればよいか」を組み立てられるよう、種別と実値
+/// （`reason`）を分けた形にしています。種別ごとに利用者へ案内すべき次の操作が
+/// 異なるため（メモリ予算超過なら、開いている対象を閉じてから再試行する）、
+/// フロントエンドは `kind` で分岐します。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnableMergedViewError {
+    /// `PERF-008`。統合表示の参照列（`(source_id, seq)` の並び）の確保が
+    /// メモリ予算で拒否された。**既存の表示は何も変わりません**（統合表示を
+    /// 開始しなかっただけで、ファイル別タブの閲覧は継続できます）。
+    MemoryReservationRejected { reason: String },
+}
+
 /// 現在開いている全ソースを横断する統合表示集合を構築し、ON にします
 /// （`LOG-007`〜`LOG-008`）。**参加ソースの索引の再読み込み・再解析は行いません**
 /// （「再読み込みなしの切り替え」。計画正本 `tasks/phase-09-timeline-merge.md`）。
 ///
 /// フロントエンド（`src/shell.js`）は、応答の `display_set_id` を使って
-/// `fetch_log_range` を呼び出します。範囲取得契約（`RangeRequest`／
-/// `RangeResponse`）は個別ファイルの表示集合と変わりません。
+/// `fetch_log_range`・`copy_selection` を呼び出します。範囲取得契約
+/// （`RangeRequest`／`RangeResponse`）は個別ファイルの表示集合と変わりません。
 ///
 /// メモリ予算（`PERF-008`）の逼迫で参照列（`(source_id, seq)` の並び）の確保が
-/// 拒否された場合、統合表示集合を開始せず理由をエラーとして返します。
+/// 拒否された場合、統合表示集合を開始せず [`EnableMergedViewError`] を返します。
 #[tauri::command]
 pub fn enable_merged_view(
     registry: State<'_, DisplaySetRegistryState>,
-) -> Result<MergedViewHandleDto, String> {
+) -> Result<MergedViewHandleDto, EnableMergedViewError> {
     let mut registry_guard = registry.0.lock().unwrap_or_else(PoisonError::into_inner);
     registry_guard
         .enable_merged_view()
         .map(MergedViewHandleDto::from)
-        .map_err(|rejected| rejected.to_string())
+        .map_err(
+            |rejected| EnableMergedViewError::MemoryReservationRejected {
+                reason: rejected.to_string(),
+            },
+        )
 }
 
 /// 統合表示集合を破棄し、OFF にします（`LOG-008`、`LOG-015`）。参加していた
@@ -688,6 +708,29 @@ mod tests {
     fn fetch_log_range_error_conversion_maps_unknown_display_set() {
         let converted = FetchLogRangeError::from(hakutaku_core::FetchRangeError::UnknownDisplaySet);
         assert_eq!(converted, FetchLogRangeError::UnknownDisplaySet);
+    }
+
+    // 受け入れ条件（`ERR-002`、Issue #37）: 統合表示を開始できなかった理由が、
+    // 種別（kind）と実値（reason）に分かれてフロントエンドへ届く。
+    #[test]
+    fn enable_merged_view_error_carries_kind_and_reason() {
+        let rejected = hakutaku_memory_accounting::ReservationRejected {
+            requested_bytes: 16,
+            allocated_bytes: 1,
+            outstanding_reserved_bytes: 2,
+            budget_bytes: 3,
+        };
+        let error = EnableMergedViewError::MemoryReservationRejected {
+            reason: rejected.to_string(),
+        };
+        let json = serde_json::to_value(&error).expect("直列化できるはず");
+        assert_eq!(json["kind"], "memory_reservation_rejected");
+        assert!(
+            json["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("メモリ予約を拒否しました")),
+            "拒否理由の実値がそのまま含まれるはず: {json}"
+        );
     }
 
     // --- P08-3: EvictionFlag / drain_pending_eviction ---
