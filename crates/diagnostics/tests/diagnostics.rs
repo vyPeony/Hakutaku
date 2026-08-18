@@ -418,3 +418,292 @@ fn diagnostics_can_be_shared_across_threads() {
     let content = fs::read_to_string(&log_path).unwrap();
     assert!(content.contains("threads.write"));
 }
+
+/// 見出し（`LOG_HEADER`）はクレート非公開のため、実際に 1 度開いてファイル長
+/// から求めます。「見出し + N レコード分」でローテーション上限を組み立てる
+/// テストが、見出しの文言変更で壊れないようにするためです。
+fn header_len_bytes() -> u64 {
+    let temp = TempDir::new("header-len");
+    let logs_dir = temp.path().join("logs");
+    let (diagnostics, unavailable) = Diagnostics::open(
+        &logs_dir,
+        RotationPolicy::default(),
+        ProcessElevation::Normal,
+    );
+    assert!(unavailable.is_none());
+    assert!(diagnostics.is_active());
+    fs::metadata(logs_dir.join("hakutaku.log"))
+        .expect("見出しだけのファイルが存在する")
+        .len()
+}
+
+// 受け入れ条件: ローテーション判定は自プロセスの書き込み量ではなく実ファイル
+// サイズで行う。他プロセスの追記でファイルが max_file_bytes を超えた場合も、
+// 次の書き込みで退避される（DIAG-002、DIAG-007、Issue #41）。
+#[test]
+fn rotates_on_actual_file_size_including_other_process_appends() {
+    let temp = TempDir::new("rotate-actual-size");
+    let logs_dir = temp.path().join("logs");
+
+    // 自プロセスのレコードだけでは到達しない上限にする。
+    let policy = RotationPolicy {
+        max_file_bytes: header_len_bytes() + 4096,
+        max_generations: 3,
+    };
+    let (diagnostics, unavailable) = Diagnostics::open(&logs_dir, policy, ProcessElevation::Normal);
+    assert!(unavailable.is_none());
+
+    diag_info!(
+        diagnostics,
+        module = "test::multiprocess",
+        operation = "multiprocess.write",
+        "自プロセスの 1 件目"
+    );
+
+    let current = logs_dir.join("hakutaku.log");
+    let gen1 = logs_dir.join("hakutaku.1.log");
+    assert!(
+        !gen1.exists(),
+        "自プロセス分だけでは上限に届かず、まだ退避されない"
+    );
+
+    // 別プロセスによる追記を模擬する（同じファイルを追記モードで開いて書く）。
+    const OTHER_PROCESS_MARKER: &str = "OTHER-PROCESS-APPEND";
+    {
+        use std::io::Write as _;
+        let mut other = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&current)
+            .expect("別プロセスと同じ追記モードで開ける");
+        let padding = "x".repeat(8192);
+        writeln!(other, "{OTHER_PROCESS_MARKER}{padding}").expect("追記できる");
+        other.flush().expect("フラッシュできる");
+    }
+
+    diag_info!(
+        diagnostics,
+        module = "test::multiprocess",
+        operation = "multiprocess.write",
+        "自プロセスの 2 件目"
+    );
+
+    assert!(
+        diagnostics.is_active(),
+        "ローテーションだけでは無効化されない"
+    );
+    assert!(
+        gen1.is_file(),
+        "他プロセスの追記を含む実サイズで上限を超えたため退避されている"
+    );
+
+    let rotated = fs::read_to_string(&gen1).expect("退避後ファイルを読み取れる");
+    assert!(
+        rotated.contains(OTHER_PROCESS_MARKER),
+        "他プロセスの追記は退避後ファイルへ残る"
+    );
+
+    let content = fs::read_to_string(&current).expect("新しい現行ファイルを読み取れる");
+    assert!(content.starts_with("# Hakutaku 診断ログ"));
+    assert!(
+        !content.contains(OTHER_PROCESS_MARKER),
+        "新しい現行ファイルは見出しから始まり、退避前の内容を含まない"
+    );
+}
+
+// 受け入れ条件: 退避（rename・削除）に失敗しても、その直前に書いたレコードは
+// 失われず、panic せずに理由を取得できる（DIAG-002、DIAG-006、Issue #41）。
+// 判定を書き込みの後に行うため、レコードの記録が退避の成否に依存しない。
+#[test]
+fn keeps_the_record_written_before_a_failed_rotation_and_reports_the_reason() {
+    let temp = TempDir::new("rotate-failure");
+    let logs_dir = temp.path().join("logs");
+    fs::create_dir_all(&logs_dir).expect("logs を先に用意できる");
+
+    // 退避上限を超える世代（max_generations=3 なら hakutaku.2.log）を
+    // ディレクトリとして作り、fs::remove_file を失敗させる。ハンドル保持による
+    // rename 失敗（Windows 固有で単体テストからは再現しにくい）と同じ経路
+    // （rotate_generations の Err）へ入る。
+    fs::create_dir(logs_dir.join("hakutaku.2.log")).expect("同名ディレクトリを作れる");
+
+    let policy = RotationPolicy {
+        max_file_bytes: 1,
+        max_generations: 3,
+    };
+    let (diagnostics, unavailable) = Diagnostics::open(&logs_dir, policy, ProcessElevation::Normal);
+    assert!(unavailable.is_none(), "開くところまでは成功する");
+    assert!(diagnostics.is_active());
+
+    const MARKER: &str = "退避に失敗しても残るレコード";
+    diag_info!(
+        diagnostics,
+        module = "test::rotate_failure",
+        operation = "rotate_failure.write",
+        "{MARKER}"
+    );
+
+    let current = logs_dir.join("hakutaku.log");
+    let content = fs::read_to_string(&current).expect("現行ファイルを読み取れる");
+    assert!(
+        content.contains(MARKER),
+        "退避に失敗しても、直前に書いたレコードは書き込み済みで失われない"
+    );
+
+    // DIAG-006: 退避に失敗した時点で無効化し、理由を取得できるようにする。
+    assert!(!diagnostics.is_active());
+    assert!(diagnostics.log_path().is_none());
+    let reason = diagnostics
+        .unavailable_reason()
+        .expect("無効化の理由を取得できる");
+    assert!(!reason.reason.is_empty());
+
+    // 無効化後も呼び出し側は継続できる（panic しない）。
+    diag_error!(
+        diagnostics,
+        module = "test::rotate_failure",
+        operation = "rotate_failure.write",
+        "無効化後は出力されない"
+    );
+    let after = fs::read_to_string(&current).expect("現行ファイルを読み取れる");
+    assert_eq!(content, after, "無効化後は追記されない");
+}
+
+// 受け入れ条件: keep_generations（max_generations）が 1 のときは世代退避を
+// 行わず、現行ファイルだけを保持する（DIAG-002、CFG-020 の分岐の現行挙動固定）。
+#[test]
+fn single_generation_policy_keeps_only_the_current_file() {
+    let temp = TempDir::new("single-generation");
+    let logs_dir = temp.path().join("logs");
+
+    // 見出し + 2 レコード程度で上限に達する大きさにする。
+    let policy = RotationPolicy {
+        max_file_bytes: header_len_bytes() + 400,
+        max_generations: 1,
+    };
+    let (diagnostics, unavailable) = Diagnostics::open(&logs_dir, policy, ProcessElevation::Normal);
+    assert!(unavailable.is_none());
+
+    for index in 0..20 {
+        diag_info!(
+            diagnostics,
+            module = "test::single_generation",
+            operation = "single_generation.write",
+            "世代1件の確認用レコード{:03}",
+            index
+        );
+    }
+
+    assert!(
+        diagnostics.is_active(),
+        "ローテーションだけでは無効化されない"
+    );
+
+    let current = logs_dir.join("hakutaku.log");
+    assert!(current.is_file(), "現行ファイルは存在する");
+    assert!(
+        !logs_dir.join("hakutaku.1.log").exists(),
+        "max_generations=1 では退避ファイルを作らない"
+    );
+
+    let content = fs::read_to_string(&current).expect("現行ファイルを読み取れる");
+    assert!(content.starts_with("# Hakutaku 診断ログ"));
+    assert!(
+        !content.contains("レコード000"),
+        "上限に達した時点で古い内容は退避されず削除される"
+    );
+}
+
+// 受け入れ条件: 1 レコードが max_file_bytes を超える場合でも、そのレコードは
+// 丸ごと記録され、書き込みの後にローテーションされる。記録の欠落や無限の
+// ローテーションは起きない（DIAG-002、Issue #41）。
+#[test]
+fn record_larger_than_max_file_bytes_is_written_then_rotated() {
+    let temp = TempDir::new("oversized-record");
+    let logs_dir = temp.path().join("logs");
+
+    // 見出しだけで既に超える極端な上限。
+    let policy = RotationPolicy {
+        max_file_bytes: 64,
+        max_generations: 3,
+    };
+    let (diagnostics, unavailable) = Diagnostics::open(&logs_dir, policy, ProcessElevation::Normal);
+    assert!(unavailable.is_none());
+
+    let long_message = format!("OVERSIZED-1-{}", "あ".repeat(2000));
+    diag_info!(
+        diagnostics,
+        module = "test::oversized",
+        operation = "oversized.write",
+        "{}",
+        long_message
+    );
+    diag_info!(
+        diagnostics,
+        module = "test::oversized",
+        operation = "oversized.write",
+        "OVERSIZED-2"
+    );
+
+    assert!(
+        diagnostics.is_active(),
+        "1 レコードが上限を超えても無効化しない"
+    );
+
+    let current = fs::read_to_string(logs_dir.join("hakutaku.log")).expect("現行を読み取れる");
+    let gen1 = fs::read_to_string(logs_dir.join("hakutaku.1.log")).expect("第1世代を読み取れる");
+    let gen2 = fs::read_to_string(logs_dir.join("hakutaku.2.log")).expect("第2世代を読み取れる");
+
+    // 書き込みの後に判定するため、現行ファイルは見出しだけの状態になる。
+    assert!(current.starts_with("# Hakutaku 診断ログ"));
+    assert!(!current.contains("OVERSIZED-"));
+    assert!(gen1.contains("OVERSIZED-2"), "2 件目は第1世代にある");
+    assert!(
+        gen2.contains(&long_message),
+        "上限を超える 1 レコードも切り詰められず丸ごと残る"
+    );
+}
+
+// 受け入れ条件: 本文に区切り文字 ` | ` が含まれてもエスケープせず記録し、
+// 先頭から 8 回の分割で 9 個目が本文全体になる（DIAG-003、DIAG-004、
+// crates/diagnostics/src/lib.rs のモジュール doc コメント、Issue #41）。
+#[test]
+fn message_containing_the_field_separator_is_recorded_without_escaping() {
+    let temp = TempDir::new("separator");
+    let logs_dir = temp.path().join("logs");
+    let (diagnostics, _) = Diagnostics::open(
+        &logs_dir,
+        RotationPolicy::default(),
+        ProcessElevation::Normal,
+    );
+
+    let message = r"参照元: C:\Device\Logs\a.log | level=WARN | msg=区切りを含む本文";
+    diag_error!(
+        diagnostics,
+        module = "test::separator",
+        operation = "separator.write",
+        error_code = "HKT-W2-0007",
+        "{}",
+        message
+    );
+
+    let log_path = diagnostics.log_path().unwrap().to_path_buf();
+    let content = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        content.contains(message),
+        "本文は加工されずそのまま記録される"
+    );
+
+    let line = content
+        .lines()
+        .find(|line| line.contains("separator.write"))
+        .expect("レコード行が見つかる");
+    let fields: Vec<&str> = line.splitn(9, " | ").collect();
+    assert_eq!(fields.len(), 9, "欄は 9 個で、本文が最後尾の欄");
+    assert_eq!(fields[8], message);
+    assert_eq!(fields[1], "ERROR");
+    assert_eq!(fields[5], "code=HKT-W2-0007");
+    assert!(
+        line.split(" | ").count() > 9,
+        "すべての区切りで分割すると欄数が変わるため、固定欄数での分割が必要"
+    );
+}

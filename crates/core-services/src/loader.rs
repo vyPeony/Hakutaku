@@ -455,6 +455,39 @@ impl LoadFileError {
     pub fn is_sharing_violation(&self) -> bool {
         matches!(self, LoadFileError::ReadFile(inner) if inner.is_sharing_violation())
     }
+
+    /// 診断ログの `code=` 欄（`DIAG-005`）へ記録するアプリ内エラーコードです。
+    /// 割り当てのない失敗では `None`（記録時は `code=-`）を返します。
+    ///
+    /// 書式・採番規則・割り当て基準は `docs/development/error-codes.md` が正本
+    /// です。ここでコードを持つのは、文字コードに起因する2件（領域 `ENC`。
+    /// 採番台帳は `hakutaku_format_detection::error_codes`）だけです。理由は
+    /// 次のとおりです。
+    ///
+    /// - [`LoadFileError::IndexMemoryBudgetExceeded`] は、予約を拒否した
+    ///   `hakutaku_memory_accounting` 側が会計イベントとして同じ失敗を
+    ///   `HKT-MEM-0001` で記録済みのため、ここで重ねて付けない
+    /// - [`LoadFileError::ReadFile`] と [`LoadFileError::ChangedDuringLoad`] は、
+    ///   読み込み経路以外にも同じ失敗（共有違反、読み込み中の変更）が現れるため、
+    ///   領域と採番を決めていない
+    /// - [`LoadFileError::InvalidEncodingName`] は、起動時検証で先に検出され、
+    ///   安全モード（`HKT-CFG-0001`）として記録される経路が主のため、ここでは
+    ///   採番していない
+    #[must_use]
+    pub fn error_code(&self) -> Option<&'static str> {
+        match self {
+            LoadFileError::UnsupportedEncoding(_) => {
+                Some(hakutaku_format_detection::error_codes::UNSUPPORTED_UTF16)
+            }
+            LoadFileError::Decode(_) => {
+                Some(hakutaku_format_detection::error_codes::UNKNOWN_CODEPAGE)
+            }
+            LoadFileError::ReadFile(_)
+            | LoadFileError::InvalidEncodingName(_)
+            | LoadFileError::ChangedDuringLoad(_)
+            | LoadFileError::IndexMemoryBudgetExceeded(_) => None,
+        }
+    }
 }
 
 /// [`register_source`] の失敗です（P06）。
@@ -3234,7 +3267,46 @@ mod tests {
         let error = load_file_into_registry(&mut registry, &file.path, "test.log".to_string(), &[])
             .expect_err("UTF-16 は未対応のはず");
         assert!(matches!(error, LoadFileError::UnsupportedEncoding(_)));
+        assert_eq!(
+            error.error_code(),
+            Some("HKT-ENC-0001"),
+            "未対応形式には領域 ENC のエラーコードが対応する（DIAG-005）"
+        );
         assert!(registry.is_empty(), "失敗時は登録しないはず");
+    }
+
+    // 受け入れ条件: 診断ログの `code=` へ記録するエラーコードは、文字コードに
+    // 起因する2件（領域 `ENC`）にだけ割り当て、他のバリアントは `None` を返す
+    // （`DIAG-005`、docs/development/error-codes.md の割り当て基準、Issue #41）。
+    #[test]
+    fn load_file_error_assigns_codes_only_to_encoding_failures() {
+        use hakutaku_format_detection::{DecodeError, UnsupportedEncoding, Utf16BomKind};
+
+        let unsupported = LoadFileError::UnsupportedEncoding(UnsupportedEncoding {
+            bom: Utf16BomKind::Le,
+        });
+        assert_eq!(
+            unsupported.error_code(),
+            Some(hakutaku_format_detection::error_codes::UNSUPPORTED_UTF16)
+        );
+
+        let decode = LoadFileError::Decode(DecodeError::UnknownCodepage(99999));
+        assert_eq!(
+            decode.error_code(),
+            Some(hakutaku_format_detection::error_codes::UNKNOWN_CODEPAGE)
+        );
+
+        // 予約拒否は memory-accounting 側の会計イベントが HKT-MEM-0001 として
+        // 記録するため、ここでは重ねて付けない。
+        let rejected = LoadFileError::IndexMemoryBudgetExceeded(
+            hakutaku_memory_accounting::ReservationRejected {
+                requested_bytes: 1,
+                allocated_bytes: 2,
+                outstanding_reserved_bytes: 3,
+                budget_bytes: 4,
+            },
+        );
+        assert_eq!(rejected.error_code(), None);
     }
 
     // 受け入れ条件: BOM あり UTF-8 も正しく判定・デコードされる。

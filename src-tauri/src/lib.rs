@@ -172,9 +172,15 @@ pub fn run() {
     // グローバル予算（`global_budget()`）に対して起動時に一度だけ配線する
     // （`MemoryBudget::set_event_sink` は `OnceLock` のため、2回目以降の呼び出し
     // は無視される）。予約拒否・しきい値到達のどちらも、対処が必要ではあるが
-    // 起動や継続を止めるものではないため `Warn` とする。エラーコード
-    // （`docs/development/error-codes.md`）は、起動できない／利用者の対処が
-    // 必要な失敗にだけ割り当てる基準のため、ここでは付与しない（`code=-`）。
+    // 起動や継続を止めるものではないため `Warn` とする。
+    //
+    // エラーコード（`docs/development/error-codes.md`）は「起動できない、または
+    // 処理を継続できない失敗」「利用者・導入組織側の対処が必要な失敗」にだけ
+    // 割り当てる。予約拒否は、要求された読み込み・索引作成をその場では継続でき
+    // ず、対象を閉じる・`memory.budget_mib` を見直すという利用者側の対処を要する
+    // ためこの基準に該当し、`HKT-MEM-0001` を付ける。しきい値到達と参考指標の
+    // 超過は、先読み停止・バッファ解放でアプリ側が自動的に縮退し、利用者の対処を
+    // 要さないため付けない（`code=-`）。
     let memory_event_diagnostics = std::sync::Arc::clone(&diagnostics);
     hakutaku_memory_accounting::global_budget().set_event_sink(Box::new(
         move |event| match event {
@@ -183,6 +189,7 @@ pub fn run() {
                     memory_event_diagnostics,
                     module = "memory",
                     operation = "memory.reserve",
+                    error_code = hakutaku_memory_accounting::error_codes::RESERVATION_REJECTED,
                     "{rejected}"
                 );
             }
