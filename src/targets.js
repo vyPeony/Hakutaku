@@ -75,7 +75,16 @@
 
 /**
  * @typedef {Object} TargetRow 左ペインが描画する1行。
- * @property {string} key 描画時の安定した識別子（DOM の再利用判定に使う）。
+ * @property {string} key 描画時の安定した識別子（DOM の再利用判定に使う。
+ *   src/shell.js の renderTargetList が差分更新の対応表の鍵にする。
+ *   Issue #48）。設定由来（`origin === "configured"`）の行は名前ベース
+ *   （`configured:<name>`）で、未読み込み（`not_opened`）から開いた後
+ *   （`loading`／`ready`／…）まで同じ一覧上の「枠」を指し続ける。target_id
+ *   ベースにしなかったのは、開く操作の直後に key が切り替わって DOM が
+ *   作り直され、その瞬間だけフォーカスが失われる問題を避けるため。
+ *   アドホックに開いた対象（`origin === "ad_hoc"`）は開いた時点で初めて
+ *   一覧に現れ、以後 ID が変わらないため対象 ID ベース（`target:<targetId>`）
+ *   のままでよい。
  * @property {number | null} targetId `null` は「設定由来だがまだ開いていない」行（`status.kind === "not_opened"`）を表す。
  * @property {string} displayName
  * @property {"ad_hoc" | "configured"} origin
@@ -117,7 +126,10 @@ export function buildTargetRows(dataSourceNames, sessionTargets) {
   for (const name of dataSourceNames) {
     const session = sessionsByName.get(name);
     if (session) {
-      rows.push(sessionToRow(session));
+      // key は名前ベースへ上書きする（`sessionToRow` は既定で target_id
+      // ベースの key を作るが、設定由来の行は名前ベースで安定させる。
+      // TargetRow.key の doc コメント参照。Issue #48）。
+      rows.push({ ...sessionToRow(session), key: `configured:${name}` });
       sessionsByName.delete(name);
     } else {
       rows.push({

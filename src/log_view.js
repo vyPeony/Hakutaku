@@ -114,6 +114,24 @@
 // Ctrl+C）も、既存の scroll・resize 購読と同じく `initLogView` で1回だけ
 // 登録する単一の購読であり、行数に比例して増えるものではない（PERF-012 の
 // 累積源にならない）。
+//
+// # Issue #48: タブ切り替え時のスクロール・選択の復元、無効なジャンプ入力の明示
+//
+// 従来、`activateDisplaySet` はタブ切り替え（共通シェルのタブ操作、
+// タブを閉じた後の再表示を含む）のたびにスクロール位置を先頭・選択を空へ
+// 戻していたため、他のタブを見てから戻ると読んでいた位置を見失っていた。
+// 現在は、離れる側のタブの `scrollTop`・選択範囲を `savedTabViewStates`
+// （displaySetId をキーとする小さな Map）へ保存し、同じ世代のタブへ戻る
+// 場合にだけ復元する（`activateDisplaySet` の doc コメント参照）。
+// `reload_target` による世代の更新（＝再読み込み）を挟んだ場合は復元条件
+// （世代の一致）を満たさなくなるため、従来どおり先頭へ戻る。
+//
+// ジャンプ入力欄（`#log-jump-input`）に無効な値（空欄・範囲外など、
+// `parseJumpTargetRowIndex` が `null` を返す入力）を送信しようとした場合は、
+// バナーを出さず `aria-invalid="true"` と CSS（`src/styles.css` の
+// `.log-toolbar__jump-input[aria-invalid="true"]`）による境界色の変化で
+// 入力欄自体に明示する（`handleJumpRequest`）。次にその欄へ入力した時点
+// （`handleJumpInputInput`）で解除する。
 
 import {
   chunkIndexForRow,
@@ -184,6 +202,105 @@ const FETCH_RETRY_BASE_DELAY_MS = 1_000;
  * 何分も待たされる。復帰の検知が遅れすぎない範囲で頭打ちにする。
  */
 const FETCH_RETRY_MAX_DELAY_MS = 30_000;
+
+/**
+ * `savedTabViewStates` に保持する最大エントリ数（Issue #48）。
+ *
+ * `PERF-005`（対象は10件程度を想定）に対して十分な余裕を持たせつつ、対象を
+ * 開いては閉じる操作をセッション中に延々と繰り返しても無制限に増えないよう
+ * 頭打ちにする。上限を超えたら、最も長く参照されていないエントリ（Map の
+ * 挿入順で先頭。`rememberTabViewState` が参照のたびに末尾へ移し替える）から
+ * 追い出す。
+ */
+const MAX_SAVED_TAB_VIEW_STATES = 32;
+
+/**
+ * @typedef {Object} SavedTabViewState タブを離れる直前に保存する、そのタブへ
+ * 戻ったときに復元する最小限のビュー状態（Issue #48、主セッション裁定2）。
+ * @property {number} generation 保存時点の世代。`activateDisplaySet` は、
+ *   復元先の世代がこれと一致する場合（＝再読み込みを挟んでいない同一世代の
+ *   タブ切り替え）にだけ復元する。再読み込みで世代が進んだ場合は、この
+ *   エントリは二度と一致しなくなり（世代は増える一方のため）、結果として
+ *   常に先頭へ戻る（主セッション裁定の「再読み込みは先頭へ戻す」）。
+ * @property {number} scrollTop 保存時点の `elements.viewport.scrollTop`（px）。
+ * @property {import("./selection.js").SelectionState} selection 保存時点の選択範囲
+ *   （アンカー・フォーカスの2つの数値のみ。行データは含まない）。
+ */
+
+/**
+ * @type {Map<number, SavedTabViewState>} displaySetId ->
+ * 直近にそのタブを離れた時点のビュー状態（Issue #48）。`activateDisplaySet`
+ * が離れる側で書き込み、戻ってきた側で読み出す。`reload_target`
+ * （`LOG-028`、ADR-0007）は表示集合 ID を保ったまま世代だけを進める設計
+ * （モジュール冒頭のコメント「応答適用条件」参照）のため、displaySetId は
+ * タブ（対象）の識別子として安定して使える。
+ *
+ * PERF-012「取得済みの行を累積しない」への抵触検討: ここに保持するのは
+ * displaySetId 1件あたり数値4つ（世代・scrollTop・アンカー・フォーカス）
+ * だけであり、行の本文・バイト数は一切保持しない。エントリ数も
+ * `MAX_SAVED_TAB_VIEW_STATES` で頭打ちにしているため、PERF-012 が問題視する
+ * 「行データの累積」には当たらない。
+ */
+const savedTabViewStates = new Map();
+
+/**
+ * `displaySetId` のビュー状態を記録する（最近参照した順に並べ替え、上限超過分は
+ * 最も古いものから追い出す。Issue #48）。
+ *
+ * @param {number} displaySetId
+ * @param {SavedTabViewState} viewState
+ */
+function rememberTabViewState(displaySetId, viewState) {
+  // Map は挿入順を保持する。既存キーを一度消してから入れ直すことで
+  // 「最近使った順」の末尾へ移動させる（簡易 LRU）。
+  savedTabViewStates.delete(displaySetId);
+  savedTabViewStates.set(displaySetId, viewState);
+  while (savedTabViewStates.size > MAX_SAVED_TAB_VIEW_STATES) {
+    const oldestKey = savedTabViewStates.keys().next().value;
+    savedTabViewStates.delete(oldestKey);
+  }
+}
+
+/**
+ * 現在表示中の表示集合（統合表示を除く）のビュー状態を `savedTabViewStates`
+ * へ保存する。表示集合を切り替える・空表示にする直前に呼ぶ（Issue #48）。
+ *
+ * 統合表示（P09-1）を保存しないのは、統合表示が「タブ」（src/tabs.js）を
+ * 持たず、ON にするたびに新しい表示集合を作り直す設計だからである
+ * （`handleMergedViewToggleClick`）。主セッション裁定も「タブごとに」
+ * 保持する対象と定めており、統合表示はその対象外。
+ */
+function rememberCurrentTabViewStateIfApplicable() {
+  if (state.displaySetId === null || state.isMerged) {
+    return;
+  }
+  rememberTabViewState(state.displaySetId, {
+    generation: /** @type {number} */ (state.generation),
+    scrollTop: elements.viewport.scrollTop,
+    selection: state.selection,
+  });
+}
+
+/**
+ * 保存済みの選択範囲を、現在の `totalItems` の範囲へクランプする（Issue #48、
+ * 主セッション裁定「復元時は totalItems の範囲へクランプ」）。表示集合が
+ * タブを離れている間に縮む通常の経路は無い（読み込みは伸びる方向にしか
+ * 進まない設計）が、防御的に丸める。
+ *
+ * @param {import("./selection.js").SelectionState} selection
+ * @param {number} totalItems
+ * @returns {import("./selection.js").SelectionState}
+ */
+function clampSelectionToTotalItems(selection, totalItems) {
+  if (selection.anchorIndex === null || selection.focusIndex === null || totalItems <= 0) {
+    return createSelectionState();
+  }
+  const maxIndex = totalItems - 1;
+  return {
+    anchorIndex: Math.min(selection.anchorIndex, maxIndex),
+    focusIndex: Math.min(selection.focusIndex, maxIndex),
+  };
+}
 
 /**
  * @typedef {Object} LogItemDto `fetch_log_range` 応答の1項目
@@ -368,6 +485,7 @@ export function initLogView(retentionLimits) {
   elements.rows.addEventListener("click", handleRowsClick);
   elements.jumpButton.addEventListener("click", handleJumpRequest);
   elements.jumpInput.addEventListener("keydown", handleJumpInputKeydown);
+  elements.jumpInput.addEventListener("input", handleJumpInputInput);
   elements.detailPanelCloseButton.addEventListener("click", hideDetailPanel);
   elements.copyColumnLineNumber.addEventListener("change", handleCopyColumnsChange);
   elements.copyColumnTimestamp.addEventListener("change", handleCopyColumnsChange);
@@ -385,9 +503,28 @@ export function initLogView(retentionLimits) {
  * `logViewer`（本モジュール末尾）が公開する「形式別ビューアの差し込み口」
  * 契約のうち `activate` の実体。
  *
+ * # タブ切り替え時のスクロール位置・選択の復元（Issue #48、主セッション裁定2）
+ *
+ * 離れる側のタブの `scrollTop`・選択範囲を `savedTabViewStates` へ保存し
+ * （`rememberCurrentTabViewStateIfApplicable`）、戻る側のタブに保存済みかつ
+ * 世代が一致するエントリがあれば復元する。世代が異なる場合（＝再読み込みを
+ * 挟んでいる）は復元せず先頭へ戻す。
+ *
+ * 復元する `scrollTop` を代入する前に、可視範囲を空にした状態で一度
+ * `renderRows` を呼び、上下スペーサの高さを新しい `totalItems` に合わせて
+ * 確定させている。`computeSpacerHeightsForScroll` はどの可視範囲を渡しても
+ * スペーサ高さの合計が総高さと厳密に一致するよう作られているため
+ * （`virtual_scroll.js` の同関数 doc コメント参照）、この「空範囲での事前
+ * 描画」は総高さ（`viewport.scrollHeight`）だけを正しく先に確定させる安全な
+ * 手段になる。この順序を踏まないと、直前のタブの内容量に基づく古い
+ * `scrollHeight` を基準に `scrollTop` の代入がブラウザ側でクランプされ、
+ * 復元先が手前へ丸められてしまう。
+ *
  * @param {DisplaySetDescriptor} descriptor
  */
 export function activateDisplaySet(descriptor) {
+  rememberCurrentTabViewStateIfApplicable();
+
   clearCache();
   // 前の表示集合へ向けて発行済みの取得は、応答が届いても捨てられる（Issue #34 の
   // 文脈照合）。その登録を残したままだと、新しい表示集合の同じチャンク番号の取得
@@ -402,16 +539,35 @@ export function activateDisplaySet(descriptor) {
   // enable_merged_view の応答を activate するときだけ true を渡す。
   state.isMerged = Boolean(descriptor.is_merged);
   state.everCachedChunkIndices.clear();
+
+  const savedViewState = state.isMerged ? undefined : savedTabViewStates.get(state.displaySetId);
+  const canRestore = savedViewState !== undefined && savedViewState.generation === state.generation;
   // 表示集合の切り替えでは、古い表示集合のインデックスを指したままにしない
   // よう選択も破棄する（PERF-012: 選択はインデックス範囲だけを保持している
-  // ため、切り替え後は無意味な範囲になる）。
-  state.selection = createSelectionState();
+  // ため、切り替え後は無意味な範囲になる）。同一世代のタブへ戻る場合だけ、
+  // 保存しておいた選択を復元する。
+  state.selection = canRestore
+    ? clampSelectionToTotalItems(savedViewState.selection, state.totalItems)
+    : createSelectionState();
 
   elements.sourceLabel.textContent = state.sourceLabel;
   updateTotalItemsLabel();
-  elements.viewport.scrollTop = 0;
   elements.jumpInput.value = "";
+  elements.jumpInput.removeAttribute("aria-invalid");
   hideDetailPanel();
+
+  // 関数 doc コメント「タブ切り替え時のスクロール位置・選択の復元」参照。
+  // scrollTop を読み書きする前に、新しい totalItems でスペーサ高さを確定させる。
+  renderRows({ startIndex: 0, endIndex: 0 });
+  if (canRestore) {
+    const maxScrollTopPx = Math.max(
+      0,
+      elements.viewport.scrollHeight - elements.viewport.clientHeight,
+    );
+    elements.viewport.scrollTop = Math.min(Math.max(0, savedViewState.scrollTop), maxScrollTopPx);
+  } else {
+    elements.viewport.scrollTop = 0;
+  }
 
   scheduleRender();
 }
@@ -439,6 +595,7 @@ export function showEmptyState() {
     updateTotalItemsLabel();
     elements.viewport.scrollTop = 0;
     elements.jumpInput.value = "";
+    elements.jumpInput.removeAttribute("aria-invalid");
     hideDetailPanel();
   }
 
@@ -1321,8 +1478,15 @@ function hideDetailPanel() {
 function handleJumpRequest() {
   const rowIndex = parseJumpTargetRowIndex(elements.jumpInput.value, state.totalItems);
   if (rowIndex === null) {
+    // 低優先の作業項目（Issue #48）: 空欄・数値でない・0以下など無効な入力を
+    // 無反応のままにせず、入力欄自体に明示する。同時多発を避けたい他の通知
+    // （Issue #11 の集約バナー）と違い、この誤りは入力欄1箇所に閉じているため
+    // バナーは出さない（主セッション裁定）。次の入力（`handleJumpInputInput`）
+    // で解除する。
+    elements.jumpInput.setAttribute("aria-invalid", "true");
     return;
   }
+  elements.jumpInput.removeAttribute("aria-invalid");
   // 丸めた結果を入力欄へ反映し、利用者が実際に移動した先を確認できるようにする。
   elements.jumpInput.value = String(rowIndex + 1);
   // クランプ済みの大規模ファイルでは行インデックス↔スクロール
@@ -1358,6 +1522,18 @@ function handleJumpInputKeydown(event) {
     event.preventDefault();
     handleJumpRequest();
   }
+}
+
+/**
+ * ジャンプ入力欄の内容が変わるたびに呼ばれる（Issue #48）。無効な入力の明示
+ * （`aria-invalid`）は、利用者が値を直そうとした時点（次の入力）で解除する。
+ * 新しい値がまだ有効かどうかはここでは判定しない（判定は
+ * `handleJumpRequest` が改めて行う。入力の途中経過を逐一 aria-invalid の
+ * 有無へ反映すると、桁を打ち切る途中の一瞬だけ無効になる入力（例:
+ * 「10」を打つ途中の「1」は総行数によっては範囲外）で明示がちらつくため）。
+ */
+function handleJumpInputInput() {
+  elements.jumpInput.removeAttribute("aria-invalid");
 }
 
 /**
