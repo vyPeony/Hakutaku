@@ -28,6 +28,18 @@
 // 挙動を一切変えない（回帰を避ける）ことを最優先したためである。詳細な設計判断は
 // 各関数の JSDoc を参照。
 //
+// この3関数は同じ画面レイアウトを扱うにもかかわらず、当初はそれぞれ別の一次式で
+// 書かれていた。そのため比例写像が有効な規模で、行番号ジャンプの目標行が画面外
+// （2000万行では最大46行ぶん上）へ出る不具合があった（Issue #33）。現在は
+// `computeSpacerHeightsForScroll` が構成するレイアウト——上スペーサの高さが
+// 描画ブロックの document 座標そのものであること——を唯一の基準とし、
+// `computeVisibleRangeForScroll` をその逆写像、`computeScrollTopForRowIndexScaled`
+// をその順写像として実装している。両者が同じレイアウトから導かれるため、
+// 「ジャンプで指定した行が画面上端付近に来る」ことと「スクロール位置から求めた
+// 先頭行が実際に画面最上部へ描画される行と一致する」ことが同時に成り立つ。
+// ジャンプが上端ちょうどではなく `JUMP_CONTEXT_ROWS` 行ぶん下を狙うのは、実機
+// （WebView2）が 10^7 px 級の座標を量子化するためである（同定数の JSDoc 参照）。
+//
 // # P08-2: 可変行高ではなく「折りたたみ方式」を採用した理由
 //
 // tasks/phase-08-log-view.md 作業項目1（LOG-014）は、継続行を含む論理項目の
@@ -158,6 +170,167 @@ export function computeEffectiveTotalHeightPx(totalItems, rowHeightPx) {
 }
 
 /**
+ * `computeScrollTopForRowIndexScaled` が `bufferRows` を渡されなかったときに
+ * 使う既定のバッファ行数。
+ *
+ * 比例写像が有効な規模では、スクロール座標と行インデックスの対応が上スペーサの
+ * 高さ（`computeSpacerHeightsForScroll`）で決まり、その高さは実描画行数
+ * （可視行数＋バッファ行数×2）に依存する。このためジャンプ位置の計算にも
+ * バッファ行数が要るが、既存の呼び出し側（`log_view.js` の `handleJumpRequest`）は
+ * 引数を4つしか渡していない。呼び出し側が明示的に渡すようになるまでの既定値
+ * として、この値を使う（Issue #33）。
+ *
+ * この値が `log_view.js` の `BUFFER_ROWS` とずれると、2000万行規模でジャンプ
+ * 位置が数十行ずれる（バッファ行数1行あたり約2行）。静かに壊れることを防ぐため、
+ * 一致は `scripts/check-virtual-scroll.mjs` の「前提の同期」で検査する。
+ */
+export const DEFAULT_BUFFER_ROWS = 50;
+
+/**
+ * 比例写像が有効な規模で、行番号ジャンプの目標行を画面最上部から何行下へ置くか
+ * （`computeScrollTopForRowIndexScaled` が使う文脈行の余裕）。
+ *
+ * 目標行をちょうど最上部（オフセット0行）へ置く計算は、数値上は厳密でも実機で
+ * 破綻する。WebView2 の実測（Issue #33。300万行、`clientHeight` 579px、
+ * デバイスピクセル比1.25）では、2×10^7 px 級の `scrollTop` と CSS 高さが単精度
+ * 相当（±10px 程度）へ量子化されていた。代入した `scrollTop` は計算値より約
+ * +8px、上スペーサの実寸は厳密値より約 -9px ずれ、合わせて1行（22px）を超える。
+ * 目標行がちょうど floor の境界に乗る設計では、この丸めだけで
+ * `computeVisibleRangeForScroll` の先頭行が1行進み、目標行が画面上端の外へ出る
+ * （実測で行 1,500,000 は上端より 22.0px 上、行 2,900,000 は 27.6px 上）。
+ *
+ * そこで目標行そのものではなく、その2行手前を先頭行として順写像へ通し、目標行を
+ * 数値上「上端から2行下」に置く。実機の量子化ずれ（±1.3行程度）が乗っても、
+ * 目標行は上端から約0.7〜3.3行の位置に収まり、常に画面内に残る。2行にとどめる
+ * のは、ジャンプ先の視認性（目標行が上端付近にあること）を損なわない範囲で
+ * 余裕を取るためである。
+ *
+ * クランプ未満の1:1経路（`computeScrollTopForRowIndex`）はこの余裕を持たせない。
+ * 座標値が小さく量子化の影響を受けないうえ、既存の挙動を変えないことを優先する。
+ */
+export const JUMP_CONTEXT_ROWS = 2;
+
+/**
+ * @typedef {Object} ScaledScrollLayout
+ * @property {number} effectiveHeightPx 実効総高さ（`computeEffectiveTotalHeightPx`）。
+ * @property {number} visibleRowCount ビューポートに収まる行数（下端の半端な1行を含む）。
+ * @property {number} bufferedRows 可視範囲の前後に確保するバッファ行数（0以上）。
+ * @property {boolean} spacerless スペーサが常に0pxになる縮退状態かどうか。
+ * @property {number} spacerPxPerRow 内側領域での、未描画1行あたりのスペーサ高さ（px）。
+ * @property {number} headEndScrollTopPx 頭部領域と内側領域の境界のスクロール位置（px）。
+ * @property {number} tailStartRowIndex 内側領域と末尾領域の境界の先頭行インデックス。
+ * @property {number} tailStartScrollTopPx 内側領域と末尾領域の境界のスクロール位置（px）。
+ */
+
+/**
+ * 比例写像が有効な規模での「スクロール座標 ↔ 先頭行インデックス」写像を決める
+ * パラメータを、`computeSpacerHeightsForScroll` が構成するレイアウトから導く。
+ *
+ * 記号を `T`（総行数）、`h`（行高）、`B`（バッファ行数）、`E`（実効総高さ）、
+ * `V`（可視行数）、`R`（実描画行数 = `endIndex − startIndex`）とすると、
+ * `computeSpacerHeightsForScroll` は上スペーサを `(E − R·h) × startIndex / (T − R)`
+ * と定める。上スペーサの高さは、そのまま描画ブロックの document 座標
+ * （＝先頭の描画行の上端の位置）である。したがって先頭行 `f` を画面最上部へ
+ * 置くスクロール位置は「上スペーサ + (f − startIndex) × h」に決まり、
+ * `f` の位置によって3つの領域に分かれる。
+ *
+ *   1. 頭部（`f ≤ B`）: `startIndex = 0` でクリップされ上スペーサは0px。
+ *      行が実寸で並ぶため `scrollTop = f × h`（傾き `h`）
+ *   2. 内側（`B < f < T − V − B`）: `R` はクリップされず `V + 2B` で一定。
+ *      上スペーサは `k × (f − B)`（`k = (E − R·h) / (T − R)`）となり、
+ *      `scrollTop = k × (f − B) + B × h`（傾き `k`）
+ *   3. 末尾（`f ≥ T − V − B`）: `endIndex = T` でクリップされ `startIndex = T − R`
+ *      になるため上スペーサは `E − R·h`（下スペーサ0px）。整理すると
+ *      `scrollTop = E − (T − f) × h`（傾き `h`）
+ *
+ * 3領域の式は境界で連続する（領域1と2は `f = B` で `B × h`、領域2と3は
+ * `f = T − V − B` で `E − (V + B) × h` を共有する）。全体として単調増加の
+ * 区分一次関数であり、逆写像も同じ3領域の場合分けで求まる。
+ *
+ * 領域1と3の傾きが `h`（実寸）で内側だけが `k`（圧縮）になるのは、レイアウト側の
+ * 都合そのものである。先頭・末尾ではスペーサが0pxへ張り付き、描画ブロックが
+ * 実寸のまま document の端に固定されるため、その範囲のスクロールは実寸で進む。
+ *
+ * @param {number} rowHeightPx
+ * @param {number} totalItems
+ * @param {number} viewportHeightPx
+ * @param {number} bufferRows
+ * @returns {ScaledScrollLayout}
+ */
+function computeScaledScrollLayout(rowHeightPx, totalItems, viewportHeightPx, bufferRows) {
+  const effectiveHeightPx = computeEffectiveTotalHeightPx(totalItems, rowHeightPx);
+  const visibleRowCount = Math.ceil(Math.max(0, viewportHeightPx) / rowHeightPx) + 1;
+  const bufferedRows = Math.max(0, bufferRows);
+  // 内側領域（先頭でも末尾でもクリップされない位置）での実描画行数。
+  const renderedRowCount = Math.min(totalItems, visibleRowCount + 2 * bufferedRows);
+  const remainingRows = totalItems - renderedRowCount;
+  const availableSpacerHeightPx = effectiveHeightPx - renderedRowCount * rowHeightPx;
+  // 実描画行だけで表示集合全体を覆う、または実描画行の高さだけで実効総高さを
+  // 使い切る極端な規模（行高が極端に大きい場合）。`computeSpacerHeightsForScroll`
+  // は上下とも0pxを返し、行が実寸で並ぶだけになるため、写像も実寸（傾き `h`）に
+  // 縮退させる。
+  const spacerless = remainingRows <= 0 || availableSpacerHeightPx <= 0;
+  return {
+    effectiveHeightPx,
+    visibleRowCount,
+    bufferedRows,
+    spacerless,
+    spacerPxPerRow: spacerless ? rowHeightPx : availableSpacerHeightPx / remainingRows,
+    headEndScrollTopPx: bufferedRows * rowHeightPx,
+    tailStartRowIndex: totalItems - visibleRowCount - bufferedRows,
+    tailStartScrollTopPx: effectiveHeightPx - (visibleRowCount + bufferedRows) * rowHeightPx,
+  };
+}
+
+/**
+ * スクロール位置から先頭行インデックスを求める（`computeScaledScrollLayout` の
+ * 3領域の逆写像）。クランプ・下限・上限の適用は呼び出し側が行う。
+ *
+ * @param {number} scrollTop
+ * @param {ScaledScrollLayout} layout
+ * @param {number} rowHeightPx
+ * @param {number} totalItems
+ * @returns {number}
+ */
+function scaledFirstVisibleRowForScrollTop(scrollTop, layout, rowHeightPx, totalItems) {
+  const clampedScrollTop = Math.max(0, scrollTop);
+  if (layout.spacerless || clampedScrollTop <= layout.headEndScrollTopPx) {
+    return Math.floor(clampedScrollTop / rowHeightPx);
+  }
+  if (clampedScrollTop >= layout.tailStartScrollTopPx) {
+    return Math.floor(
+      totalItems - (layout.effectiveHeightPx - clampedScrollTop) / rowHeightPx,
+    );
+  }
+  return (
+    Math.floor((clampedScrollTop - layout.headEndScrollTopPx) / layout.spacerPxPerRow) +
+    layout.bufferedRows
+  );
+}
+
+/**
+ * 先頭行インデックスから、その行が画面最上部へ来るスクロール位置を求める
+ * （`computeScaledScrollLayout` の3領域の順写像）。クランプの適用は呼び出し側が行う。
+ *
+ * @param {number} rowIndex
+ * @param {ScaledScrollLayout} layout
+ * @param {number} rowHeightPx
+ * @param {number} totalItems
+ * @returns {number}
+ */
+function scaledScrollTopForFirstVisibleRow(rowIndex, layout, rowHeightPx, totalItems) {
+  if (layout.spacerless || rowIndex <= layout.bufferedRows) {
+    return rowIndex * rowHeightPx;
+  }
+  if (rowIndex >= layout.tailStartRowIndex) {
+    return layout.effectiveHeightPx - (totalItems - rowIndex) * rowHeightPx;
+  }
+  return (
+    layout.spacerPxPerRow * (rowIndex - layout.bufferedRows) + layout.headEndScrollTopPx
+  );
+}
+
+/**
  * スクロール位置から、DOM に描画すべき行範囲（可視範囲＋前後バッファ）を計算
  * する（スクロール高クランプ対応版）。
  *
@@ -166,25 +339,32 @@ export function computeEffectiveTotalHeightPx(totalItems, rowHeightPx) {
  * 対応する従来方式）へそのまま委譲する（「クランプ未満の通常規模では従来の
  * 1:1方式を維持する」という設計判断。回帰を避ける）。
  *
- * 上限を超える場合は、スクロール座標をブラウザが実際に許容する範囲
- * （0 〜 `maxScrollTopPx`。呼び出し側が `viewport.scrollHeight -
- * viewport.clientHeight` から渡す）に対する比例（0〜1）とみなし、その比例を
- * 総行数に掛けて先頭行インデックスを決める比例写像を使う
- * （`selectChunksToEvict` 等と同じ「純粋関数として仕様を明記する」方針）。
+ * 上限を超える場合は、`computeSpacerHeightsForScroll` が構成するレイアウトの
+ * 逆写像（`computeScaledScrollLayout` の3領域）で先頭行インデックスを決める。
+ * 返す `startIndex` に対して `computeSpacerHeightsForScroll` が返す上スペーサを
+ * `topHeightPx` とすると、`scrollTop − topHeightPx` は「描画ブロックの先頭から
+ * 画面最上部までの画素数」であり、常に `(firstVisibleRow − startIndex) × rowHeightPx`
+ * と一致する。つまりここで求めた `firstVisibleRow` は、実際に画面最上部へ描画
+ * される行そのものである（Issue #33。当初はスクロール位置を `maxScrollTopPx`
+ * に対する比例とみなす別の一次式を使っており、スペーサ配分の一次式とわずかに
+ * 傾きが違ったため、2000万行規模で両者が最大46行ずれていた）。
  *
- * 比例写像は `scrollTop === maxScrollTopPx`（スクロールバーが末尾に到達した
- * 状態）で必ず表示集合の末尾（`endIndex === totalItems`）に到達することを
+ * `scrollTop === maxScrollTopPx`（スクロールバーが末尾に到達した状態）では、
+ * 3領域の式を経由せず先頭行インデックスを上限（`totalItems − visibleRowCount`）
+ * に固定し、必ず表示集合の末尾（`endIndex === totalItems`）へ到達することを
  * 保証する。クランプによる問題（2000万行規模でスクロールバー操作により実際に
  * ファイル末尾付近まで到達できない）の解消そのものが目的のため、末尾到達性を
- * 最優先する設計判断とした。
+ * 最優先する設計判断とした。式を経由しないのは、ブラウザが実際にレイアウトへ
+ * 反映した `scrollHeight` が実効総高さと厳密に一致しない場合でも、末尾到達性を
+ * 環境に依存させないためである。
  *
- * 一方、比例写像は `totalItems` が巨大な場合に浮動小数点演算による行
+ * 一方、この写像は `totalItems` が巨大な場合に浮動小数点演算による行
  * インデックスの微小な離散化誤差を伴う（同じ `scrollTop` でも、ブラウザ側の
  * scrollTop 丸めや totalItems の大きさにより、隣接ピクセルで指す行が1行程度
  * 前後することがある）。可変行高（前置和の再計算が必要）を避けた
  * `virtual_scroll.js` 冒頭のコメントの設計判断と同じ考え方で、可視範囲の
  * 連続性（スクロールで表示行が飛ばない・逆行しない）と末尾到達性を優先し、
- * 行単位の厳密なピクセル対応は求めない設計判断とした。
+ * 1行未満の厳密なピクセル対応は求めない設計判断とした。
  *
  * @param {Object} params
  * @param {number} params.scrollTop 現在のスクロール位置（px、0以上）。
@@ -224,10 +404,22 @@ export function computeVisibleRangeForScroll({
 
   let firstVisibleRow;
   if (maxScrollTopPx <= 0) {
+    // レイアウト未確定などでスクロールできない状態。常に先頭を描画する。
     firstVisibleRow = 0;
+  } else if (scrollTop >= maxScrollTopPx) {
+    // 末尾到達性の保証（JSDoc 参照）。式を経由せず上限へ固定する。
+    firstVisibleRow = maxFirstVisibleRow;
   } else {
-    const proportion = Math.min(1, Math.max(0, scrollTop / maxScrollTopPx));
-    firstVisibleRow = Math.min(maxFirstVisibleRow, Math.floor(proportion * totalItems));
+    const layout = computeScaledScrollLayout(
+      rowHeightPx,
+      totalItems,
+      viewportHeightPx,
+      bufferRows,
+    );
+    firstVisibleRow = Math.min(
+      maxFirstVisibleRow,
+      Math.max(0, scaledFirstVisibleRowForScrollTop(scrollTop, layout, rowHeightPx, totalItems)),
+    );
   }
 
   const startIndex = Math.max(0, firstVisibleRow - bufferRows);
@@ -483,6 +675,13 @@ export function computeSpacerHeights({
  * ふらつきの発生源そのものを消すため、可視範囲の位置によらず決定的に末尾へ
  * 到達できる。
  *
+ * この関数が返す `topHeightPx` は、描画ブロックの document 座標そのもの
+ * （＝先頭の描画行の上端の位置）であり、スクロール座標と行インデックスの
+ * 対応の唯一の基準である。`computeVisibleRangeForScroll`（逆写像）と
+ * `computeScrollTopForRowIndexScaled`（順写像）は、どちらもここでの配分から
+ * 導いており、独自の一次式を持たない（Issue #33）。この関数の配分規則を
+ * 変えるときは、`computeScaledScrollLayout` の3領域の式も同時に見直す。
+ *
  * @param {Object} params
  * @param {number} params.startIndex 描画している先頭行インデックス。
  * @param {number} params.endIndex 描画している終端行インデックス（含まない）。
@@ -601,18 +800,37 @@ export function computeScrollTopForRowIndex(rowIndex, rowHeightPx) {
  * 通常規模では `computeScrollTopForRowIndex`（従来の1:1方式）へそのまま委譲
  * する（回帰を避ける設計判断）。
  *
- * 上限を超える場合は `computeVisibleRangeForScroll` が使う比例写像
- * （スクロール位置の比例 → 行インデックス）の逆変換（行インデックス →
- * 比例 → スクロール位置）を使う。往復（行インデックス→スクロール位置→
- * `computeVisibleRangeForScroll` で先頭行インデックスを再計算）は、比例
- * 写像に伴う微小な離散化誤差（`computeVisibleRangeForScroll` のコメント
- * 参照）の範囲内で一致する。
+ * 上限を超える場合は、`computeSpacerHeightsForScroll` が構成するレイアウトの
+ * 順写像（`computeScaledScrollLayout` の3領域）を使う。これは
+ * `computeVisibleRangeForScroll` が使う逆写像と同一のレイアウトから導いた
+ * ものであり、往復（行インデックス→スクロール位置→
+ * `computeVisibleRangeForScroll` で先頭行インデックスを再計算）は、
+ * 浮動小数点の丸めに由来する1行未満の誤差の範囲内で一致する。
+ *
+ * 順写像へ通すのは目標行そのものではなく `JUMP_CONTEXT_ROWS` 行手前であり、
+ * 指定した行は画面最上部からその行数ぶん下（＋1行未満の誤差）に来る。実機
+ * （WebView2）が 10^7 px 級の座標を量子化することへの頑健化であり、理由と実測は
+ * `JUMP_CONTEXT_ROWS` の JSDoc に書いた。表示集合の先頭側（目標行が
+ * `JUMP_CONTEXT_ROWS` 行未満）ではスクロール位置を0より手前へは動かせないため、
+ * 目標行は上端からちょうどその行数ぶん下（＝行インデックスと同じ位置）に来る。
+ *
+ * 当初は「行インデックス / 総行数 × `maxScrollTopPx`」という、スペーサ配分とは
+ * 別の一次式を使っていた。傾きがわずかに違うため、2000万行規模で目標行が
+ * 画面最上部より最大46行ぶん上（＝画面外）になっていた（Issue #33）。
+ *
+ * 末尾付近（残り1画面ぶん）の行を指定した場合、スクロール位置は
+ * `maxScrollTopPx` で頭打ちになるため、目標行は画面最上部ではなく画面内の
+ * どこかに来る。これはブラウザのスクロール範囲そのものの制約であり、
+ * Ctrl+End（`scrollTop = scrollHeight`）と同じ状態である。
  *
  * @param {number} rowIndex
  * @param {number} rowHeightPx
  * @param {number} totalItems
  * @param {number} maxScrollTopPx ブラウザの実際の最大スクロール位置
  *   （`viewport.scrollHeight - viewport.clientHeight`）。0以下なら常に0を返す。
+ * @param {number} [bufferRows] 可視範囲の前後に確保するバッファ行数。
+ *   `computeVisibleRangeForScroll` へ渡している値と同じものを渡す。省略時は
+ *   `DEFAULT_BUFFER_ROWS`（同定数の JSDoc 参照）。
  * @returns {number}
  */
 export function computeScrollTopForRowIndexScaled(
@@ -620,6 +838,7 @@ export function computeScrollTopForRowIndexScaled(
   rowHeightPx,
   totalItems,
   maxScrollTopPx,
+  bufferRows = DEFAULT_BUFFER_ROWS,
 ) {
   if (!isHeightScalingActive(totalItems, rowHeightPx)) {
     return computeScrollTopForRowIndex(rowIndex, rowHeightPx);
@@ -627,7 +846,30 @@ export function computeScrollTopForRowIndexScaled(
   if (totalItems <= 0 || maxScrollTopPx <= 0) {
     return 0;
   }
+  const effectiveHeightPx = computeEffectiveTotalHeightPx(totalItems, rowHeightPx);
+  // ビューポートの表示高さは引数で渡されないため、`maxScrollTopPx`
+  // （= scrollHeight − clientHeight）と実効総高さの差として復元する。
+  // `computeSpacerHeightsForScroll` が総高さを実効総高さへ厳密に固定している
+  // ため、ブラウザが返す scrollHeight は実効総高さに一致する。
+  const viewportHeightPx = Math.max(0, effectiveHeightPx - maxScrollTopPx);
+  const layout = computeScaledScrollLayout(
+    rowHeightPx,
+    totalItems,
+    viewportHeightPx,
+    bufferRows,
+  );
   const clampedRowIndex = Math.min(Math.max(0, rowIndex), totalItems);
-  const proportion = clampedRowIndex / totalItems;
-  return Math.min(maxScrollTopPx, Math.max(0, proportion * maxScrollTopPx));
+  // 目標行そのものではなく `JUMP_CONTEXT_ROWS` 行手前を先頭行として順写像へ通し、
+  // 目標行を上端から数行下に置く。実機（WebView2）が 10^7 px 級の座標を量子化する
+  // ことへの頑健化余裕であり、理由は `JUMP_CONTEXT_ROWS` の JSDoc に書いた。
+  // 表示集合の先頭側では余裕を取れないが、その範囲は上スペーサが0pxで座標値も
+  // 小さく、量子化の影響を受けない。
+  const anchorRowIndex = Math.max(0, clampedRowIndex - JUMP_CONTEXT_ROWS);
+  const scrollTop = scaledScrollTopForFirstVisibleRow(
+    anchorRowIndex,
+    layout,
+    rowHeightPx,
+    totalItems,
+  );
+  return Math.min(maxScrollTopPx, Math.max(0, scrollTop));
 }

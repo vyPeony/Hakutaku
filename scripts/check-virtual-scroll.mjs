@@ -5,7 +5,8 @@
 //
 //   1. スクロール高さのクランプ（`MAX_TOTAL_HEIGHT_PX`）
 //   2. クランプ超過時の比例写像（スクロール座標 ↔ 行インデックス）
-//   3. 保持上限（`CFG-022`）に基づく破棄判定（`PERF-012`）
+//   3. 行番号ジャンプと実際の描画位置の一致（画素座標側の不変条件。Issue #33）
+//   4. 保持上限（`CFG-022`）に基づく破棄判定（`PERF-012`）
 //
 // 段階0の実測（`docs/verification/stage0-results.md` 2.3節・10節）で実際に起きた
 // 退行——保持行数が上限を一時的に超える、2000万行規模でスクロールの末尾へ到達
@@ -28,6 +29,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
+  DEFAULT_BUFFER_ROWS,
+  JUMP_CONTEXT_ROWS,
   MAX_TOTAL_HEIGHT_PX,
   computeChunkRange,
   computeEffectiveTotalHeightPx,
@@ -236,13 +239,18 @@ function checkVisibleRangeOneToOne() {
 // 3. 比例写像（クランプ超過時の可視範囲）
 // ---------------------------------------------------------------------------
 //
-// 仕様（`computeVisibleRangeForScroll` の JSDoc）:
+// 仕様（`computeVisibleRangeForScroll`・`computeScaledScrollLayout` の JSDoc）:
 //   クランプ未満 → `computeVisibleRange` へそのまま委譲（挙動を変えない）
-//   クランプ超過 →
-//     proportion      = min(1, max(0, scrollTop / maxScrollTopPx))
-//     visibleRowCount = ceil(max(0, viewportHeightPx) / rowHeightPx) + 1
-//     firstVisibleRow = min(totalItems − visibleRowCount, floor(proportion × totalItems))
-//     （maxScrollTopPx ≤ 0 なら firstVisibleRow = 0）
+//   クランプ超過 → `computeSpacerHeightsForScroll` が構成するレイアウトの逆写像。
+//     T=総行数 h=行高 B=バッファ行数 E=実効総高さ C=ビューポート高
+//     V = ceil(max(0, C) / h) + 1            （可視行数）
+//     k = (E − (V + 2B)·h) / (T − (V + 2B))  （内側での未描画1行あたりの高さ）
+//     先頭行 f に対する正準スクロール位置 S(f) は3領域の区分一次関数:
+//       頭部 f ≤ B          : S = f·h
+//       内側 B < f < T−V−B  : S = k·(f − B) + B·h
+//       末尾 f ≥ T−V−B      : S = E − (T − f)·h
+//     firstVisibleRow は S の逆写像（各領域で floor）を 0〜(T − V) へ切り詰めた値。
+//     （maxScrollTopPx ≤ 0 なら 0、scrollTop ≥ maxScrollTopPx なら T − V に固定）
 //   かつ「scrollTop === maxScrollTopPx で必ず endIndex === totalItems に到達する」
 //   ことを保証すると明記されている。以下の期待値はこの式と保証から導いた。
 
@@ -282,13 +290,21 @@ function checkProportionalMapping() {
     20_000_000,
   );
 
-  // 中央: 23,998,920 / 2 = 11,999,460 → proportion = 0.5 →
-  //   floor(0.5 × 20,000,000) = 10,000,000 → {9,999,950, 10,000,101}。
+  // 中央: scrollTop = 23,998,920 / 2 = 11,999,460。頭部の境界（B·h = 1,100）より
+  //   大きく、末尾の境界（E − (V + B)·h = 24,000,000 − 2,222 = 23,997,778）より
+  //   小さいので内側領域。逆写像は floor((scrollTop − 1,100) / k) + 50 で、
+  //   k = (24,000,000 − 151 × 22) / (20,000,000 − 151) = 23,996,678 / 19,999,849。
+  //     (11,999,460 − 1,100) × 19,999,849 / 23,996,678
+  //       = 239,965,388,247,640 / 23,996,678
+  //       = 10,000,000 − 1,391,752,360 / 23,996,678 = 10,000,000 − 57.997…
+  //       = 9,999,942.002…  → floor = 9,999,942
+  //   firstVisibleRow = 9,999,942 + 50 = 9,999,992。
+  //   startIndex = 9,999,992 − 50、endIndex = 9,999,992 + 51 + 50。
   expectRange(
     "比例写像: 中央（2000万行）",
     scaledRange(HUGE_MAX_SCROLL_TOP_PX / 2),
-    9_999_950,
-    10_000_101,
+    9_999_942,
+    10_000_093,
   );
 
   // 範囲外のスクロール位置は proportion を 0〜1 に切り詰める。
@@ -384,20 +400,29 @@ function checkProportionalMapping() {
   check("比例写像: 可視範囲が常に 0 ≤ start ≤ end ≤ 総行数（513点）", boundsOk);
 
   // 往復（行インデックス → スクロール位置 → 行インデックス）。
-  // `computeScrollTopForRowIndexScaled` の JSDoc は「比例写像に伴う微小な離散化
-  // 誤差の範囲内で一致する」と定めている。誤差の上界は仕様から導ける:
-  // scrollTop = (row / total) × maxScrollTop を戻すと proportion は row / total に
-  // 浮動小数点の丸め分だけ届かないことがあり、floor が1行だけ手前を指す。
-  // したがって許容差は1行。バッファを0にして startIndex = firstVisibleRow とする。
+  // `computeScrollTopForRowIndexScaled` は目標行そのものではなく
+  // `JUMP_CONTEXT_ROWS` 行手前を先頭行として順写像へ通す（同定数の JSDoc）ため、
+  // 戻ってくる先頭行は max(0, 行 − JUMP_CONTEXT_ROWS) である。
+  // 誤差の上界は仕様から導ける: S(f) を戻すときの floor は、除算の丸め分だけ
+  // 1行手前を指すことがある。したがって許容差は1行。両方の写像へ同じバッファ
+  // 行数（ここでは0）を渡す。0にするのは startIndex = firstVisibleRow となり
+  // 比較が直接書けるためで、実運用の動作点（50行）での一致は「ジャンプと描画
+  // 位置の一致」で検査する。
   for (const rowIndex of [0, 1, 12_345, 10_000_000, 19_000_000, HUGE_MAX_FIRST_ROW]) {
     const scrollTop = computeScrollTopForRowIndexScaled(
       rowIndex,
       ROW_HEIGHT_PX,
       HUGE_TOTAL_ITEMS,
       HUGE_MAX_SCROLL_TOP_PX,
+      0,
     );
     const range = scaledRange(scrollTop, { bufferRows: 0 });
-    expectNear(`比例写像: 往復で同じ行へ戻る（行 ${rowIndex}）`, range.startIndex, rowIndex, 1);
+    expectNear(
+      `比例写像: 往復で文脈行ぶん手前の行へ戻る（行 ${rowIndex}）`,
+      range.startIndex,
+      Math.max(0, rowIndex - JUMP_CONTEXT_ROWS),
+      1,
+    );
   }
 
   // ジャンプ位置は 0 〜 maxScrollTopPx に収まる（範囲外の行番号を渡しても
@@ -543,7 +568,288 @@ function checkSpacerHeights() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. 破棄判定（保持上限 `CFG-022`、`PERF-012`）
+// 5. 行番号ジャンプと描画位置の一致（Issue #33）
+// ---------------------------------------------------------------------------
+//
+// 3節は可視範囲の写像を、4節はスペーサ配分を、それぞれ単独で検査している。
+// Issue #33 の不具合は、両者が個別には当時の仕様どおりでも、互いに別の一次式
+// だったために起きた。行番号ジャンプで求めたスクロール位置に対してスペーサが
+// 配る描画ブロックの上端がずれ、目標行が画面の外（2000万行では上方23行、
+// 最大で46行）へ出ていた。行インデックスの往復（3節）は両者を組み合わせないため
+// このずれを検出できない。そこでここでは、2つの写像を組み合わせた結果——実際に
+// 画面へ出る画素の位置——だけを検査する。
+//
+// 仕様（`computeSpacerHeightsForScroll` の JSDoc）:
+//   上スペーサの高さ = 描画ブロックの document 座標（先頭の描画行の上端の位置）
+// したがって、あるスクロール位置で画面最上部に来る行は
+//   topRow = startIndex + (scrollTop − topHeightPx) / rowHeightPx
+// であり、これが `computeVisibleRangeForScroll` の firstVisibleRow と一致すること
+// （2つの写像が同一のレイアウトから導かれること）が統一後の仕様である。以下は
+// この等式から導かれる2つの帰結を検査する。
+//
+//   (a) ジャンプした目標行が描画ウィンドウ内に入り、かつ画面上端から
+//       `JUMP_CONTEXT_ROWS` 行ぶん下（逆写像の floor による1行未満の誤差を許す）
+//       に来ること。目標行が `JUMP_CONTEXT_ROWS` 行未満の先頭側では、スクロール
+//       位置を0より手前へ動かせないため上端から「行インデックスぶん下」になる。
+//       末尾1画面ぶんの行はスクロール位置が maxScrollTopPx で頭打ちになるため、
+//       位置は指定できず「行全体が画面内」だけを期待する。いずれの場合も
+//       「行全体が画面内」は共通の期待とする（利用者から見える保証そのもの）
+//   (b) 画素側の不変条件。startIndex > 0（先頭でクリップされていない）なら
+//       scrollTop − topHeightPx は必ず bufferRows × rowHeightPx 以上であり、
+//       上界は (V + B) × h − C = 101 × 22 − 1,080 = 1,142px（scrollTop が
+//       maxScrollTopPx のとき、先頭行が上限 T − V へ固定されて最大になる）
+//
+// あわせて、スクロールアンカリングの自走（Issue #21）が再発しないための性質——
+// 同じ scrollTop に対してスペーサ高さが安定し、描画後の総高さから読み直した
+// maxScrollTopPx で再計算しても同じ描画ウィンドウになること——も検査する。
+
+// Issue #33 が実測を挙げた5つの規模。いずれも totalItems × 22px が
+// 24,000,000px を超えるため、比例写像の経路を通る。
+const SCALED_TOTALS = [2_000_000, 2_500_000, 5_000_000, 10_000_000, 20_000_000];
+
+// 画素比較の許容差。位置の計算は除算を2回しか含まず、値の大きさは 24,000,000px
+// 前後（倍精度の刻みは約4e-9px）なので、丸め誤差の上界は1e-8px 程度。1e-6px は
+// それを2桁上回る余裕であり、検出したい「ずれ」（最小でも1行 = 22px）よりは
+// 7桁小さいため、退行は確実に捉えられる。
+const PIXEL_TOLERANCE = 1e-6;
+
+/** 指定した規模での動作点（実効総高さと、ブラウザが返す最大スクロール位置）。 */
+function scaledOperatingPoint(totalItems) {
+  const effectiveHeightPx = computeEffectiveTotalHeightPx(totalItems, ROW_HEIGHT_PX);
+  return {
+    totalItems,
+    effectiveHeightPx,
+    maxScrollTopPx: effectiveHeightPx - VIEWPORT_HEIGHT_PX,
+  };
+}
+
+/**
+ * あるスクロール位置で実装が実際に構成する描画結果を、公開関数だけから組み立てる
+ * （`log_view.js` の `renderVisibleRows` が DOM へ設定する内容と同じ組み合わせ）。
+ * `topRow` は画面最上部に来る行（端数を含む実数）。
+ */
+function renderedAt(scale, scrollTop, maxScrollTopPx = scale.maxScrollTopPx) {
+  const range = computeVisibleRangeForScroll({
+    scrollTop,
+    maxScrollTopPx,
+    viewportHeightPx: VIEWPORT_HEIGHT_PX,
+    rowHeightPx: ROW_HEIGHT_PX,
+    totalItems: scale.totalItems,
+    bufferRows: BUFFER_ROWS,
+  });
+  const spacers = computeSpacerHeightsForScroll({
+    startIndex: range.startIndex,
+    endIndex: range.endIndex,
+    totalItems: scale.totalItems,
+    rowHeightPx: ROW_HEIGHT_PX,
+  });
+  const renderedHeightPx = (range.endIndex - range.startIndex) * ROW_HEIGHT_PX;
+  const offsetPx = scrollTop - spacers.topHeightPx;
+  return {
+    range,
+    spacers,
+    offsetPx,
+    topRow: range.startIndex + offsetPx / ROW_HEIGHT_PX,
+    totalHeightPx: spacers.topHeightPx + spacers.bottomHeightPx + renderedHeightPx,
+  };
+}
+
+function checkJumpAlignment() {
+  // 上界 1,142px の導出（4節の動作点と同じ V = 51、B = 50、h = 22、C = 1,080）。
+  const maxOffsetPx = (VISIBLE_ROW_COUNT + BUFFER_ROWS) * ROW_HEIGHT_PX - VIEWPORT_HEIGHT_PX;
+  expectEqual("ジャンプ: 画素オフセットの上界（(51+50)×22−1,080）", maxOffsetPx, 1_142);
+  // 文脈行の余裕は、実機の量子化ずれ（±1.3行程度）を吸収しつつジャンプ先の
+  // 視認性を損なわない値として2行に決めた（`JUMP_CONTEXT_ROWS` の JSDoc）。
+  // 期待値をこの定数から組み立てるため、値そのものも表明しておく。
+  expectEqual("ジャンプ: 文脈行の余裕は2行", JUMP_CONTEXT_ROWS, 2);
+
+  for (const totalItems of SCALED_TOTALS) {
+    const label = totalItems.toLocaleString("en-US");
+    const scale = scaledOperatingPoint(totalItems);
+    check(
+      `ジャンプ: ${label}行では比例写像が有効（前提）`,
+      isHeightScalingActive(totalItems, ROW_HEIGHT_PX),
+      `理論高さ ${totalItems * ROW_HEIGHT_PX} / 上限 ${MAX_TOTAL_HEIGHT_PX}`,
+    );
+
+    // (a) 代表的な行番号ジャンプ。先頭付近（文脈行とバッファ境界の前後）、中央、
+    //     Issue #33 がずれの実測を挙げた 3/4 付近、末尾領域の境界、末尾。
+    const quarter = Math.floor(totalItems / 4);
+    const threeQuarters = Math.floor((totalItems * 3) / 4);
+    const tailStartRow = totalItems - VISIBLE_ROW_COUNT - BUFFER_ROWS;
+    // 目標行の位置を指定できるのは、順写像へ通す先頭行
+    // （max(0, 目標行 − JUMP_CONTEXT_ROWS)）のスクロール位置がスクロール範囲に
+    // 収まる場合だけである。末尾領域の式 S(a) = E − (T − a)·h が
+    // maxScrollTopPx = E − C 以下になる条件は (T − a)·h ≥ C、すなわち
+    // a ≤ T − ceil(C / h) = T − 50。a = 目標行 − JUMP_CONTEXT_ROWS なので、
+    // 目標行 ≤ T − 50 + 2 = T − 48。これより後ろの行（末尾1画面ぶん）は
+    // スクロールが頭打ちになるため「行全体が画面内」だけを期待する。
+    // 実装が返す scrollTop ではなく仕様から決めるのは、頭打ちの判定そのものを
+    // 実装に委ねると、頭打ちにしない実装を見逃してしまうため。
+    const lastPlaceableTarget =
+      totalItems - Math.ceil(VIEWPORT_HEIGHT_PX / ROW_HEIGHT_PX) + JUMP_CONTEXT_ROWS;
+    const targets = [
+      // 0〜3 は文脈行の余裕を取れない／取れるようになる境界（JUMP_CONTEXT_ROWS = 2）。
+      0,
+      1,
+      JUMP_CONTEXT_ROWS,
+      JUMP_CONTEXT_ROWS + 1,
+      BUFFER_ROWS - 1,
+      BUFFER_ROWS,
+      BUFFER_ROWS + 1,
+      1_000,
+      quarter,
+      Math.floor(totalItems / 2),
+      threeQuarters - 1,
+      threeQuarters,
+      tailStartRow - 1,
+      tailStartRow,
+      totalItems - VISIBLE_ROW_COUNT,
+      totalItems - 1,
+    ];
+
+    let outsideWindow = null;
+    // ずれは規模と行位置によって大きさが変わるため、最初の1件ではなく最大の
+    // 1件を残す（Issue #33 の特徴である「末尾へ向かうほど広がるずれ」が、
+    // 失敗時のメッセージからそのまま読み取れるようにする）。
+    let notAtContext = null;
+    let notAtContextPx = 0;
+    let notFullyVisible = null;
+    for (const target of targets) {
+      const scrollTop = computeScrollTopForRowIndexScaled(
+        target,
+        ROW_HEIGHT_PX,
+        totalItems,
+        scale.maxScrollTopPx,
+        BUFFER_ROWS,
+      );
+      const rendered = renderedAt(scale, scrollTop);
+      // 目標行の上端・下端の、ビューポート上端からの画素距離。
+      const rowTopPx = (target - rendered.topRow) * ROW_HEIGHT_PX;
+      const rowBottomPx = rowTopPx + ROW_HEIGHT_PX;
+      if (target < rendered.range.startIndex || target >= rendered.range.endIndex) {
+        outsideWindow ??= `行 ${target} は描画ウィンドウ ${format(rendered.range)} の外`;
+      }
+      if (target <= lastPlaceableTarget) {
+        // 目標行の位置を指定できる範囲。期待は「上端から JUMP_CONTEXT_ROWS 行
+        // ぶん下」だが、先頭側（目標行 < JUMP_CONTEXT_ROWS）はスクロール位置を
+        // 0より手前へ動かせないため「上端から行インデックスぶん下」になる。
+        // 逆写像の floor による端数（1行未満）だけさらに下へずれることは許す。
+        const expectedTopPx = Math.min(target, JUMP_CONTEXT_ROWS) * ROW_HEIGHT_PX;
+        const deviationPx = rowTopPx - expectedTopPx;
+        if (
+          !(deviationPx >= -PIXEL_TOLERANCE && deviationPx < ROW_HEIGHT_PX) &&
+          Math.abs(deviationPx) > notAtContextPx
+        ) {
+          notAtContextPx = Math.abs(deviationPx);
+          notAtContext =
+            `行 ${target} は上端から ${rowTopPx.toFixed(1)}px（期待 ${expectedTopPx}px）で、` +
+            `${(deviationPx / ROW_HEIGHT_PX).toFixed(1)} 行ずれている`;
+        }
+      }
+      // 行全体が画面内（0px 〜 1,080px）に収まることは、位置を指定できるかどうかに
+      // よらず共通の期待。末尾1画面ぶんではこれだけが保証される。
+      if (
+        !(
+          rowTopPx >= -PIXEL_TOLERANCE &&
+          rowBottomPx <= VIEWPORT_HEIGHT_PX + PIXEL_TOLERANCE
+        )
+      ) {
+        notFullyVisible ??= `行 ${target} は上端 ${rowTopPx.toFixed(3)}px・下端 ${rowBottomPx.toFixed(3)}px で画面外`;
+      }
+    }
+    check(`ジャンプ: 目標行が描画ウィンドウ内（${label}行）`, outsideWindow === null, outsideWindow);
+    check(
+      `ジャンプ: 目標行が上端から${JUMP_CONTEXT_ROWS}行下（誤差1行未満。${label}行）`,
+      notAtContext === null,
+      notAtContext,
+    );
+    check(
+      `ジャンプ: 目標行の全体が画面内（${label}行）`,
+      notFullyVisible === null,
+      notFullyVisible,
+    );
+
+    // (b) 画素側の不変条件と、再描画に対する安定性。スクロール範囲全体を
+    //     等間隔（先頭・末尾を含む257点）で走査する。
+    let offsetOutOfRange = null;
+    let offsetBelowBuffer = null;
+    let heightDrift = null;
+    let unstable = null;
+    let regressed = null;
+    let previousStart = -1;
+    const sampleCount = 256;
+    for (let step = 0; step <= sampleCount; step += 1) {
+      const scrollTop = (scale.maxScrollTopPx * step) / sampleCount;
+      const rendered = renderedAt(scale, scrollTop);
+      if (
+        !(
+          rendered.offsetPx >= -PIXEL_TOLERANCE &&
+          rendered.offsetPx <= maxOffsetPx + PIXEL_TOLERANCE
+        )
+      ) {
+        offsetOutOfRange ??= `scrollTop=${scrollTop} で ${rendered.offsetPx}px（許容 0〜${maxOffsetPx}px）`;
+      }
+      if (
+        rendered.range.startIndex > 0 &&
+        rendered.offsetPx < BUFFER_ROWS * ROW_HEIGHT_PX - PIXEL_TOLERANCE
+      ) {
+        offsetBelowBuffer ??= `scrollTop=${scrollTop} で ${rendered.offsetPx}px（下限 ${BUFFER_ROWS * ROW_HEIGHT_PX}px）`;
+      }
+      if (Math.abs(rendered.totalHeightPx - scale.effectiveHeightPx) > PIXEL_TOLERANCE) {
+        heightDrift ??= `scrollTop=${scrollTop} で総高さ ${rendered.totalHeightPx}`;
+      }
+      // 描画後の総高さから maxScrollTopPx を読み直しても同じ描画ウィンドウに
+      // なること（`log_view.js` の `computeCurrentRenderTargets` は毎回
+      // DOM の scrollHeight/clientHeight から読み直す）。ここが崩れると、
+      // 再描画のたびに描画位置が動き続ける（Issue #21 の自走）。
+      const reread = renderedAt(
+        scale,
+        scrollTop,
+        rendered.totalHeightPx - VIEWPORT_HEIGHT_PX,
+      );
+      if (
+        reread.range.startIndex !== rendered.range.startIndex ||
+        reread.range.endIndex !== rendered.range.endIndex ||
+        reread.spacers.topHeightPx !== rendered.spacers.topHeightPx
+      ) {
+        unstable ??= `scrollTop=${scrollTop} で ${format(rendered.range)} → ${format(reread.range)}`;
+      }
+      if (rendered.range.startIndex < previousStart) {
+        regressed ??= `scrollTop=${scrollTop} で ${previousStart} → ${rendered.range.startIndex}`;
+      }
+      previousStart = rendered.range.startIndex;
+    }
+    check(
+      `ジャンプ: scrollTop − 上スペーサが 0〜${maxOffsetPx}px（257点。${label}行）`,
+      offsetOutOfRange === null,
+      offsetOutOfRange,
+    );
+    check(
+      `ジャンプ: 先頭でクリップされていなければ scrollTop − 上スペーサ ≥ バッファ高（257点。${label}行）`,
+      offsetBelowBuffer === null,
+      offsetBelowBuffer,
+    );
+    check(
+      `ジャンプ: 総高さが実効総高さのまま動かない（257点。${label}行）`,
+      heightDrift === null,
+      heightDrift,
+    );
+    check(
+      `ジャンプ: 再描画で描画ウィンドウとスペーサが変わらない（257点。${label}行）`,
+      unstable === null,
+      unstable,
+    );
+    check(
+      `ジャンプ: スクロールに対して可視範囲が逆行しない（257点。${label}行）`,
+      regressed === null,
+      regressed,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 6. 破棄判定（保持上限 `CFG-022`、`PERF-012`）
 // ---------------------------------------------------------------------------
 //
 // 仕様（`selectChunksToEvict` の JSDoc）:
@@ -738,7 +1044,7 @@ function checkEviction() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. 必要チャンクの選定（表示範囲と破棄判定をつなぐ部分）
+// 7. 必要チャンクの選定（表示範囲と破棄判定をつなぐ部分）
 // ---------------------------------------------------------------------------
 //
 // 仕様（`computeRequiredChunkIndices`・`computeChunkRange` の JSDoc）:
@@ -781,7 +1087,7 @@ function checkRequiredChunks() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. 前提の同期（`src/log_view.js` の動作点）
+// 8. 前提の同期（`src/log_view.js` の動作点）
 // ---------------------------------------------------------------------------
 //
 // 上の境界値は `log_view.js` の定数（行高22px、チャンク512行、バッファ50行）を
@@ -798,6 +1104,17 @@ function checkPremises() {
   expectEqual("前提: log_view.js の ROW_HEIGHT_PX", readConstant("ROW_HEIGHT_PX"), ROW_HEIGHT_PX);
   expectEqual("前提: log_view.js の CHUNK_SIZE", readConstant("CHUNK_SIZE"), CHUNK_SIZE);
   expectEqual("前提: log_view.js の BUFFER_ROWS", readConstant("BUFFER_ROWS"), BUFFER_ROWS);
+
+  // `handleJumpRequest` は `computeScrollTopForRowIndexScaled` へバッファ行数を
+  // 渡していないため、既定値（`DEFAULT_BUFFER_ROWS`）が使われる。この既定値が
+  // `log_view.js` の `BUFFER_ROWS` とずれると、比例写像が有効な規模でジャンプ
+  // 位置が静かにずれる（バッファ行数1行あたり約2行、50行ずれれば約95行）。
+  // 5節の検査は動作点の値を明示的に渡しているため、このずれは検出できない。
+  expectEqual(
+    "前提: log_view.js の BUFFER_ROWS と virtual_scroll.js の DEFAULT_BUFFER_ROWS が一致",
+    DEFAULT_BUFFER_ROWS,
+    readConstant("BUFFER_ROWS"),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -808,6 +1125,7 @@ checkHeightClamp();
 checkVisibleRangeOneToOne();
 checkProportionalMapping();
 checkSpacerHeights();
+checkJumpAlignment();
 checkEviction();
 checkRequiredChunks();
 checkPremises();
@@ -822,5 +1140,5 @@ if (problems.length > 0) {
 }
 
 console.log(
-  `仮想スクロールの規模依存ロジック（クランプ、比例写像、破棄判定）を ${checkCount} 項目検査しました。問題はありません。`,
+  `仮想スクロールの規模依存ロジック（クランプ、比例写像、ジャンプと描画位置の一致、破棄判定）を ${checkCount} 項目検査しました。問題はありません。`,
 );
