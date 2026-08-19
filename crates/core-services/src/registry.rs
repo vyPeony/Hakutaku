@@ -28,6 +28,11 @@
 //!   毎回の範囲取得で開き直します（ファイルハンドルを長期保持しない設計。
 //!   Windows の共有可オープンであれば頻繁な開閉のコストは軽微であり、
 //!   共有違反・削除の検知が範囲取得のたびに自然に効くという利点があります）。
+//! - 読み出しバッファとデコードは、この経路で最も大きな確保です。確保の前に
+//!   メモリ予算へ予約し（`PERF-010`、Issue #32。見積もりは
+//!   [`hydrate_group_peak_bytes`]）、拒否されたらその項目群だけを既定値
+//!   （空の本文）で返して応答は継続します（下の `ERR-001` と同じ扱い。
+//!   [`DisplaySetRegistry::hydrate_source_group`] の doc コメント参照）。
 //! - デコード済みチャンクの有界キャッシュ（[`crate::chunk_cache::
 //!   DecodedChunkCache`]）が、繰り返しアクセスのコストを抑えます。要求した
 //!   項目群がキャッシュ済みチャンクへ完全に包含される場合もヒットします
@@ -383,8 +388,19 @@ fn build_rebuilt_source_containers(
 
 /// 表示集合レジストリです。`display_set_id`・`source_id` はレジストリ内で一意な
 /// 連番で払い出します。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DisplaySetRegistry {
+    /// このレジストリが `PERF-008`・`PERF-010` の予約に使うメモリ予算です。
+    ///
+    /// 実行時は必ず [`hakutaku_memory_accounting::global_budget`]（プロセス
+    /// 全体で共有する唯一の予算）を指します。フィールドとして持つのは、予約の
+    /// 拒否が起きたときの縮退（統合表示の無効化・本文の既定値応答）を、
+    /// グローバル予算を壊さずにテストから再現できるようにするためです
+    /// （[`Self::with_memory_budget`]）。読み込み経路（`crate::item`・
+    /// `crate::line_index`）とデコード済みチャンクキャッシュは従来どおり
+    /// グローバル予算を直接使うため、注入した予算はレジストリ自身が行う予約
+    /// （統合表示の参照列・オンデマンド読み出し）にだけ効きます。
+    memory_budget: &'static hakutaku_memory_accounting::MemoryBudget,
     next_source_id: u32,
     next_display_set_id: u32,
     /// ADR-0008 の `source_ordinal` を払い出す単調増加カウンター
@@ -404,10 +420,38 @@ pub struct DisplaySetRegistry {
     hydrate_fallback_items: u64,
 }
 
+/// `#[derive(Default)]` は使えません（`memory_budget` は参照であり、参照には
+/// [`Default`] が無いため）。[`DisplaySetRegistry::new`] へ委譲して、既定の
+/// レジストリが常にグローバル予算を指すようにします。
+impl Default for DisplaySetRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DisplaySetRegistry {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_budget(hakutaku_memory_accounting::global_budget())
+    }
+
+    /// テスト専用の入口です。レジストリ自身の予約（統合表示の参照列・
+    /// オンデマンド読み出し）だけを、注入した予算で判定させます
+    /// （`memory_budget` フィールドの doc コメント参照）。
+    ///
+    /// 予算は `&'static` である必要があるため、テストでは
+    /// `Box::leak(Box::new(MemoryBudget::new(..)))` で作ります（テストごとに
+    /// 独立したインスタンスになり、グローバル予算にも他のテストにも影響しま
+    /// せん）。
+    #[cfg(test)]
+    #[must_use]
+    fn with_memory_budget(budget: &'static hakutaku_memory_accounting::MemoryBudget) -> Self {
+        Self::with_budget(budget)
+    }
+
+    fn with_budget(memory_budget: &'static hakutaku_memory_accounting::MemoryBudget) -> Self {
         DisplaySetRegistry {
+            memory_budget,
             next_source_id: 0,
             next_display_set_id: 0,
             next_source_ordinal: 0,
@@ -1055,8 +1099,9 @@ impl DisplaySetRegistry {
     /// 「再読み込みなしの切り替え」）。既に登録済みの各ソースの
     /// [`IndexedText`] を読むだけです。
     ///
-    /// 参照列（`(source_id, seq)` の並び）の確保が [`hakutaku_memory_accounting::
-    /// global_budget`] の予約（`PERF-008`）で拒否された場合、統合表示集合を
+    /// 参照列（`(source_id, seq)` の並び）の構築が、メモリ予算
+    /// （実行時は [`hakutaku_memory_accounting::global_budget`]。`memory_budget`
+    /// フィールド参照）への予約（`PERF-008`）で拒否された場合、統合表示集合を
     /// 開始せず `Err` を返します。
     pub fn enable_merged_view(
         &mut self,
@@ -1098,6 +1143,11 @@ impl DisplaySetRegistry {
     /// （`ItemId` の並び）を構築します。予約が拒否された場合は統合表示を
     /// 開始（または継続）せず `Err` を返します（`crate::merge` のモジュール
     /// doc コメント参照）。
+    ///
+    /// 予約量は構築中のピーク（並べ替え用の一時列と結果列が同時に生存する分。
+    /// [`merge::reserve_merged_order`] の doc コメント）で取り、構築後に残る
+    /// のは結果列だけなので、その分だけを実確保へ振り替えて残りはトークンの
+    /// 破棄で返します（ADR-0003）。
     fn compute_merged_order(
         &self,
     ) -> Result<Vec<ItemId>, hakutaku_memory_accounting::ReservationRejected> {
@@ -1119,11 +1169,14 @@ impl DisplaySetRegistry {
         }
 
         let total_items: usize = members.iter().map(|member| member.entries.len()).sum();
-        let token =
-            merge::reserve_merged_order(hakutaku_memory_accounting::global_budget(), total_items)?;
+        let token = merge::reserve_merged_order(self.memory_budget, total_items)?;
 
         let order = merge::build_merged_order(&members);
 
+        // 実際に残るのは結果列（`ItemId` × 件数）だけ。予約はピーク（一時列を
+        // 含む）で取っているため振り替え量の方が必ず小さいが、`min` で残量を
+        // 超えないことを保証してから振り替える（超過は `mark_allocated` の
+        // エラーになり、予約が返らなくなる）。
         let actual_bytes = order.len() * std::mem::size_of::<ItemId>();
         let _ = token.mark_allocated(actual_bytes.min(token.remaining_bytes()));
 
@@ -1349,6 +1402,35 @@ impl DisplaySetRegistry {
     /// キャッシュヒット時はファイルへ一切アクセスしません。ミス時は、
     /// このグループが覆う範囲（最小オフセット〜最大終端）をまとめて1回の
     /// 読み込みで取得し、項目ごとにデコードします。
+    ///
+    /// # 確保の前に予約する（`PERF-010`、Issue #32 の経路3）
+    ///
+    /// 読み出しバッファ（`vec![0u8; span_len]`）とデコードは、この経路で最も
+    /// 大きな確保です。`span_len` は要求された項目群が覆う**ファイル上の範囲**
+    /// であり、項目の生バイト長の合計（[`MAX_RESPONSE_RAW_BYTES`] で頭打ち）
+    /// とは違って上限がありません。統合表示集合では1回の範囲取得が1ソース内の
+    /// 離れた項目群を含み得るため、間に挟まる未要求のバイトまで含めて一度に
+    /// 読み込みます。予約なしで確保すると、`PERF-008` の予算判定を通らないまま
+    /// 大きな確保が起きます。
+    ///
+    /// 予約量の内訳は [`hydrate_group_peak_bytes`] の doc コメントを参照して
+    /// ください。
+    ///
+    /// # 予約が拒否されたときに応答を失敗させない理由
+    ///
+    /// 拒否された場合は [`Self::fallback_group`]（既定値＝空の本文）へ縮退し、
+    /// 応答そのものは成功させます。読み出しの失敗（削除・共有違反・
+    /// I/O エラー）と同じ扱いです。理由は3つあります。
+    ///
+    /// - `ERR-001`: 1ソース分の失敗で応答全体を落とさず、他の項目・他のソースの
+    ///   取得は継続する
+    /// - `COPY-005`: 空の本文が黙って利用者の手元へ渡ると取り消せないコピー
+    ///   経路では、[`Self::fallback_group`] が数える件数の増加を
+    ///   `crate::copy::assemble_copy` が検知してコピー全体を失敗させる
+    /// - 進行保証: [`DisplaySet::fetch_range_index`] は「1件も返せないと呼び
+    ///   出し側が前進できなくなる」ため少なくとも1件を必ず返す。ここで応答を
+    ///   エラーにすると、その項目を要求し続ける限り前進できなくなる。空の本文で
+    ///   返せば、表示は次回以降の範囲取得で追いつける
     fn hydrate_source_group(&mut self, source_id: u32, group: Vec<IndexItemRef>) -> Vec<ItemDto> {
         if group.is_empty() {
             return Vec::new();
@@ -1445,14 +1527,6 @@ impl DisplaySetRegistry {
             );
             return self.fallback_group(&group);
         }
-        let mut buffer = vec![0u8; span_len];
-        if file.read_exact(&mut buffer).is_err() {
-            self.mark_error_now(
-                source_id,
-                "本文の読み出しに失敗しました（read）。".to_string(),
-            );
-            return self.fallback_group(&group);
-        }
 
         let decided = hakutaku_format_detection::DecidedEncoding {
             encoding: selected_encoding,
@@ -1462,6 +1536,28 @@ impl DisplaySetRegistry {
             bom_len: 0,
             warnings: Vec::new(),
         };
+
+        // 読み出しバッファとデコードの確保は、この関数で最も大きい。予約に
+        // 失敗したら**確保を始めずに**既定値へ縮退する（`PERF-010`、Issue #32。
+        // 縮退を選ぶ理由はこの関数の doc コメント参照）。
+        let budget = self.memory_budget;
+        let Ok(token) = budget.reserve(hydrate_group_peak_bytes(&decided, span_len, group.len()))
+        else {
+            return self.fallback_group(&group);
+        };
+
+        let mut buffer = vec![0u8; span_len];
+        // ADR-0003「帰属（振り替え）」: 確保の直後に振り替え、予約と実確保が
+        // 二重に数えられる時間窓を短くする。振り替えても予約したピークの残りは
+        // トークンに残り、デコード中の一時確保を覆い続ける。
+        let _ = token.mark_allocated(span_len.min(token.remaining_bytes()));
+        if file.read_exact(&mut buffer).is_err() {
+            self.mark_error_now(
+                source_id,
+                "本文の読み出しに失敗しました（read）。".to_string(),
+            );
+            return self.fallback_group(&group);
+        }
 
         let mut decoded_items: Vec<Arc<str>> = Vec::with_capacity(group.len());
         for item in &group {
@@ -1475,6 +1571,15 @@ impl DisplaySetRegistry {
             };
             decoded_items.push(text);
         }
+
+        // デコードの一時確保は解放済みで、ここから先も残るのは本文
+        // （`Arc<str>` 群）だけ。その実測分を実確保へ振り替え、残りの予約は
+        // トークンの破棄で返す。キャッシュへの格納分を改めて予約するのは
+        // `DecodedChunkCache::insert` の責務なので、その前に返しておく
+        // （返さないと、自分の一時予約でキャッシュ側の予約を弾いてしまう）。
+        let retained_bytes: usize = decoded_items.iter().map(|text| text.len()).sum();
+        let _ = token.mark_allocated(retained_bytes.min(token.remaining_bytes()));
+        drop(token);
 
         // 応答とキャッシュで本文を共有する。以前はキャッシュ用に
         // 全体を複製していたが、`Arc` の複製は参照カウントの増加だけで済む。
@@ -1518,6 +1623,65 @@ impl DisplaySetRegistry {
     pub fn is_empty(&self) -> bool {
         self.display_sets.is_empty()
     }
+}
+
+/// [`hydrate_group_peak_bytes`] が、デコード結果とその正規化のために入力1バイト
+/// あたりへ見込む最悪バイト数です（導出根拠は同関数の doc コメント）。
+const DECODED_TEXT_PEAK_BYTES_PER_INPUT_BYTE: usize = 9;
+
+/// [`hydrate_group_peak_bytes`] が項目1件あたりに加算する固定費（バイト）です。
+///
+/// [`hakutaku_format_detection::max_decode_peak_bytes`] の「入力長に比例しない
+/// 分」（不正位置一覧の容量など）と同じ大きさで、あちらは1回分しか含まれない
+/// ため件数分をここで足します。あわせて、項目ごとに生じる小さな確保
+/// （`Arc<str>` の参照カウント領域、`Vec<Arc<str>>` と `Arc<[Arc<str>]>` の
+/// 要素）も、この枠で覆います。
+const PER_ITEM_FIXED_OVERHEAD_BYTES: usize = 2048;
+
+/// [`DisplaySetRegistry::hydrate_source_group`] が1グループ分の読み出しと
+/// デコードで**同時に確保し得る**バイト数の上界を見積もります（`PERF-010`、
+/// Issue #32 の経路3）。
+///
+/// `span_len` はそのグループが覆うファイル上の範囲の長さ、`item_count` は
+/// グループの項目数です。算術はすべて飽和演算で、飽和した値は
+/// [`hakutaku_memory_accounting::MemoryBudget::reserve`] が `checked_add` で
+/// 必ず拒否するため安全側（縮退）へ倒れます。
+///
+/// # 内訳
+///
+/// 1. **読み出しバッファ**: `span_len`（`vec![0u8; span_len]` そのもの）
+/// 2. **デコード実行中のピーク**:
+///    [`hakutaku_format_detection::max_decode_peak_bytes`]`(decided, span_len)`。
+///    項目ごとのデコード入力は読み出しバッファの互いに重ならない部分スライス
+///    で、合計長は `span_len` 以下です。見積もりは入力長に線形なので、
+///    `span_len` 1回分が全項目の合計を覆います（実際のデコードは1項目ずつ順に
+///    行うため、同時に生きるのは1項目分だけで、この枠にはデコード出力
+///    （`String`）が生き続ける分も含まれます）
+/// 3. **デコード結果の保持分と正規化の一時複製**: `span_len` ×
+///    [`DECODED_TEXT_PEAK_BYTES_PER_INPUT_BYTE`]。内訳は次の2つで、片方が
+///    最悪でももう片方に余裕があるのではなく、同時に成立し得るため足します
+///    - 応答とキャッシュが保持する `Arc<str>` 群（`span_len` × 3）:
+///      デコード出力の最終長は入力の3倍以下（`max_decode_peak_bytes` の
+///      doc コメントの導出。UTF-8 は不正1バイトが U+FFFD の3バイトへ、
+///      Windows コードページは1コード単位が UTF-8 で最大3バイトへ膨らむのが
+///      最悪）で、全項目の入力長の合計は `span_len` 以下
+///    - [`normalize_newlines`] の一時複製（`span_len` × 6）: `\r` を含む項目
+///      では `str::replace` が新しい `String` を作り、`Arc<str>` へ複写し終える
+///      まで元のデコード結果と同時に生きます。長さは元と同じかそれ以下
+///      （= 入力の3倍以下）、確保済み容量は倍々成長の性質からその2倍以下です
+/// 4. **項目ごとの固定費**: `item_count` ×
+///    [`PER_ITEM_FIXED_OVERHEAD_BYTES`]
+fn hydrate_group_peak_bytes(
+    decided: &hakutaku_format_detection::DecidedEncoding,
+    span_len: usize,
+    item_count: usize,
+) -> usize {
+    span_len
+        .saturating_add(hakutaku_format_detection::max_decode_peak_bytes(
+            decided, span_len,
+        ))
+        .saturating_add(span_len.saturating_mul(DECODED_TEXT_PEAK_BYTES_PER_INPUT_BYTE))
+        .saturating_add(item_count.saturating_mul(PER_ITEM_FIXED_OVERHEAD_BYTES))
 }
 
 /// 索引情報から本文なしの既定値 `ItemDto` を組み立てます（未知のソース・
@@ -2834,5 +2998,200 @@ mod tests {
             .enable_merged_view()
             .expect("ソースが無くてもエラーにはならないはず");
         assert_eq!(merged.total_items, 0);
+    }
+
+    // --- メモリ予約（`PERF-008`・`PERF-010`、Issue #32） ---
+
+    /// レジストリへ注入する `&'static MemoryBudget` を作ります。
+    ///
+    /// 意図的に leak しますが、テストごとに独立したインスタンスになるため、
+    /// グローバル予算にも他のテストにも影響しません（テストは並行実行されます）。
+    fn leaked_budget(budget_bytes: usize) -> &'static hakutaku_memory_accounting::MemoryBudget {
+        Box::leak(Box::new(hakutaku_memory_accounting::MemoryBudget::new(
+            budget_bytes,
+        )))
+    }
+
+    // 受け入れ条件（Issue #32 の経路2）: 統合表示の参照列は、構築中のピーク
+    // （並べ替え用の一時列＋結果列）で予約の可否を判定する。結果列だけ
+    // （16バイト/件）は賄えるがピークには足りない予算では拒否され、統合表示を
+    // 開始しない安全側へ倒れる（従来はこの予算帯で予約が通り、実確保が予算を
+    // 超えていた）。
+    #[test]
+    fn enable_merged_view_is_rejected_when_budget_covers_only_the_result_column() {
+        let items = 2usize;
+        let result_only_bytes = items * std::mem::size_of::<ItemId>();
+        let peak_bytes = items * merge::MERGED_ORDER_PEAK_BYTES_PER_ITEM;
+        // 結果列だけの見積もりとピークのちょうど中間。前者は賄えるが後者には
+        // 足りない予算帯を選ぶ。
+        let memory_budget = leaked_budget((result_only_bytes + peak_bytes) / 2);
+        let mut registry = DisplaySetRegistry::with_memory_budget(memory_budget);
+        let budget = crate::budget::SourceBudget::new();
+
+        let (_handle, _file) = insert_multiline_file(
+            &mut registry,
+            &budget,
+            "a.log",
+            &[(1, "a-1", Some(1000)), (2, "a-2", Some(2000))],
+        );
+
+        let rejected = registry
+            .enable_merged_view()
+            .expect_err("ピークには足りない予算なので拒否されるはず");
+        assert_eq!(rejected.requested_bytes, peak_bytes);
+        assert!(
+            rejected.requested_bytes > result_only_bytes,
+            "結果列だけではなく一時列を含めたピークで判定しているはず"
+        );
+        assert!(
+            !registry.is_merged_view_enabled(),
+            "拒否されたら統合表示を開始しない（安全側）"
+        );
+        assert_eq!(
+            memory_budget.outstanding_reserved_bytes(),
+            0,
+            "拒否された予約は残らないはず"
+        );
+    }
+
+    // 受け入れ条件（ADR-0003）: 統合表示の構築に成功したら、結果列の分だけを
+    // 実確保へ振り替え、一時列の分は返す（予約が残らない）。
+    #[test]
+    fn enable_merged_view_leaves_no_outstanding_reservation_when_it_succeeds() {
+        let memory_budget = leaked_budget(1_000_000);
+        let mut registry = DisplaySetRegistry::with_memory_budget(memory_budget);
+        let budget = crate::budget::SourceBudget::new();
+
+        let (_handle_a, _file_a) = insert_multiline_file(
+            &mut registry,
+            &budget,
+            "a.log",
+            &[(1, "a-1", Some(1000)), (2, "a-2", Some(3000))],
+        );
+        let (_handle_b, _file_b) =
+            insert_multiline_file(&mut registry, &budget, "b.log", &[(1, "b-1", Some(2000))]);
+
+        let merged = registry
+            .enable_merged_view()
+            .expect("十分な予算なら成功するはず");
+        assert_eq!(merged.total_items, 3);
+        assert_eq!(
+            memory_budget.outstanding_reserved_bytes(),
+            0,
+            "構築後に未消費の予約が残らないはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #32 の経路3、`PERF-010`）: 読み出しバッファと
+    // デコードの予約が拒否されたら、確保を始めずに既定値（空の本文）へ縮退
+    // する。応答自体は失敗せず（`ERR-001`）、フォールバック件数が増えることで
+    // コピー経路が後から気づける（`COPY-005`）。
+    #[test]
+    fn fetch_range_falls_back_to_empty_text_when_hydrate_reservation_is_rejected() {
+        // 項目ごとの固定費（2048バイト）にも満たない極小予算。
+        let memory_budget = leaked_budget(64);
+        let mut registry = DisplaySetRegistry::with_memory_budget(memory_budget);
+        let budget = crate::budget::SourceBudget::new();
+        let file = TempFile::create("hydrate-reserve-reject", b"content");
+        // 読み込み系（索引・項目列）はグローバル予算を使うため、注入した極小
+        // 予算の影響を受けずに登録できる。
+        let handle = insert_from_file(&mut registry, &budget, &file.path, "a.log", "content");
+
+        let before = registry.hydrate_fallback_items();
+        let response = registry
+            .fetch_range(
+                handle.display_set_id,
+                RangeRequest {
+                    start: 0,
+                    max_items: 10,
+                    expected_generation: handle.generation,
+                },
+            )
+            .expect("予約拒否でも応答そのものは失敗しないはず（ERR-001）");
+
+        assert_eq!(response.items.len(), 1, "進行保証: 項目自体は返る");
+        assert_eq!(
+            &*response.items[0].raw_text, "",
+            "予約が拒否されたら本文は既定値（空）になるはず"
+        );
+        assert_eq!(
+            registry.hydrate_fallback_items(),
+            before + 1,
+            "COPY-005 のためにフォールバック件数を数えるはず"
+        );
+        assert_eq!(
+            registry.source_status(handle.source_id),
+            Some(SourceStatus::Loaded),
+            "予約の拒否はファイル側の異常ではないので、ソースの状態は変えないはず"
+        );
+        assert_eq!(
+            memory_budget.outstanding_reserved_bytes(),
+            0,
+            "拒否された予約は残らないはず"
+        );
+    }
+
+    // 受け入れ条件（ADR-0003）: 予約が通る予算では本文が従来どおり返り、
+    // 読み出し・デコードの一時確保分は関数を抜ける前に返される（会計の均衡）。
+    #[test]
+    fn fetch_range_returns_text_and_leaves_no_outstanding_reservation_when_reserved() {
+        let memory_budget = leaked_budget(1_000_000);
+        let mut registry = DisplaySetRegistry::with_memory_budget(memory_budget);
+        let budget = crate::budget::SourceBudget::new();
+        let file = TempFile::create("hydrate-reserve-ok", b"content");
+        let handle = insert_from_file(&mut registry, &budget, &file.path, "a.log", "content");
+
+        let response = registry
+            .fetch_range(
+                handle.display_set_id,
+                RangeRequest {
+                    start: 0,
+                    max_items: 10,
+                    expected_generation: handle.generation,
+                },
+            )
+            .expect("成功するはず");
+
+        assert_eq!(&*response.items[0].raw_text, "content");
+        assert_eq!(registry.hydrate_fallback_items(), 0);
+        assert_eq!(
+            memory_budget.outstanding_reserved_bytes(),
+            0,
+            "一時分を返した後は予約が残らないはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #32 の経路3）: 予約量が4つの内訳（読み出しバッファ・
+    // デコードのピーク・保持する本文と正規化の一時複製・項目ごとの固定費）の
+    // 合計であり、巨大な入力でも飽和して panic しない。
+    #[test]
+    fn hydrate_group_peak_bytes_sums_the_four_components_and_saturates() {
+        let decided = hakutaku_format_detection::DecidedEncoding {
+            encoding: SelectedEncoding::Utf8,
+            route: hakutaku_format_detection::DetectionRoute::EnvironmentAnsi,
+            bom_len: 0,
+            warnings: Vec::new(),
+        };
+        let span_len = 1_000usize;
+        let item_count = 3usize;
+
+        let expected = span_len
+            + hakutaku_format_detection::max_decode_peak_bytes(&decided, span_len)
+            + span_len * DECODED_TEXT_PEAK_BYTES_PER_INPUT_BYTE
+            + item_count * PER_ITEM_FIXED_OVERHEAD_BYTES;
+        assert_eq!(
+            hydrate_group_peak_bytes(&decided, span_len, item_count),
+            expected
+        );
+        assert!(
+            expected > span_len,
+            "読み出しバッファだけでなくデコード側も見込むはず"
+        );
+
+        assert_eq!(
+            hydrate_group_peak_bytes(&decided, usize::MAX, usize::MAX),
+            usize::MAX,
+            "飽和演算なのでオーバーフローで panic しないはず"
+        );
     }
 }
