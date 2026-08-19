@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
+use windows::Win32::Foundation::HWND;
 
 use hakutaku_diagnostics::{diag_info, diag_warn, Diagnostics};
 
@@ -182,7 +183,15 @@ pub enum OpenLogFileResponse {
 /// 開きます。通常は `None`（自動解決、`LOG-021` の4段階）です。
 /// `manual_datetime_format`（`LOG-022`）を指定すると、その日時書式
 /// で解析します。通常は `None`（自動判定）です。
-#[tauri::command]
+///
+/// `#[tauri::command(async)]` を付けているのは、**同期関数のまま** Tauri の
+/// ブロッキングスレッドプールで実行させるためです（Issue #44）。同期コマンドは
+/// イベントループスレッド上でインライン実行され、ダイアログが閉じるまでメイン
+/// ウィンドウのメッセージループを止めてしまいます。`async fn` にはしません
+/// （`crate::targets` のモジュール doc コメント「非同期化の設計」の理由がその
+/// まま当てはまります）。詳細は `crate::file_dialog` のモジュール doc コメント
+/// 「呼び出し元スレッドと親ウィンドウ」を参照してください。
+#[tauri::command(async)]
 pub fn open_log_file(
     manual_profile: Option<String>,
     manual_datetime_format: Option<String>,
@@ -190,7 +199,12 @@ pub fn open_log_file(
     targets: State<'_, TargetRegistryState>,
     diagnostics: State<'_, Arc<Diagnostics>>,
 ) -> OpenLogFileResponse {
-    let selection = match file_dialog::choose_log_file() {
+    // 親ウィンドウの HWND は、ダイアログを開く**前に**このスレッドで取得する。
+    // ダイアログ用の専用スレッドから取得しようとするとイベントループの応答待ちに
+    // なる（Issue #44。`crate::file_dialog` のモジュール doc コメントを参照）。
+    let owner = main_window_hwnd(&app, diagnostics.inner());
+
+    let selection = match file_dialog::choose_log_file(owner) {
         Ok(selection) => selection,
         Err(error) => {
             diag_warn!(
@@ -276,6 +290,44 @@ pub fn open_log_file(
     OpenLogFileResponse::Loading {
         target_id,
         source_label,
+    }
+}
+
+/// ファイル選択ダイアログの親にするメインウィンドウの HWND を返します
+/// （Issue #44）。
+///
+/// ラベル `"main"` は `crate::lib` の `WebviewWindowBuilder::new` へ渡している
+/// 値です（変えるならここも合わせて直します）。
+///
+/// 取得できない場合はコマンドを失敗させず `None` を返します。親が無いと
+/// ダイアログは前面・モーダルになりませんが、それでもファイルは選べます。
+/// 「開けない」より「所有者なしでも開ける」方が利用者にとって有益である、
+/// という裁定です（`LOG-020`）。取得できなかったこと自体は診断ログへ残し、
+/// 前面に出ないという申告があったときに切り分けられるようにします。
+fn main_window_hwnd(app: &AppHandle, diagnostics: &Diagnostics) -> Option<HWND> {
+    let Some(window) = app.get_webview_window("main") else {
+        diag_warn!(
+            diagnostics,
+            module = "log_view",
+            operation = "log.open_dialog",
+            "メインウィンドウ（ラベル main）が見つからないため、ファイル選択\
+             ダイアログを所有者なしで表示します"
+        );
+        return None;
+    };
+
+    match window.hwnd() {
+        Ok(hwnd) => Some(hwnd),
+        Err(error) => {
+            diag_warn!(
+                diagnostics,
+                module = "log_view",
+                operation = "log.open_dialog",
+                "メインウィンドウの HWND を取得できないため、ファイル選択\
+                 ダイアログを所有者なしで表示します: {error}"
+            );
+            None
+        }
     }
 }
 
