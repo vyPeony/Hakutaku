@@ -15,6 +15,47 @@
 //! `JoinHandle::join` で結果を待つだけで、自身の COM 状態には触れません）。
 //! 新しい外部クレートは追加せず、既存の `windows` クレートの feature
 //! （`Win32_System_Com`・`Win32_UI_Shell`）だけを使います。
+//!
+//! # 呼び出し元スレッドと親ウィンドウ（Issue #44）
+//!
+//! このモジュールの利用者（[`crate::log_view::open_log_file`]）が満たすべき
+//! 前提が2つあります。どちらも Issue #44 で実測により確定した制約です。
+//!
+//! ## 1. 呼び出し元はイベントループスレッドであってはならない
+//!
+//! Tauri v2 の `#[tauri::command]` は、同期関数のままだと WebView2 の IPC
+//! ハンドラから**イベントループスレッド（メインスレッド）上でインライン実行**
+//! されます。そのためこの関数を同期コマンドから直接呼ぶと、[`std::thread::JoinHandle::join`]
+//! で待っている間ずっとメインウィンドウのメッセージループが止まります。Issue #44
+//! の実測では、ダイアログ表示中にメインウィンドウと WebView2 の子ウィンドウが
+//! `IsHungAppWindow` で「応答なし」と判定され、`SendMessageTimeout(WM_NULL)` は
+//! 失敗し、他の Tauri コマンドの `invoke` も届かなくなりました。
+//!
+//! そこで [`crate::log_view::open_log_file`] は `#[tauri::command(async)]` を
+//! 付け、**同期関数のまま** Tauri のブロッキングスレッドプールで実行させます
+//! （`async fn` にはしません。`crate::targets` のモジュール doc コメント
+//! 「非同期化の設計」が述べるとおり、`.await` をまたいで `std::sync::MutexGuard`
+//! を保持できなくなり、managed state の扱いを作り直すことになるためです）。
+//!
+//! ## 2. 親ウィンドウの HWND は、呼び出し元が取得して値で渡す
+//!
+//! [`choose_log_file`] は `owner` を引数で受け取るだけで、自分では取得しません。
+//! Tauri の `WebviewWindow::hwnd()` は内部でイベントループへメッセージを送り、
+//! 応答をチャネルで待ちます（呼び出し元がメインスレッドの場合だけインラインで
+//! 処理されます）。つまり**ダイアログ表示用の専用スレッドの中から `hwnd()` を
+//! 呼ぶとイベントループの応答待ちになり、状況によってはデッドロックします**。
+//! 呼び出し元はダイアログを開く前に `hwnd()` を済ませ、得た値だけをここへ渡し
+//! ます。[`HWND`] は生ポインタのラッパーで `Send` ではないため、専用スレッドへは
+//! 数値（`isize`）へ落として渡し、スレッドの中で復元します。
+//!
+//! ## 親を渡すと何が変わるか
+//!
+//! `IFileOpenDialog::Show` に親を渡すと、ダイアログはオーナーモーダルになり
+//! ます。ダイアログが閉じるまでメインウィンドウは無効化され（`IsWindowEnabled`
+//! が `false` になり）、常にメインウィンドウの前面に置かれます。親を取得できな
+//! かった場合は `HWND(null)` を渡し、所有者なしで表示します（ダイアログを
+//! 開けなくするより、前面・モーダルにならない状態でも開ける方がよい、という
+//! 裁定です。`LOG-020`）。
 
 use std::path::PathBuf;
 use std::thread;
@@ -62,11 +103,25 @@ fn dialog_error(reason: impl Into<String>) -> FileDialogError {
 /// ログファイル選択用のネイティブダイアログを表示し、選択結果を返します。
 ///
 /// 呼び出し元スレッドをブロックします（専用スレッドの完了を `join` で待つ）。
-pub fn choose_log_file() -> Result<FileSelection, FileDialogError> {
+/// **イベントループスレッドから呼んではいけません**（モジュール doc コメント
+/// 「1. 呼び出し元はイベントループスレッドであってはならない」、Issue #44）。
+///
+/// `owner` にはダイアログの親にするウィンドウの HWND を渡します。呼び出し元が
+/// 自分のスレッドで取得済みの値を渡す契約です（同「2. 親ウィンドウの HWND は、
+/// 呼び出し元が取得して値で渡す」）。`None` を渡した場合は所有者なしで表示し
+/// ます（前面・モーダルにならない従来の挙動）。
+pub fn choose_log_file(owner: Option<HWND>) -> Result<FileSelection, FileDialogError> {
+    // HWND は生ポインタのラッパーで Send ではないため、そのままでは
+    // thread::spawn のクロージャへ入れられない。ダイアログスレッドはこの値を
+    // Show の親として渡すだけで、参照解決もメッセージ送出も行わないため、
+    // 数値へ落として境界を越え、スレッドの中で復元する（Issue #44）。
+    // None（親を取得できなかった場合）は 0 = HWND(null) として扱う。
+    let owner_handle = owner.map_or(0_isize, |handle| handle.0 as isize);
+
     // モジュール doc コメントのとおり、ダイアログ操作専用のスレッドを立てる。
     let handle = thread::Builder::new()
         .name("hakutaku-file-dialog".to_string())
-        .spawn(run_dialog_on_sta_thread)
+        .spawn(move || run_dialog_on_sta_thread(owner_handle))
         .map_err(|error| {
             dialog_error(format!(
                 "ファイル選択ダイアログ用スレッドを起動できません: {error}"
@@ -81,7 +136,10 @@ pub fn choose_log_file() -> Result<FileSelection, FileDialogError> {
 }
 
 /// 専用スレッド上で実行される本体。COM の初期化・後始末をこの関数の中で完結させる。
-fn run_dialog_on_sta_thread() -> Result<FileSelection, FileDialogError> {
+///
+/// `owner_handle` は [`choose_log_file`] が数値へ落とした親ウィンドウの HWND
+/// （0 なら所有者なし）。この関数の中で [`HWND`] へ復元する。
+fn run_dialog_on_sta_thread(owner_handle: isize) -> Result<FileSelection, FileDialogError> {
     // SAFETY: この関数はダイアログ操作専用に立てた新規スレッド上でだけ呼ばれ、
     // このスレッドは他の COM 初期化状態を持たない。対応する CoUninitialize を
     // この関数の中で必ず呼ぶ（早期 return しても抜けられるよう、CoInitializeEx
@@ -94,7 +152,8 @@ fn run_dialog_on_sta_thread() -> Result<FileSelection, FileDialogError> {
         )));
     }
 
-    let result = show_dialog();
+    // 0 は HWND(null)（所有者なし）と同じ表現のため、分岐せずそのまま復元できる。
+    let result = show_dialog(HWND(owner_handle as *mut std::ffi::c_void));
 
     // SAFETY: 直前の CoInitializeEx が成功した場合にだけ到達する経路であり、
     // 対応する CoUninitialize を呼ぶ。このスレッドはここで終了するため、以降
@@ -106,7 +165,9 @@ fn run_dialog_on_sta_thread() -> Result<FileSelection, FileDialogError> {
 
 /// ダイアログの作成・表示・結果取得を行う。COM は呼び出し元
 /// （[`run_dialog_on_sta_thread`]）が初期化済みである前提。
-fn show_dialog() -> Result<FileSelection, FileDialogError> {
+///
+/// `owner` はダイアログの親にするウィンドウ。`HWND(null)` なら所有者なし。
+fn show_dialog(owner: HWND) -> Result<FileSelection, FileDialogError> {
     // SAFETY: CLSCTX_INPROC_SERVER での CoCreateInstance は標準的な使い方であり、
     // 返るインターフェースポインタは windows クレートの COM ラッパー型が Drop 時に
     // 自動的に Release する（参照カウントの管理はクレート側に委譲される）。
@@ -146,9 +207,13 @@ fn show_dialog() -> Result<FileSelection, FileDialogError> {
         },
     )?;
 
-    // SAFETY: dialog は有効な COM インターフェースである。親ウィンドウには
-    // HWND(null) を渡す（このダイアログは既存のウィンドウに紐付けない）。
-    let show_result = unsafe { dialog.Show(Some(HWND(std::ptr::null_mut()))) };
+    // 親を渡すとオーナーモーダルになり、閉じるまでメインウィンドウは無効化され、
+    // 常にその前面に置かれる（Issue #44。詳細はモジュール doc コメント）。
+    //
+    // SAFETY: dialog は有効な COM インターフェースである。owner は呼び出し元の
+    // スレッドで取得済みのメインウィンドウの HWND か、取得できなかった場合の
+    // HWND(null)（所有者なし）のいずれかである。
+    let show_result = unsafe { dialog.Show(Some(owner)) };
 
     if let Err(error) = show_result {
         // 利用者がキャンセルした場合、Show は ERROR_CANCELLED 相当の HRESULT で
