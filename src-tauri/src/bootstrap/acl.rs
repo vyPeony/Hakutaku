@@ -25,7 +25,10 @@
 //!   優先するため、対象 SID への拒否 ACE が必要なアクセス権と重なっている場合は、
 //!   許可 ACE を追加しても有効にならない。この場合は付与を行わず
 //!   [`AclOutcome::BlockedByDenyAce`] を返す（`Issue #45`）。
-//! - 不足していれば ACE を追加する（[`AclOutcome::Applied`]）。
+//! - 不足していれば ACE を追加する（[`AclOutcome::Applied`]）。付与は対象フォルダの
+//!   **継承構造を変えない**。親から継承していた ACE は継承のまま残り、明示 ACE へ
+//!   複製されないため、付与後も親フォルダの権限変更が対象フォルダへ反映され続ける
+//!   （根拠と実機確認の範囲は [`grant_access`] の doc コメントを参照。`Issue #45`）。
 //! - 現在の権限で変更できない場合は [`AclOutcome::Denied`] を返し、呼び出し側が
 //!   `bootstrap::notify::acl_not_applicable` で通知する。
 //! - フォルダの有無や判定自体に失敗した場合は [`AclOutcome::Undetermined`] を返す。
@@ -147,7 +150,21 @@ impl Drop for LocalAllocGuard {
 /// App Container 用 SID（`S-1-15-2-1`）を作成する。戻り値のガードが drop される際、
 /// `LocalFree` で解放される。
 fn convert_app_container_sid() -> Result<LocalAllocGuard, String> {
-    let sid_wide = to_wide_null(APP_CONTAINER_SID);
+    convert_string_sid(APP_CONTAINER_SID, "App Container 用 SID")
+}
+
+/// 文字列 SID（`S-1-15-2-1` 形式）から SID を作成する。戻り値のガードが drop
+/// される際、`LocalFree` で解放される。
+///
+/// 本体が使うのは [`convert_app_container_sid`] 経由の `S-1-15-2-1` だけだが、
+/// テストが別の well-known SID（BATCH `S-1-5-3` など）で継承 ACE の実機挙動を
+/// 検証するため、SID 文字列を引数に取る形で切り出している（`Issue #45`）。
+///
+/// `label` は失敗時の説明文の先頭に置く、その SID の役割名。この説明文は
+/// [`AclOutcome::Undetermined`] の `reason` として利用者の目に触れるため、
+/// 呼び出し側は「どの用途の SID を作れなかったか」が分かる語を渡す。
+fn convert_string_sid(text: &str, label: &str) -> Result<LocalAllocGuard, String> {
+    let sid_wide = to_wide_null(text);
     let mut sid_out = PSID(std::ptr::null_mut());
 
     // SAFETY: sid_wide はこの関数のスコープ内で生存する NUL 終端バッファであり、
@@ -157,7 +174,7 @@ fn convert_app_container_sid() -> Result<LocalAllocGuard, String> {
     match result {
         Ok(()) => Ok(LocalAllocGuard(sid_out.0)),
         Err(error) => Err(format!(
-            "App Container 用 SID（{APP_CONTAINER_SID}）を作成できません（{}）。",
+            "{label}（{text}）を作成できません（{}）。",
             error.message()
         )),
     }
@@ -422,6 +439,25 @@ fn ace_applies_to_object_itself(flags: u8) -> bool {
 const REQUIRED_PRIVILEGE_MESSAGE: &str = "WebView2Runtime フォルダの所有者、または管理者権限を持つ利用者が、このフォルダのアクセス許可を変更する必要があります。エクスプローラーでフォルダを右クリックし、「プロパティ」→「セキュリティ」タブ→「編集」または「詳細設定」からアクセス許可を追加するか、管理者として Hakutaku を再起動して自動設定を再試行してください。";
 
 /// App Container 用 SID へ、読み取り + 実行（継承あり）のアクセス許可を追加する。
+///
+/// `existing_dacl` は [`read_dacl`] が `GetNamedSecurityInfoW` から得たもので、
+/// 親フォルダから継承した ACE（`INHERITED_ACE` フラグ付き）も含む。それをそのまま
+/// `SetEntriesInAclW` の OldAcl として渡すため、「書き戻しで継承 ACE が対象フォルダの
+/// 明示 ACE へ複製され、以後、親フォルダの権限変更が反映されなくなるのではないか」
+/// という懸念があった（`Issue #45`）。
+///
+/// 実機で確認した結果、この複製は起きない。`SetNamedSecurityInfoW` は自動継承の
+/// 規則に従い、渡された ACL のうち `INHERITED_ACE` フラグが立った ACE を明示 ACE
+/// として保存せず、書き戻しの際に親から継承し直す。確認は Windows 10 22H2
+/// （10.0.19045）で行い、`tests::granting_access_keeps_inherited_aces_inherited` が
+/// 回帰テストとして固定している（継承 ACE が1個・継承のまま残ること、および付与後に
+/// 親の権限を広げるとその変更が子へ伝播することを検証する）。
+///
+/// この保証は、`SetNamedSecurityInfoW` へ `DACL_SECURITY_INFORMATION` **だけ**を
+/// 渡すことに依存する。`PROTECTED_DACL_SECURITY_INFORMATION` /
+/// `UNPROTECTED_DACL_SECURITY_INFORMATION` を追加すると対象フォルダの保護状態
+/// （`SE_DACL_PROTECTED`）自体を切り替えてしまい、Hakutaku が変更してよい範囲
+/// （`DIST-010` が認める ACL の付与）を超えるため、追加しない。
 fn grant_access(
     path_wide: &[u16],
     existing_dacl: *const ACL,
@@ -472,6 +508,9 @@ fn grant_access(
     // 以降 new_acl は必ずこのガードを通じて解放する（成功・失敗いずれの経路でも）。
     let new_acl_guard = LocalAllocGuard(new_acl as *mut c_void);
 
+    // 継承構造を変えないため、指定するのは DACL_SECURITY_INFORMATION だけに留める
+    // （保護状態を切り替える PROTECTED / UNPROTECTED を足さない理由は、この関数の
+    // doc コメントを参照。`Issue #45`）。
     // SAFETY: path_wide はこの呼び出しの間だけ生存すればよい NUL 終端バッファ。
     // new_acl は直前の SetEntriesInAclW が作成した有効な ACL である。
     let apply_status = unsafe {
@@ -531,8 +570,14 @@ fn to_wide_null(text: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use windows::Win32::Security::Authorization::DENY_ACCESS;
+    use windows::Win32::Security::Authorization::{ACCESS_MODE, DENY_ACCESS};
+    use windows::Win32::Security::INHERITED_ACE;
     use windows::Win32::Storage::FileSystem::FILE_WRITE_DATA;
+
+    /// テスト専用: 継承 ACE の実機挙動を観測するための目印に使う well-known SID
+    /// （BATCH）。本体が扱う `S-1-15-2-1` と衝突せず、テスト用フォルダへ付けても
+    /// 実害のない良性のグループであるため選んでいる（`Issue #45`）。
+    const BATCH_SID: &str = "S-1-5-3";
 
     // 以下はマスクの写像・継承フラグ・INHERIT_ONLY_ACE の除外という
     // 純粋なロジックだけを検証する（ファイル・レジストリ等へは一切触れない）。
@@ -670,9 +715,20 @@ mod tests {
     /// テスト専用: 対象フォルダの DACL へ、App Container 用 SID への拒否 ACE
     /// （継承あり、指定したアクセスマスク）を追加する。
     fn add_deny_ace_for_app_container(path: &std::path::Path, mask: u32) {
+        add_inheritable_ace(path, APP_CONTAINER_SID, mask, DENY_ACCESS);
+    }
+
+    /// テスト専用: 対象フォルダの DACL へ、指定した文字列 SID に対する ACE
+    /// （`CONTAINER_INHERIT_ACE` | `OBJECT_INHERIT_ACE` 付き）を追加する。
+    ///
+    /// 本体の [`grant_access`] と同じ `SetEntriesInAclW` / `SetNamedSecurityInfoW`
+    /// の手順を、対象 SID・アクセスマスク・許可/拒否の別だけ差し替えたもの。
+    /// テスト用フォルダを組み立てる下準備と、付与後に親フォルダの権限を広げて
+    /// 継承の伝播を確かめる操作の両方に使う。
+    fn add_inheritable_ace(path: &std::path::Path, string_sid: &str, mask: u32, mode: ACCESS_MODE) {
         let path_wide = to_wide_null(&path.to_string_lossy());
-        let target_sid_guard =
-            convert_app_container_sid().expect("テスト用の App Container SID を作成できません");
+        let target_sid_guard = convert_string_sid(string_sid, "テスト用の SID")
+            .expect("テスト用の SID を作成できません");
         let target_sid = PSID(target_sid_guard.0);
 
         let (_descriptor_guard, dacl_ptr) =
@@ -693,7 +749,7 @@ mod tests {
 
         let entry = EXPLICIT_ACCESS_W {
             grfAccessPermissions: mask,
-            grfAccessMode: DENY_ACCESS,
+            grfAccessMode: mode,
             grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
             Trustee: trustee,
         };
@@ -711,7 +767,7 @@ mod tests {
         };
         assert!(
             build_status.is_ok(),
-            "拒否 ACE を含む ACL を構築できません: {build_status:?}"
+            "テスト用の ACE を含む ACL を構築できません: {build_status:?}"
         );
 
         let new_acl_guard = LocalAllocGuard(new_acl as *mut c_void);
@@ -733,7 +789,7 @@ mod tests {
 
         assert!(
             apply_status.is_ok(),
-            "拒否 ACE を適用できません: {apply_status:?}"
+            "テスト用の ACE を適用できません: {apply_status:?}"
         );
     }
 
@@ -818,6 +874,152 @@ mod tests {
         assert!(
             matches!(second, AclOutcome::AlreadyAccessible),
             "付与後の再判定は AlreadyAccessible のはずです: {second:?}"
+        );
+    }
+
+    // 以下は Issue #45(b) の検証: ACL の書き戻しが、親フォルダから継承していた
+    // ACE を対象フォルダの明示 ACE へ複製してしまわないこと。
+
+    /// テスト専用: 対象の DACL を先頭から走査し、指定した文字列 SID に一致する
+    /// 許可・拒否 ACE の `(AceFlags, Mask)` を並び順どおりに集める。
+    ///
+    /// 継承の有無は `icacls` の表示（ロケール依存）ではなく、この `AceFlags` の
+    /// `INHERITED_ACE` ビットで判定する。
+    fn aces_for_sid(path: &std::path::Path, string_sid: &str) -> Vec<(u8, u32)> {
+        let path_wide = to_wide_null(&path.to_string_lossy());
+        let sid_guard = convert_string_sid(string_sid, "テスト用の SID")
+            .expect("テスト用の SID を作成できません");
+        let target = PSID(sid_guard.0);
+
+        let (_descriptor_guard, dacl_ptr) =
+            read_dacl(&path_wide).expect("テスト用フォルダの DACL を取得できません");
+        let dacl = dacl_ptr.expect("テスト用フォルダには DACL があるはずです");
+
+        let mut found = Vec::new();
+        // SAFETY: dacl は read_dacl が返した有効なポインタであり、
+        // _descriptor_guard が生存している間だけ使う。
+        let ace_count = unsafe { (*dacl).AceCount };
+        for index in 0..u32::from(ace_count) {
+            let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+            // SAFETY: dacl は有効な ACL、index は AceCount 未満、ace_ptr は出力専用。
+            if unsafe { GetAce(dacl, index, &mut ace_ptr) }.is_err() {
+                continue;
+            }
+            // SAFETY: GetAce が返したポインタは ACE_HEADER として読み取れる。
+            let header = unsafe { *(ace_ptr as *const ACE_HEADER) };
+            let ace_type = u32::from(header.AceType);
+            let (mask, ace_sid) = if ace_type == ACCESS_ALLOWED_ACE_TYPE {
+                // SAFETY: AceType を確認済みのため ACCESS_ALLOWED_ACE として読める。
+                let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
+                (ace.Mask, PSID(&ace.SidStart as *const u32 as *mut c_void))
+            } else if ace_type == ACCESS_DENIED_ACE_TYPE {
+                // SAFETY: AceType を確認済みのため ACCESS_DENIED_ACE として読める。
+                let ace = unsafe { &*(ace_ptr as *const ACCESS_DENIED_ACE) };
+                (ace.Mask, PSID(&ace.SidStart as *const u32 as *mut c_void))
+            } else {
+                continue;
+            };
+
+            // SAFETY: ace_sid・target はいずれもこの時点で有効な SID である。
+            if unsafe { EqualSid(ace_sid, target) }.is_ok() {
+                found.push((header.AceFlags, mask));
+            }
+        }
+        found
+    }
+
+    /// テスト専用: ACE の `AceFlags` に `INHERITED_ACE` が立っているか。
+    /// 立っていれば、その ACE は対象自身の明示 ACE ではなく親からの継承である。
+    fn is_inherited(flags: u8) -> bool {
+        flags & INHERITED_ACE.0 as u8 != 0
+    }
+
+    /// テスト専用: `icacls` の生出力（証拠として `--nocapture` で目視するため）。
+    ///
+    /// 表示文言はロケール依存であり、アサートには使わない。
+    fn icacls_dump(path: &std::path::Path) -> String {
+        match std::process::Command::new("icacls").arg(path).output() {
+            Ok(output) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("icacls を実行できません: {error}"),
+        }
+    }
+
+    #[test]
+    fn granting_access_keeps_inherited_aces_inherited() {
+        // 受け入れ条件: 親から継承した ACE を持つフォルダへ許可 ACE を付与しても、
+        // 継承 ACE が明示 ACE へ複製・変換されず（`INHERITED_ACE` のまま1個で
+        // 残り）、付与後も親フォルダの権限変更が子へ反映され続ける
+        // （`DIST-010`、`Issue #45`）。
+        let parent = TestFolder::new("inherit-parent");
+
+        // 順序依存: 継承可能 ACE を親へ付けた**後**に子を作る。子の作成時に親の
+        // 継承可能 ACE が複製されるという OS の既定動作を使うため、逆順にすると
+        // 前提条件（子に継承 ACE がある）が成立しない。
+        add_inheritable_ace(&parent.path, BATCH_SID, FILE_GENERIC_READ.0, GRANT_ACCESS);
+        let child = parent.path.join("child");
+        std::fs::create_dir(&child).expect("子フォルダを作成できません");
+
+        let before = aces_for_sid(&child, BATCH_SID);
+        println!("icacls（付与前）:\n{}", icacls_dump(&child));
+        println!("BATCH の (AceFlags, Mask)（付与前）: {before:02x?}");
+        assert_eq!(
+            before.len(),
+            1,
+            "前提条件: 子フォルダには BATCH の ACE がちょうど1個あるはずです: {before:02x?}"
+        );
+        assert!(
+            is_inherited(before[0].0),
+            "前提条件: 子フォルダの BATCH ACE は継承 ACE のはずです: {before:02x?}"
+        );
+
+        let outcome = ensure_app_container_access(&child);
+        assert!(
+            matches!(outcome, AclOutcome::Applied),
+            "新規の子フォルダでは Applied を返すはずです: {outcome:?}"
+        );
+
+        let after = aces_for_sid(&child, BATCH_SID);
+        println!("icacls（付与後）:\n{}", icacls_dump(&child));
+        println!("BATCH の (AceFlags, Mask)（付与後）: {after:02x?}");
+        assert_eq!(
+            after.len(),
+            1,
+            "継承 ACE が明示 ACE として複製されています（継承構造が壊れます）: {after:02x?}"
+        );
+        assert!(
+            is_inherited(after[0].0),
+            "継承 ACE が明示 ACE へ変換されています（親の権限変更が反映されなくなります）: {after:02x?}"
+        );
+
+        // 継承構造が生きていることの決定的な確認: 付与の後に親の権限を広げると、
+        // その変更が子へ伝播する。ACE が明示化・複製されていた場合、子は親の
+        // 変更から切り離されるためこの確認が失敗する（`Issue #45` の指摘の本質）。
+        add_inheritable_ace(
+            &parent.path,
+            BATCH_SID,
+            FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
+            GRANT_ACCESS,
+        );
+        let propagated = aces_for_sid(&child, BATCH_SID);
+        println!("icacls（親の権限変更後）:\n{}", icacls_dump(&child));
+        println!("BATCH の (AceFlags, Mask)（親の権限変更後）: {propagated:02x?}");
+        assert!(
+            !propagated.is_empty() && propagated.iter().all(|(flags, _)| is_inherited(*flags)),
+            "親の権限変更後も、子の BATCH ACE はすべて継承 ACE のはずです: {propagated:02x?}"
+        );
+        // SetEntriesInAclW が既存 ACE へ併合するか別 ACE を足すかは Win32 の
+        // 裁量であるため、個数ではなくマスクの論理和で判定する。
+        let propagated_mask = propagated
+            .iter()
+            .fold(0u32, |merged, (_, mask)| merged | *mask);
+        assert_eq!(
+            propagated_mask & FILE_GENERIC_EXECUTE.0,
+            FILE_GENERIC_EXECUTE.0,
+            "親フォルダの権限変更が子へ反映されていません（継承が切れています）: {propagated_mask:08x}"
         );
     }
 }

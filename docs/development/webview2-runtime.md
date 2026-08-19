@@ -121,6 +121,7 @@ Windows 10 では、App Container からのアクセスに `WebView2Runtime` フ
 - 付与する権限は、App Container（`ALL APPLICATION PACKAGES`。SID は `S-1-15-2-1`）に対する**読み取り + 実行**（継承あり）です。
 - 既に必要なアクセスが許可されていれば何も変更しません。不足していれば ACE を追加します。現在の権限で変更できない場合はネイティブダイアログで理由と必要な対応を通知します（[`src-tauri/src/bootstrap/acl.rs`](../../src-tauri/src/bootstrap/acl.rs)）。
 - 判定は許可 ACE だけでなく拒否 ACE も DACL の並び順どおりに読みます（`evaluate_dacl`）。App Container 用 SID への拒否 ACE が必要なアクセス権と重なっている場合、Windows の評価順（拒否が許可より優先）では許可 ACE を追加しても有効にならないため、付与を行わず `AclOutcome::BlockedByDenyAce` を返します。この場合、診断ログには「付与しました」ではなく、拒否 ACE により有効にならない旨と管理者による確認が必要である旨が記録されます（[Issue #45](https://github.com/vyPeony/Hakutaku/issues/45)）。
+- 付与は対象フォルダの**継承構造を変えません**。親フォルダから継承していた ACE は継承のまま残り、明示 ACE へ複製されないため、付与後も親フォルダの権限変更が `WebView2Runtime` フォルダへ反映され続けます。実機（Windows 10 22H2）で書き戻し前後の ACL ダンプを比較して確認し、回帰テストで固定しています（[`src-tauri/src/bootstrap/acl.rs`](../../src-tauri/src/bootstrap/acl.rs) の `granting_access_keeps_inherited_aces_inherited`、[Issue #45](https://github.com/vyPeony/Hakutaku/issues/45)）。
 - ACL の要否そのものが判定できない場合も、Runtime の使用は継続します（安全側に倒す）。
 
 **ACL 要否の最終確定は P13（`VER-006`）です。** 段階0・段階1では「必要と判明したら設定を試み、できなければ通知する」経路を実装済みにしておくところまでが範囲です。
