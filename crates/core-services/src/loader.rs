@@ -3,8 +3,10 @@
 //!
 //! P05 の各部品（6書式日時解析・プロファイル4段階解決・文字コード判定）を、
 //! 実際の読み込みパイプラインへ結線します。P08-5 以降、この
-//! パイプラインは**索引 + オンデマンド読み出し**方式です（本文をファイル全量
-//! 分蓄積しません。下記「P08-5: 索引 + オンデマンド読み出しへの移行」参照）。
+//! パイプラインは**索引 + オンデマンド読み出し**方式です（読み終えた本文を
+//! 蓄積し続けません。下記「P08-5: 索引 + オンデマンド読み出しへの移行」参照。
+//! 改行が現れない入力で一時保持がファイル全量まで伸びる例外と、その有界性は
+//! [`DecodeCursor`] の doc コメント「`carry` の大きさ」）。
 //!
 //! # パイプライン
 //!
@@ -402,6 +404,20 @@ pub enum LoadFileError {
     /// `crate::budget::SourceBudget`（`PERF-006`、開いているファイルの合計
     /// サイズ）の拒否とは別の理由・メッセージで区別します。
     IndexMemoryBudgetExceeded(hakutaku_memory_accounting::ReservationRejected),
+    /// Issue #32: 読み込みバッファ（`DecodeCursor` の `carry`）の伸長、または
+    /// チャンクのデコード出力のためのメモリ予約が拒否された（`PERF-008`）。
+    ///
+    /// 改行が現れない入力（改行なしの巨大な1行、`\r` だけで改行する旧 Mac 形式
+    /// など）では、行を確定できないまま `carry` が最後の改行（無ければファイル
+    /// 終端）まで伸び、その一括デコードも入力長に比例して大きくなります。この
+    /// 失敗は、そうした確保を**行う前に**予約で止めたことを意味します。
+    ///
+    /// 呼び出し側にとっては [`LoadFileError::IndexMemoryBudgetExceeded`] と
+    /// 同じく「メモリ予算が足りず読み込めない」であり、対処も同じ（他の対象を
+    /// 閉じる、`hakutaku.yaml` の予算値を上げる）です。索引側と分けているのは、
+    /// 予算が不足した場所（常駐する索引か、読み込み中の一時バッファか）を
+    /// 診断ログのメッセージから切り分けられるようにするためです。
+    DecodeMemoryBudgetExceeded(hakutaku_memory_accounting::ReservationRejected),
 }
 
 impl std::fmt::Display for LoadFileError {
@@ -435,6 +451,13 @@ impl std::fmt::Display for LoadFileError {
                      PERF-008）: {rejected}"
                 )
             }
+            LoadFileError::DecodeMemoryBudgetExceeded(rejected) => {
+                write!(
+                    f,
+                    "読み込みバッファまたはデコード結果のためのメモリ予約に失敗しました\
+                     （メモリ予算の上限に達しています。PERF-008）: {rejected}"
+                )
+            }
         }
     }
 }
@@ -464,7 +487,8 @@ impl LoadFileError {
     /// 採番台帳は `hakutaku_format_detection::error_codes`）だけです。理由は
     /// 次のとおりです。
     ///
-    /// - [`LoadFileError::IndexMemoryBudgetExceeded`] は、予約を拒否した
+    /// - [`LoadFileError::IndexMemoryBudgetExceeded`] と
+    ///   [`LoadFileError::DecodeMemoryBudgetExceeded`] は、予約を拒否した
     ///   `hakutaku_memory_accounting` 側が会計イベントとして同じ失敗を
     ///   `HKT-MEM-0001` で記録済みのため、ここで重ねて付けない
     /// - [`LoadFileError::ReadFile`] と [`LoadFileError::ChangedDuringLoad`] は、
@@ -485,7 +509,8 @@ impl LoadFileError {
             LoadFileError::ReadFile(_)
             | LoadFileError::InvalidEncodingName(_)
             | LoadFileError::ChangedDuringLoad(_)
-            | LoadFileError::IndexMemoryBudgetExceeded(_) => None,
+            | LoadFileError::IndexMemoryBudgetExceeded(_)
+            | LoadFileError::DecodeMemoryBudgetExceeded(_) => None,
         }
     }
 }
@@ -1347,7 +1372,10 @@ pub fn register_source_with_access(
         raw_display_due_to_profile,
     );
 
-    let mut cursor = DecodeCursor::new(profile_encoding);
+    let mut cursor = DecodeCursor::new(
+        profile_encoding,
+        hakutaku_memory_accounting::global_budget(),
+    );
     let mut assembler = crate::streaming_parse::StreamingAssembler::new(
         raw_display_due_to_profile,
         explicit_datetime_format,
@@ -2044,17 +2072,46 @@ fn change_kind_from_verdict(verdict: hakutaku_data_source::SnapshotVerdict) -> C
 /// のマルチバイト文字の構成バイトにもなり得ないため（`hakutaku_data_source::
 /// split_raw_lines` のモジュール doc コメント参照）、この分割点は常に安全です。
 ///
-/// **`carry` は1チャンク分（既定 [`hakutaku_data_source::DEFAULT_CHUNK_BYTES`]、
-/// 8 MiB）程度の一時バッファであり、ファイル全体を蓄積しません。** デコード
-/// 確定のたびに `carry` から取り除かれます（`consume_and_decode` の
-/// `self.carry.drain(..end)`）。生バイトの行分割（[`hakutaku_data_source::
-/// split_raw_lines_into`]）とデコード後の行分割（[`hakutaku_data_source::
-/// split_line_spans_into`]）を同じ `carry[..end]` に対して行い、両者の件数が一致する
-/// （`\n` の出現回数は変わらないため）という前提で1対1に対応付けることで、
-/// 各行の生バイトオフセット・長さを、デコードした本文を保持することなく
-/// 記録します（[`DecodedLine`]）。
-struct DecodeCursor {
+/// # `carry` の大きさ（Issue #32）
+///
+/// 改行を含む通常の入力では、`carry` は1チャンク分（既定
+/// [`hakutaku_data_source::DEFAULT_CHUNK_BYTES`]、8 MiB）程度の一時バッファで
+/// 安定します。デコード確定のたびに、確定した範囲が `carry` から取り除かれる
+/// ためです（`consume_and_decode` の `self.carry.drain(..end)`）。
+///
+/// **一方、改行が現れない入力では、`carry` は最後の改行（無ければファイル
+/// 終端）まで伸び、ファイル全量に達し得ます。** 行を確定できない限り、
+/// マルチバイト文字を割らずに切れる位置が無いためです（`\r` だけで改行する
+/// 旧 Mac 形式、改行を1つも含まない単一行の JSON など）。この伸長と、それを
+/// 一括でデコードする確保はいずれも [`Self::grow_carry_for`]・
+/// [`Self::decode_and_split`] が `PERF-010` の予約を経て行うため、メモリ予算
+/// （`PERF-008`）により有界です。予約が拒否された場合は
+/// [`LoadFileError::DecodeMemoryBudgetExceeded`] で読み込みを失敗させます
+/// （要件上の扱いは `docs/requirements/quality.md` の `PERF-007`）。
+///
+/// # 生バイトオフセットの記録
+///
+/// 生バイトの行分割（[`hakutaku_data_source::split_raw_lines_into`]）とデコード
+/// 後の行分割（[`hakutaku_data_source::split_line_spans_into`]）を同じ
+/// `carry[..end]` に対して行い、両者の件数が一致する（`\n` の出現回数は
+/// 変わらないため）という前提で1対1に対応付けることで、各行の生バイト
+/// オフセット・長さを、デコードした本文を保持することなく記録します
+/// （[`DecodedLine`]）。
+struct DecodeCursor<'b> {
     profile_encoding: hakutaku_format_detection::ProfileEncodingSetting,
+    /// `carry` の伸長とチャンクのデコード出力を予約する先（`PERF-010`）。
+    ///
+    /// [`hakutaku_memory_accounting::global_budget`] を直接呼ばずに参照を
+    /// 持つのは、テストが小さな [`hakutaku_memory_accounting::MemoryBudget`] を
+    /// 注入して、拒否経路をプロセス全体の予算に触れずに検証できるようにする
+    /// ためです。
+    budget: &'b hakutaku_memory_accounting::MemoryBudget,
+    /// まだ行を確定できていない生バイト。
+    ///
+    /// **[`Self::feed`]／[`Self::finish`] の呼び出しの合間、この中に `\n` は
+    /// 残りません**（`feed` は常に最後の `\n` の直後まで確定して取り除き、
+    /// `finish` は全量を確定するため）。`feed` はこの不変条件に依拠して、
+    /// `\n` の探索を今回追記した範囲だけに限定します。
     carry: Vec<u8>,
     /// これまでに確定処理した生バイト数（ファイル先頭からの絶対位置の基準点。
     /// BOM を含む。`decode_invalid_positions` の絶対位置化、および
@@ -2113,10 +2170,14 @@ struct DecodedLineRef<'a> {
     confirmed: bool,
 }
 
-impl DecodeCursor {
-    fn new(profile_encoding: hakutaku_format_detection::ProfileEncodingSetting) -> Self {
+impl<'b> DecodeCursor<'b> {
+    fn new(
+        profile_encoding: hakutaku_format_detection::ProfileEncodingSetting,
+        budget: &'b hakutaku_memory_accounting::MemoryBudget,
+    ) -> Self {
         DecodeCursor {
             profile_encoding,
+            budget,
             carry: Vec::new(),
             consumed_before: 0,
             decided: None,
@@ -2224,8 +2285,39 @@ impl DecodeCursor {
     ///
     /// 結果は戻り値ではなく `self` に持たせ、呼び出し側は [`Self::lines`] で
     /// 借用します（行ごとの `String` 確保を避けるため）。
+    ///
+    /// # デコード出力の予約（`PERF-010`、Issue #32）
+    ///
+    /// `hakutaku_format_detection::decode` が内部で確保する量は呼び出し側から
+    /// 見えないため、[`hakutaku_format_detection::max_decode_peak_bytes`] の
+    /// 最悪ピーク見積もりで**デコードの前に**予約します（同関数の doc コメントが
+    /// 定める呼び出し契約: 予約 → `decode` → `mark_allocated(容量)`）。予約が
+    /// 拒否された場合はデコードを行わず
+    /// [`LoadFileError::DecodeMemoryBudgetExceeded`] を返します。
+    ///
+    /// 予約は通常サイズのチャンクでも毎回行います。1チャンクにつき原子的な
+    /// CAS が数回増えるだけで、デコードそのものに対して無視できる費用であり、
+    /// 「大きいときだけ予約する」条件分岐を持たない方が経路が単純で漏れが
+    /// 生じないためです。
     fn decode_and_split(&mut self, end: usize) -> Result<(), LoadFileError> {
         self.ensure_decided()?;
+        // 予約は再利用バッファを取り出す前に済ませる。拒否された場合に
+        // mem::take した Vec を戻し忘れる経路を作らないためである。
+        //
+        // 参照を先にコピーしておくのは、予約トークンの寿命を `&mut self` の
+        // 借用から切り離し、下の consume_and_decode（&mut self）と同時に
+        // 保持できるようにするためである。
+        let budget = self.budget;
+        let decode_peak_bytes = hakutaku_format_detection::max_decode_peak_bytes(
+            self.decided
+                .as_ref()
+                .expect("直前の ensure_decided で Some になっているはず"),
+            end,
+        );
+        let decode_token = budget
+            .reserve(decode_peak_bytes)
+            .map_err(LoadFileError::DecodeMemoryBudgetExceeded)?;
+
         // BOM 長は consume_and_decode より前に読む。consume_and_decode が
         // consumed_before を進めるため、後から読むと「最初の呼び出しか」の
         // 判定が変わってしまう（順序依存）。
@@ -2262,6 +2354,18 @@ impl DecodeCursor {
         let decode_began = Instant::now();
         let decoded = self.consume_and_decode(end);
         self.decode_elapsed += decode_began.elapsed();
+
+        // 予約の振り替えは計時区間の外に置く（会計の費用でデコード時間の計測を
+        // 汚さない）。保持されるのはデコード結果の `String` だけなので、その
+        // 容量だけを実確保へ振り替え、見積もりに含めた一時分（Windows 経路の
+        // 中間 UTF-16 バッファなど）はトークンの破棄でそのまま返却する。
+        // デコードが失敗した経路では振り替えず、予約全量が破棄で戻る
+        // （ADR-0003「確保の失敗」）。
+        if decoded.is_ok() {
+            let retained = self.decoded.capacity().min(decode_token.remaining_bytes());
+            let _ = decode_token.mark_allocated(retained);
+        }
+        drop(decode_token);
 
         // 成否によらず、確保済みバッファは self へ戻してから抜ける。
         let outcome = match decoded {
@@ -2308,18 +2412,79 @@ impl DecodeCursor {
         outcome
     }
 
+    /// `carry` へ `additional` バイトを追記できるよう、容量が足りない場合だけ
+    /// 予約を経て広げます（`PERF-010`、Issue #32）。
+    ///
+    /// 新しい容量は `max(必要量, 現在の容量 × 2)` です。倍々成長にするのは、
+    /// 改行が現れない病的な入力でも再確保の回数を入力長の対数に抑えるため
+    /// です。通常の入力では `carry` の容量が1チャンク分で安定するため、この
+    /// 予約が実際に走るのは読み込み全体でほぼ1回だけであり、容量が足りている
+    /// 通常経路（ホットパス）には容量の比較しか残りません。
+    ///
+    /// # 拒否されたら読み込みを失敗させる理由
+    ///
+    /// [`crate::item::ensure_pending_capacity`] は予約が拒否されると事前確保を
+    /// 諦めて倍々成長へ縮退しますが、**ここは縮退させず失敗にします**。
+    /// あちらの事前確保は再確保の回数を減らすための最適化で、諦めても読み込み
+    /// そのものは継続できるのに対し、`carry` は行が確定するまで全量を保持する
+    /// 必要があり、諦める先がないためです（保持を諦めることは、その行を落とす
+    /// ことと同じになります）。
+    fn grow_carry_for(&mut self, additional: usize) -> Result<(), LoadFileError> {
+        let required = self.carry.len().saturating_add(additional);
+        let current_capacity = self.carry.capacity();
+        if required <= current_capacity {
+            return Ok(());
+        }
+        let new_capacity = required.max(current_capacity.saturating_mul(2));
+        let growth = new_capacity - current_capacity;
+
+        let token = self
+            .budget
+            .reserve(growth)
+            .map_err(LoadFileError::DecodeMemoryBudgetExceeded)?;
+        // `Vec::reserve_exact` を使うのは、倍々成長に任せると予約量と実際に
+        // 増えた容量がずれ、振り替え量が実態と合わなくなるためである
+        // （`crate::item::ensure_pending_capacity` と同じ理由）。
+        self.carry.reserve_exact(new_capacity - self.carry.len());
+        let allocated = self.carry.capacity().saturating_sub(current_capacity);
+        // 実際に増えた分だけを振り替える。予約量で上限を切るのは、アロケータが
+        // 要求より多く返した場合に `mark_allocated` が残量超過で失敗し、
+        // 振り替えが丸ごと失われるのを避けるためである。
+        let _ = token.mark_allocated(allocated.min(growth));
+        Ok(())
+    }
+
     /// 新しく届いたチャンクを取り込み、安全に確定できる行（末尾が改行の行、
     /// 常に `confirmed: true`）を [`Self::lines`] から取り出せる状態にします。
     /// 確定できる行がなければ空になり、未処理分は `carry` に残ります。
+    ///
+    /// `\n` の探索は**今回追記した範囲だけ**に限定します。呼び出しの合間の
+    /// `carry` に `\n` が残らないという不変条件（[`Self::carry`] の
+    /// doc コメント）が成り立つため、追記前の範囲を見直す必要がないためです。
+    /// `carry` 全体を毎回逆走査すると、改行が現れない入力で走査量が
+    /// 「蓄積量 × チャンク数」に膨らみます（Issue #32）。
     fn feed(&mut self, chunk: &[u8]) -> Result<(), LoadFileError> {
+        debug_assert!(
+            !self.carry.contains(&b'\n'),
+            "feed／finish の合間に carry へ \\n が残っている（追記範囲だけの\
+             探索が成り立たない。DecodeCursor::carry の doc コメント参照）"
+        );
+        let appended_from = self.carry.len();
+        // 追記より前に容量を広げる（`PERF-010`: 大きな確保の前に予約する）。
+        self.grow_carry_for(chunk.len())?;
         self.carry.extend_from_slice(chunk);
-        let Some(last_newline) = self.carry.iter().rposition(|&byte| byte == b'\n') else {
+
+        let Some(last_newline_in_chunk) = self.carry[appended_from..]
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+        else {
             // 確定できる行がない場合も、前回の行が残っていると呼び出し側が
             // 同じ行を二重に処理してしまうため、必ず空にする。
             self.line_spans.clear();
             return Ok(());
         };
-        self.decode_and_split(last_newline + 1)
+        // 追記範囲の中の位置なので、`carry` 全体での位置へ戻す。
+        self.decode_and_split(appended_from + last_newline_in_chunk + 1)
     }
 
     /// 読み込み終了時、`carry` に残った末尾断片をデコードします。断片が
@@ -2341,7 +2506,7 @@ impl DecodeCursor {
 fn build_control_load_summary(
     file_size_bytes: u64,
     reserved_bytes: usize,
-    cursor: &DecodeCursor,
+    cursor: &DecodeCursor<'_>,
     assembler: &crate::streaming_parse::StreamingAssembler,
     raw_display_due_to_profile: bool,
     profile_resolution_route: &'static str,
@@ -2414,12 +2579,18 @@ struct StreamedRegistration {
 /// [`PendingItem`] の並びをまとめて返します（`reload_source`・
 /// `restore_evicted_source` が使う、一括コミット用の共通経路。P08-5）。
 ///
-/// **本文（生バイト・デコード済み文字列のいずれも）をファイル全体分蓄積する
-/// ことはありません。** [`hakutaku_data_source::stream_snapshotted_bytes_chunked`]
-/// がチャンクごとに一時的な生バイト列だけを渡し、[`DecodeCursor`] がチャンク
-/// サイズ程度の一時デコードで生バイトオフセットを記録し、
-/// [`crate::streaming_parse::StreamingAssembler`] が本文を持たない
-/// [`PendingItem`]（`Copy`、ヒープ確保なし）だけを蓄積します。
+/// **本文（生バイト・デコード済み文字列のいずれも）を、読み終えた分まで
+/// 蓄積し続けることはありません。** [`hakutaku_data_source::
+/// stream_snapshotted_bytes_chunked`] がチャンクごとに一時的な生バイト列だけを
+/// 渡し、[`DecodeCursor`] が行を確定するたびにその範囲を捨てながら一時デコード
+/// で生バイトオフセットを記録し、[`crate::streaming_parse::StreamingAssembler`]
+/// が本文を持たない [`PendingItem`]（`Copy`、ヒープ確保なし）だけを蓄積する
+/// ためです。
+///
+/// ただし、行が確定しない間の保持量は行の長さで決まります。改行が現れない
+/// 入力では、[`DecodeCursor`] の `carry` とその一括デコード結果がファイル全量
+/// まで伸び得ます（Issue #32。詳細と有界性は [`DecodeCursor`] の doc コメント
+/// 「`carry` の大きさ」）。
 ///
 /// # 一時バッファの事前確保とメモリ会計
 ///
@@ -2456,7 +2627,10 @@ fn stream_decode_and_index(
     // 規則で得られる。
     let profile_datetime_format = profile_datetime_format(&resolution);
 
-    let mut cursor = DecodeCursor::new(profile_encoding);
+    let mut cursor = DecodeCursor::new(
+        profile_encoding,
+        hakutaku_memory_accounting::global_budget(),
+    );
     let mut assembler = crate::streaming_parse::StreamingAssembler::new(
         raw_display_due_to_profile,
         profile_datetime_format,
@@ -4420,6 +4594,215 @@ mod tests {
                 .collect::<Vec<_>>(),
             "既存分の生バイト範囲は追記前と同じ"
         );
+    }
+
+    // --- 改行を含まない入力（Issue #32。`PERF-007`・`PERF-008`・`PERF-010`） ---
+
+    /// 文字コード自動判定の [`DecodeCursor`] を、テスト用の予算を注入して作ります。
+    fn decode_cursor_with_budget(
+        budget: &hakutaku_memory_accounting::MemoryBudget,
+    ) -> DecodeCursor<'_> {
+        DecodeCursor::new(
+            hakutaku_format_detection::ProfileEncodingSetting::auto(),
+            budget,
+        )
+    }
+
+    // 受け入れ条件（Issue #32、`PERF-010`）: 改行を含まない入力で carry が
+    // 伸び続ける場合も、予約を経ずに確保されることはなく、予算が足りなくなった
+    // 時点で DecodeMemoryBudgetExceeded として失敗する。失敗した後に未消費の
+    // 予約が残らない（トークンの取りこぼしがない）ことも併せて確認する。
+    #[test]
+    fn feed_without_newline_is_rejected_when_the_injected_budget_runs_out() {
+        let budget = hakutaku_memory_accounting::MemoryBudget::new(256 * 1024);
+        let mut cursor = decode_cursor_with_budget(&budget);
+        let chunk = vec![b'a'; 8 * 1024];
+
+        // carry の容量は倍々に伸びるため、成長分が予算（256 KiB）を超えるまでの
+        // 回数は高々数十回に収まる。十分な上限を置き、そこまでに拒否されなければ
+        // 「予約を経ていない＝この修正が効いていない」としてテストを失敗させる。
+        let mut rejection = None;
+        for _ in 0..200 {
+            if let Err(error) = cursor.feed(&chunk) {
+                rejection = Some(error);
+                break;
+            }
+        }
+
+        let error = rejection.expect("改行なしで供給し続ければ、いずれ予約が拒否されるはず");
+        assert!(
+            matches!(error, LoadFileError::DecodeMemoryBudgetExceeded(_)),
+            "carry の伸長が拒否された場合は DecodeMemoryBudgetExceeded になるはず: {error}"
+        );
+        assert_eq!(
+            budget.outstanding_reserved_bytes(),
+            0,
+            "拒否された後に未消費の予約が残らないはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #32、`LOG-026`）: 改行を含まない入力でも、予算が
+    // 足りていれば複数チャンクにまたがって蓄積し、finish で1行として本文を
+    // 復元できる（末尾は未確定行になる）。
+    #[test]
+    fn feed_without_newline_accumulates_across_chunks_and_finishes_as_one_line() {
+        let budget = hakutaku_memory_accounting::MemoryBudget::new(64 * 1024 * 1024);
+        let mut cursor = decode_cursor_with_budget(&budget);
+        let chunks = ["最初のかたまり", "つづきのかたまり", "おしまい"];
+
+        for chunk in chunks {
+            cursor
+                .feed(chunk.as_bytes())
+                .expect("予算内なので成功するはず");
+            assert_eq!(
+                cursor.lines().count(),
+                0,
+                "改行が来るまで確定できる行はないはず"
+            );
+        }
+
+        cursor.finish().expect("予算内なので成功するはず");
+        let lines: Vec<(String, bool, u64)> = cursor
+            .lines()
+            .map(|line| (line.text.to_string(), line.confirmed, line.raw_offset))
+            .collect();
+
+        assert_eq!(lines.len(), 1, "改行がないので1行になるはず");
+        assert_eq!(
+            lines[0].0,
+            chunks.concat(),
+            "全チャンクの本文がつながるはず"
+        );
+        assert!(!lines[0].1, "末尾が改行で終わらないので未確定行になる");
+        assert_eq!(lines[0].2, 0);
+        assert!(cursor.last_line_unconfirmed());
+        assert_eq!(budget.outstanding_reserved_bytes(), 0);
+    }
+
+    // 受け入れ条件（Issue #32）: `\n` の探索を追記範囲だけへ限定しても、
+    // (a) 追記チャンク内に改行がある場合と (b) 無い場合が混ざった複数回の
+    // feed で、行分割の結果（本文・確定状態・生バイトオフセット）が変わらない。
+    #[test]
+    fn feed_splits_lines_identically_for_chunks_with_and_without_newlines() {
+        let budget = hakutaku_memory_accounting::MemoryBudget::new(64 * 1024 * 1024);
+        let mut cursor = decode_cursor_with_budget(&budget);
+        let chunks = [
+            "一行目\n二行",       // (a) 改行あり。行の途中で切れた断片が残る
+            "目のつづき",         // (b) 改行なし
+            "\n三行目\n四行目\n", // (a) 先頭の改行で前の断片が確定し、複数行が続く
+            "五行目のみ",         // (b) 改行なし
+            "\n",                 // (a) 改行だけのチャンク
+            "六行目（未確定）",   // (b) 改行なし
+        ];
+
+        let mut confirmed: Vec<(String, u64)> = Vec::new();
+        for chunk in chunks {
+            cursor
+                .feed(chunk.as_bytes())
+                .expect("予算内なので成功するはず");
+            for line in cursor.lines() {
+                assert!(line.confirmed, "feed が返す行は必ず確定行のはず");
+                confirmed.push((line.text.to_string(), line.raw_offset));
+            }
+        }
+        cursor.finish().expect("予算内なので成功するはず");
+        let trailing: Vec<(String, bool, u64)> = cursor
+            .lines()
+            .map(|line| (line.text.to_string(), line.confirmed, line.raw_offset))
+            .collect();
+
+        // 生バイトオフセットは連結した全体（1文字3バイトの日本語）に対する位置。
+        assert_eq!(
+            confirmed,
+            vec![
+                ("一行目".to_string(), 0),
+                ("二行目のつづき".to_string(), 10),
+                ("三行目".to_string(), 32),
+                ("四行目".to_string(), 42),
+                ("五行目のみ".to_string(), 52),
+            ]
+        );
+        assert_eq!(trailing, vec![("六行目（未確定）".to_string(), false, 68)]);
+    }
+
+    // 受け入れ条件（`PERF-010`、Issue #32）: 通常の複数行入力を読み終えた後、
+    // 未消費の予約が残らない（予約と、振り替え・破棄が釣り合っている）。
+    #[test]
+    fn decode_cursor_leaves_no_outstanding_reservation_after_a_normal_read() {
+        let budget = hakutaku_memory_accounting::MemoryBudget::new(64 * 1024 * 1024);
+        let mut contents = String::new();
+        for i in 0..500 {
+            contents.push_str(&format!(
+                "2026/07/28 15:12:{:02}.000 メッセージ{i}\n",
+                i % 60
+            ));
+        }
+
+        let mut cursor = decode_cursor_with_budget(&budget);
+        for chunk in contents.as_bytes().chunks(4096) {
+            cursor.feed(chunk).expect("予算内なので成功するはず");
+        }
+        cursor.finish().expect("予算内なので成功するはず");
+
+        assert_eq!(
+            budget.outstanding_reserved_bytes(),
+            0,
+            "読み終えた時点で未消費の予約は残らないはず"
+        );
+    }
+
+    // 受け入れ条件（Issue #32、`PERF-007`）: `\n` を1つも含まないファイルを
+    // 公開 API から読み込める。(a) `\r` だけで改行する旧 Mac 形式と
+    // (b) 改行のない単一行 JSON は、いずれも1論理行（1項目）として登録され、
+    // 本文がそのまま読める。
+    #[test]
+    fn register_source_reads_files_without_any_line_feed() {
+        let cases = [
+            ("cr-only", "行1\r行2\r行3"),
+            (
+                "single-line-json",
+                "{\"level\":\"INFO\",\"message\":\"改行なしの単一行\"}",
+            ),
+        ];
+
+        for (label, contents) in cases {
+            let mut registry = DisplaySetRegistry::new();
+            let budget = crate::budget::SourceBudget::new();
+            let file = TempFile::create_text(label, contents);
+
+            let (handle, summary) = register_source(
+                &mut registry,
+                &budget,
+                &file.path,
+                format!("{label}.log"),
+                &[],
+            )
+            .expect("改行を含まないファイルも読み込めるはず");
+
+            assert_eq!(
+                handle.total_items, 1,
+                "{label}: 改行がないので1論理行として登録されるはず"
+            );
+            assert!(
+                summary.has_unconfirmed_trailing_line,
+                "{label}: 末尾が改行で終わらないので未確定行になる（LOG-026）"
+            );
+
+            let response = registry
+                .fetch_range(
+                    handle.display_set_id,
+                    crate::display_set::RangeRequest {
+                        start: 0,
+                        max_items: 10,
+                        expected_generation: handle.generation,
+                    },
+                )
+                .expect("範囲取得は成功するはず");
+            assert_eq!(
+                &*response.items[0].raw_text, contents,
+                "{label}: 本文がそのまま読めるはず"
+            );
+        }
     }
 }
 
