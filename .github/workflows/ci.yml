@@ -188,6 +188,9 @@ jobs:
       # 純粋関数だけを呼ぶため試験データも WebView2 も要らない
       # （docs/verification/regression-checks.md）
       - run: node scripts/check-virtual-scroll.mjs
+      # 行選択モデル（飛び飛びの選択、ドラッグ、クランプ、コピー範囲の変換）の
+      # 回帰検査。これも純粋関数だけを呼ぶ（Issue #85）
+      - run: node scripts/check-selection.mjs
       # Markdown の相対リンクと見出しアンカーの整合を検査する（外部 URL は対象外）
       - run: node scripts/check-docs-links.mjs
       # 解析のみで、スクリプトは実行しない

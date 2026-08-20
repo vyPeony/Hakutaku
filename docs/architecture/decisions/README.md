@@ -46,5 +46,6 @@
 - [ADR-0006: フロントエンドはフレームワークとバンドラーを使わない素の ES モジュールで実装する](0006-frontend-vanilla-es-modules.md) — PERF-012 の保持観測を自前コードに閉じる、npm 実行時依存ゼロを維持（マージ時点で採用済み）
 - [ADR-0007: 再読み込みで合計 2 GB を超える場合は再読み込み全体を拒否する](0007-reload-total-size-limit.md) — 部分読み込み・自動クローズは採らない、snapshot_end 固定と compare-and-reserve（マージ時点で採用済み）
 - [ADR-0008: 時系列マージの順序規則と source_ordinal を確定する](0008-merge-order-rules.md) — 同一キーは source_ordinal → 出現順、重複はファイル識別子で除外（マージ時点で採用済み）
-- [ADR-0009: コピー形式は行選択 = 原文そのまま、セル範囲 = 可逆な quoted TSV とする](0009-clipboard-copy-format.md) — バックスラッシュ置換なし、CF_UNICODETEXT のみ、超過のみ拒否（マージ時点で採用済み）
+- [ADR-0009: コピー形式は行選択 = 原文そのまま、セル範囲 = 可逆な quoted TSV とする](0009-clipboard-copy-format.md) — **置き換え済み（Superseded。ADR-0011 が置き換え。[Issue #85](https://github.com/vyPeony/Hakutaku/issues/85)）**。バックスラッシュ置換なし、CF_UNICODETEXT のみ、超過のみ拒否
 - [ADR-0010: 診断ログは実値をマスキングせず出力し、`logs` フォルダの管理は利用者・導入組織の責任とする](0010-plaintext-diagnostic-logs.md) — マスキング必須化・暗号化・アクセス制御は採らない、版 1.10 の確定要件（`DIAG-003`〜`005`、`SEC-005`、`SEC-007`）と P01 実装の判断記録（マージ時点で採用済み）
+- [ADR-0011: クリップボードコピーは常に原文そのままとし、列の選択と quoted TSV を廃止する](0011-copy-raw-text-only.md) — ADR-0009 を置き換え、選択は互いに素な範囲の集合（飛び飛び・ドラッグ）、上限は全範囲の合計で判定（マージ時点で採用済み）
