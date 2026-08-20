@@ -17,6 +17,11 @@
 //! 小さい「参照列」だけを保持します（計画正本 4.2「統合結果全体の複製は可能な
 //! 限り避ける」、`PERF-008`）。
 //!
+//! ただし**構築中のピークはこれより大きくなります**。[`build_merged_order`] は
+//! 並べ替え用の一時列（[`MergeSortKey`]）を全項目分作り、結果列へ詰め替える間
+//! この2本が同時に生存するためです。予約はこのピークで取ります
+//! （[`reserve_merged_order`]、Issue #32）。
+//!
 //! # 順序規則（ADR-0008）
 //!
 //! 1. 比較キー（ミリ秒精度に正規化済み、`LOG-024`・`LOG-025`）昇順
@@ -58,12 +63,30 @@ pub(crate) struct MergeMember<'a> {
     pub entries: &'a [LineIndexEntry],
 }
 
+/// [`build_merged_order`] が並べ替えに使う一時列の1要素です
+/// （`(実効比較キー, source_ordinal, ソース内 seq, source_id)`）。
+///
+/// 型として名前を付けているのは、[`reserve_merged_order`] の予約量がこの型の
+/// 大きさに依存するためです（係数をハードコードせず
+/// [`std::mem::size_of`] で参照し、要素が増減したら予約量も自動的に追従
+/// させます）。
+type MergeSortKey = (i64, u32, u64, u32);
+
+/// 統合表示の並べ替えで、項目1件あたり**同時に生存し得る**最悪バイト数です
+/// （[`reserve_merged_order`] の係数。導出根拠は同関数の doc コメント）。
+pub(crate) const MERGED_ORDER_PEAK_BYTES_PER_ITEM: usize =
+    std::mem::size_of::<MergeSortKey>() + std::mem::size_of::<ItemId>();
+
 /// ADR-0008 の順序規則に従い、複数ソースの索引を横断する順序付き参照列
 /// （`(source_id, seq)` の並び）を構築します。
 ///
 /// 決定的です。同じ `members`（内容・並び）を渡せば、何度呼んでも同じ結果を
 /// 返します（呼び出し順は結果に影響しません。ソートキーに `source_ordinal` を
 /// 含むため）。
+///
+/// 実行中のピークは、並べ替え用の一時列（[`MergeSortKey`]）と結果列
+/// （[`ItemId`]）が変換の間だけ同時に生存する形です
+/// （[`reserve_merged_order`] の予約モデルと一致させています）。
 #[must_use]
 pub(crate) fn build_merged_order(members: &[MergeMember<'_>]) -> Vec<ItemId> {
     let total: usize = members.iter().map(|member| member.entries.len()).sum();
@@ -71,7 +94,7 @@ pub(crate) fn build_merged_order(members: &[MergeMember<'_>]) -> Vec<ItemId> {
     // 先頭3要素の組は全項目で一意（source_ordinal はソースごとに一意、seq は
     // ソース内で一意なため）であり、安定ソートである必要はない
     // （sort_unstable_by で十分。かつ決定的）。
-    let mut combined: Vec<(i64, u32, u64, u32)> = Vec::with_capacity(total);
+    let mut combined: Vec<MergeSortKey> = Vec::with_capacity(total);
 
     for member in members {
         // ソース内で直前に出現した日時付き項目のキー（モジュール doc コメント
@@ -92,20 +115,50 @@ pub(crate) fn build_merged_order(members: &[MergeMember<'_>]) -> Vec<ItemId> {
 
     combined.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
-    combined
-        .into_iter()
-        .map(|(_, _, seq, source_id)| ItemId { source_id, seq })
-        .collect()
+    // `into_iter().map().collect()` ではなく、結果列を明示的に確保して詰め替
+    // える。`collect` は条件が揃うと一時列の確保をそのまま作り替えて再利用する
+    // （in-place 特殊化）ことがあり、実確保の形が標準ライブラリの内部実装に
+    // 左右される。ここでは `reserve_merged_order` の予約モデル（一時列と結果列
+    // が変換の間だけ同時に生存する）と実装を決定的に一致させたいので、確保の
+    // 形をこちらで固定する。
+    let mut order: Vec<ItemId> = Vec::with_capacity(total);
+    for &(_, _, seq, source_id) in &combined {
+        order.push(ItemId { source_id, seq });
+    }
+    // 予約は「一時列と結果列が同時に生存する」ピークで取っているため、一時列は
+    // 呼び出し側へ戻る前にここで解放する。
+    drop(combined);
+    order
 }
 
-/// [`build_merged_order`] が必要とする参照列の予約バイト数を計算し、
-/// `budget` へ予約します（`PERF-008`・`PERF-010`）。
+/// [`build_merged_order`] の実行中に同時に生存する確保量を計算し、`budget` へ
+/// 予約します（`PERF-008`・`PERF-010`、Issue #32）。
 ///
-/// 呼び出し側（`crate::registry::DisplaySetRegistry`）は、予約が成功した後に
-/// [`build_merged_order`] を実行し、完了後にトークンの
-/// [`hakutaku_memory_accounting::ReservationToken::mark_allocated`] で実確保へ
-/// 振り替えてください。予約が拒否された場合、統合表示集合の構築を開始しては
-/// いけません（計画正本「予約が拒否されたら統合表示を開始せずエラー」）。
+/// # ピークのモデル
+///
+/// 予約量は `total_items` × [`MERGED_ORDER_PEAK_BYTES_PER_ITEM`]
+/// （= [`MergeSortKey`] 1件 + [`ItemId`] 1件。64ビット環境で 24 + 16 =
+/// 40バイト）です。[`build_merged_order`] は、まず並べ替え用の一時列
+/// （`Vec<MergeSortKey>`）を全項目分作って整列し、そのあと結果列
+/// （`Vec<ItemId>`）へ詰め替えます。**詰め替えの間、この2本は同時に生存する**
+/// ため、結果列だけを数えると実際のピークの半分以下しか予約しないことに
+/// なります（Issue #32 の経路2。以前は `ItemId` 1件分＝16バイトだけを予約して
+/// いました）。
+///
+/// 一時列を先に捨ててから結果列を作ることはできません。詰め替えの入力が
+/// 一時列そのものだからです。したがって「同時に生存する2本」がこの関数の
+/// 予約対象であり、[`build_merged_order`] 側も `collect` の最適化任せにせず
+/// この形になるよう明示的に確保しています。
+///
+/// # 呼び出し側の契約
+///
+/// 予約が成功した後に [`build_merged_order`] を実行し、完了後にトークンの
+/// [`hakutaku_memory_accounting::ReservationToken::mark_allocated`] で、
+/// **呼び出しから戻ったあとも残る分**（結果列＝`ItemId` × 件数）だけを実確保へ
+/// 振り替えてください。一時列は既に解放されているため、振り替えずに残った予約
+/// はトークンの破棄で戻ります（ADR-0003）。予約が拒否された場合、統合表示集合の
+/// 構築を開始してはいけません（計画正本「予約が拒否されたら統合表示を開始せず
+/// エラー」）。
 pub(crate) fn reserve_merged_order(
     budget: &hakutaku_memory_accounting::MemoryBudget,
     total_items: usize,
@@ -113,7 +166,7 @@ pub(crate) fn reserve_merged_order(
     hakutaku_memory_accounting::ReservationToken<'_>,
     hakutaku_memory_accounting::ReservationRejected,
 > {
-    let bytes = total_items.saturating_mul(std::mem::size_of::<ItemId>());
+    let bytes = total_items.saturating_mul(MERGED_ORDER_PEAK_BYTES_PER_ITEM);
     budget.reserve(bytes)
 }
 
@@ -499,17 +552,28 @@ mod tests {
     // --- reserve_merged_order（PERF-008・PERF-010） ---
 
     // 受け入れ条件: 参照列の予約が P02 の予約経路を通る（会計値の観測）。
+    // 受け入れ条件（Issue #32 の経路2）: 予約量が実ピーク（並べ替え用の一時列と
+    // 結果列が同時に生存する分＝1件40バイト）と一致する。結果列だけを数えた
+    // 16バイト/件では、実際の確保の半分以下しか予約していなかった。
     #[test]
-    fn reserve_merged_order_reserves_item_id_sized_bytes_per_item() {
+    fn reserve_merged_order_reserves_sort_key_and_item_id_bytes_per_item() {
         let budget = MemoryBudget::new(1_000_000);
         assert_eq!(budget.outstanding_reserved_bytes(), 0);
 
+        // 係数はハードコードせず型の大きさから導くが、64ビット環境での実値
+        // （24 + 16 = 40バイト）が変わっていないことも合わせて固定する。
+        assert_eq!(std::mem::size_of::<MergeSortKey>(), 24);
+        assert_eq!(std::mem::size_of::<ItemId>(), 16);
+        assert_eq!(MERGED_ORDER_PEAK_BYTES_PER_ITEM, 40);
+
         let token = reserve_merged_order(&budget, 100).expect("予算内なので成功するはず");
-        let expected_bytes = 100 * std::mem::size_of::<ItemId>();
+        let expected_bytes = 100 * MERGED_ORDER_PEAK_BYTES_PER_ITEM;
         assert_eq!(budget.outstanding_reserved_bytes(), expected_bytes);
 
+        // 呼び出しから戻ったあとも残るのは結果列だけなので、振り替えるのは
+        // その分（16バイト/件）で、残りはトークンの破棄で戻る。
         token
-            .mark_allocated(expected_bytes)
+            .mark_allocated(100 * std::mem::size_of::<ItemId>())
             .expect("予約量以内の振り替えは成功するはず");
         drop(token);
         assert_eq!(
@@ -517,6 +581,26 @@ mod tests {
             0,
             "実確保へ振り替えた後は予約が残らないはず"
         );
+    }
+
+    // 受け入れ条件（Issue #32 の経路2）: 予算がちょうど 40n バイトなら予約でき、
+    // 1バイト足りなければ拒否される（境界値。16n を前提にしていた頃は、この
+    // 予算帯でも予約が通ってしまい実確保が予算を超えていた）。
+    #[test]
+    fn reserve_merged_order_boundary_accepts_exact_peak_and_rejects_one_byte_less() {
+        let items = 100usize;
+        let peak_bytes = items * MERGED_ORDER_PEAK_BYTES_PER_ITEM;
+
+        let exact = MemoryBudget::new(peak_bytes);
+        let token = reserve_merged_order(&exact, items).expect("ピークちょうどなら成功するはず");
+        assert_eq!(exact.outstanding_reserved_bytes(), peak_bytes);
+        drop(token);
+
+        let one_short = MemoryBudget::new(peak_bytes - 1);
+        let rejected = reserve_merged_order(&one_short, items)
+            .expect_err("ピークに1バイト足りなければ拒否されるはず");
+        assert_eq!(rejected.requested_bytes, peak_bytes);
+        assert_eq!(one_short.outstanding_reserved_bytes(), 0);
     }
 
     // 受け入れ条件: 予約が拒否されたら統合表示を開始せずエラーになる

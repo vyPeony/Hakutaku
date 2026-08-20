@@ -9,6 +9,30 @@ use crate::decision::{DecidedEncoding, SelectedEncoding};
 /// `true` になり、それ以降の不正位置は一覧に含まれません。
 pub const MAX_INVALID_POSITIONS: usize = 100;
 
+/// UTF-8 経路で [`decode`] が確保し得る、入力1バイトあたりの最悪バイト数です
+/// （[`max_decode_peak_bytes`] の係数。導出根拠は同関数の doc コメント）。
+const UTF8_PEAK_BYTES_PER_INPUT_BYTE: usize = 6;
+
+/// Windows コードページ経路で [`decode`] が確保し得る、入力1バイトあたりの
+/// 最悪バイト数です（[`max_decode_peak_bytes`] の係数。導出根拠は同関数の
+/// doc コメント）。
+const WINDOWS_PEAK_BYTES_PER_INPUT_BYTE: usize = 8;
+
+/// [`max_decode_peak_bytes`] が、入力長に比例しない分として加算するバイト数です。
+///
+/// 内訳は次の2つです。
+///
+/// - **不正位置一覧**（`Vec<usize>`）: 最大 [`MAX_INVALID_POSITIONS`] 件を倍々
+///   成長で溜めるため、確保済み容量は最大 `100.next_power_of_two()` = 128 要素
+///   です。さらに [`decode`] が BOM 分を加算して別の `Vec` へ集める区間では
+///   変換前後の2本が同時に生きるため、2倍を見込みます
+/// - **極小の入力での端数**: `String` と `Vec` は最小確保単位（`RawVec` の
+///   `MIN_NON_ZERO_CAP`。1バイト要素では8）を下回る容量を確保しないため、
+///   入力長への比例だけでは数バイトの入力で実際の確保量を下回ります。この
+///   固定分がその端数を吸収します
+const FIXED_OVERHEAD_BYTES: usize =
+    MAX_INVALID_POSITIONS.next_power_of_two() * std::mem::size_of::<usize>() * 2;
+
 /// [`decode`] の結果です。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeOutcome {
@@ -92,6 +116,89 @@ pub fn decode(bytes: &[u8], decided: &DecidedEncoding) -> Result<DecodeOutcome, 
         invalid_positions,
         invalid_positions_truncated: raw.truncated,
     })
+}
+
+/// `input_len` バイトを [`decode`] したときに、実行中**同時に生存し得る**追加
+/// ヒープ確保量の最悪合計（バイト）を見積もります（`PERF-008`・`PERF-010`、
+/// Issue #32）。
+///
+/// # 何のために公開しているか
+///
+/// `PERF-010` は大規模な確保の**前**に予約・拒否することを求めますが、
+/// [`decode`] が内部で確保する量は呼び出し側（読み込み経路、オンデマンド
+/// 読み出し経路）から見えず、予約量を決められません。呼び出し側はこの値を
+/// `hakutaku_memory_accounting::MemoryBudget::reserve` へ渡して確保前に予約し、
+/// 予約が通ったら [`decode`] を呼び、実際に得た [`DecodeOutcome::text`] の容量を
+/// `ReservationToken::mark_allocated` で実確保へ振り替えます（ADR-0003）。
+/// 本クレートはメモリ会計クレートに依存しない（判定・デコードの純粋なロジックに
+/// 閉じる）ため、見積もりだけを純関数として提供します。
+///
+/// `input_len` には [`decode`] へ渡す `bytes` の長さを渡してください。BOM 分
+/// （`decided.bom_len`、最大3バイト）は差し引きません（差し引かない方が過大側
+/// = 安全側で、しかも呼び出し側が長さを取り違える余地がないため）。
+///
+/// # 見積もりの前提: 何を「同時に生存する量」と数えるか
+///
+/// 計装アロケータは `realloc` の**差分だけ**を `allocated_bytes` へ計上します
+/// （ADR-0003 の会計契約）。したがって再確保の瞬間に旧容量と新容量が同時に
+/// 生きる分は会計値へ現れず、ここで数えるのは「ある時点で同時に確保されている
+/// 容量の合計」の最大値です。
+///
+/// 見積もりの土台は、`String` と `Vec` の伸長が償却的な倍々成長
+/// （新容量 = `max(旧容量 × 2, 必要量)`）である点です。伸長が起きた時点の旧容量は
+/// 必ずその時点の長さ未満なので、**伸長を経た確保済み容量は最終長の2倍を
+/// 超えません**。以下の各経路はこの性質だけを使い、標準ライブラリが初期容量を
+/// どう見積もるかには依存しません。
+///
+/// # 経路別の導出
+///
+/// ## UTF-8（[`SelectedEncoding::Utf8`]）: `input_len` × 6
+///
+/// この経路が確保するのは出力 `String` だけです。`decode_utf8_lossy_with_positions`
+/// は不正区間1つにつき U+FFFD（UTF-8 で3バイト）を1つだけ push しますが、区間長は
+/// 最小1バイトなので、**入力1バイトが出力3バイトへ膨らむ**のが最悪です（妥当な
+/// 部分はそのまま複写するので1対1）。よって最終長は最悪 `input_len` × 3、
+/// 確保済み容量は倍々成長の性質からその2倍の `input_len` × 6 を超えません。
+///
+/// ## Windows コードページ（[`SelectedEncoding::Windows`]）: `input_len` × 8
+///
+/// `crate::win32::decode_windows_codepage` は、中間の UTF-16 バッファと最終の
+/// `String` を**同時に**生かします（`String::from_utf16_lossy(&wide)` は `wide` を
+/// 借用したまま `String` を組み立てるため）。合計がこの経路の最悪ピークです。
+///
+/// - **中間の `Vec<u16>`**: `MultiByteToWideChar` が返す UTF-16 コード単位数
+///   ぴったりで確保します（`truncate` は容量を縮めません）。単位を1つ生成する
+///   のに入力を最低1バイト消費する（SBCS は1バイト→1単位、DBCS は2バイト
+///   →1単位、UTF-8・GB18030 の4バイト列はサロゲートペアで2単位、不正バイトは
+///   1バイト→置換1単位）ため、単位数は `input_len` を超えません。1単位2バイトで
+///   `input_len` × 2 バイト
+/// - **最終の `String`**: 1コード単位は UTF-8 で最大3バイトなので最終長は
+///   `input_len` × 3 を超えず、確保済み容量は倍々成長の性質からその2倍の
+///   `input_len` × 6 バイト
+///
+/// 不正位置の近似特定に使うチャンク単位の一時バッファ
+/// （`WINDOWS_CODEPAGE_SCAN_CHUNK_BYTES` バイトごと。Windows 専用モジュール
+/// `crate::win32` で定義）は、1本ずつ確保して破棄し、しかもチャンク長は
+/// `input_len` 以下なので、中間バッファ分の見積もりに収まります。
+///
+/// ## 入力長に比例しない固定分
+///
+/// 上記に `FIXED_OVERHEAD_BYTES` を加算します（内訳は同定数の doc コメント）。
+///
+/// # オーバーフロー
+///
+/// 算術はすべて飽和演算です。飽和した場合の戻り値は [`usize::MAX`] 近傍と
+/// なり、予約側（`MemoryBudget::reserve` は `checked_add` でオーバーフローする
+/// 要求を拒否します）で必ず拒否されるため、安全側へ倒れます。
+#[must_use]
+pub fn max_decode_peak_bytes(decided: &DecidedEncoding, input_len: usize) -> usize {
+    let bytes_per_input_byte = match decided.encoding {
+        SelectedEncoding::Utf8 => UTF8_PEAK_BYTES_PER_INPUT_BYTE,
+        SelectedEncoding::Windows(_) => WINDOWS_PEAK_BYTES_PER_INPUT_BYTE,
+    };
+    input_len
+        .saturating_mul(bytes_per_input_byte)
+        .saturating_add(FIXED_OVERHEAD_BYTES)
 }
 
 /// UTF-8 として `bytes` をデコードします。不正なバイト列は U+FFFD へ置換し、
@@ -222,5 +329,141 @@ mod tests {
         let outcome = decode(&bytes, &decided_utf8(0)).unwrap();
         assert_eq!(outcome.invalid_positions.len(), MAX_INVALID_POSITIONS);
         assert!(outcome.invalid_positions_truncated);
+    }
+
+    // ---------------------------------------------------------------
+    // max_decode_peak_bytes（`PERF-010` の予約量見積もり、Issue #32）。
+    // ---------------------------------------------------------------
+
+    fn decided_windows(codepage: u32) -> DecidedEncoding {
+        DecidedEncoding {
+            encoding: SelectedEncoding::Windows(codepage),
+            route: DetectionRoute::ProfileSpecified(
+                crate::decision::ProfileSpecifiedKind::AnsiCodepage,
+            ),
+            bom_len: 0,
+            warnings: Vec::new(),
+        }
+    }
+
+    // 受け入れ条件（`PERF-010`）: UTF-8 経路の見積もりが、入力長 × 6 + 固定分に
+    // なる（出力 `String` は入力1バイトあたり最大3バイトへ膨らみ、倍々成長で
+    // 確保済み容量は最終長の2倍を超えない）。
+    #[test]
+    fn max_decode_peak_bytes_for_utf8_is_six_times_input_plus_fixed_overhead() {
+        for input_len in [0usize, 1, 7, 4096, 64 * 1024] {
+            assert_eq!(
+                max_decode_peak_bytes(&decided_utf8(0), input_len),
+                input_len * 6 + FIXED_OVERHEAD_BYTES,
+                "入力長 {input_len} の UTF-8 経路の見積もり"
+            );
+        }
+    }
+
+    // 受け入れ条件（`PERF-010`）: Windows コードページ経路の見積もりが、入力長
+    // × 8 + 固定分になる（中間 UTF-16 バッファの2倍と、最終 `String` の6倍が
+    // 同時に生きる）。
+    #[test]
+    fn max_decode_peak_bytes_for_windows_codepage_is_eight_times_input_plus_fixed_overhead() {
+        for input_len in [0usize, 1, 7, 4096, 64 * 1024] {
+            assert_eq!(
+                max_decode_peak_bytes(&decided_windows(932), input_len),
+                input_len * 8 + FIXED_OVERHEAD_BYTES,
+                "入力長 {input_len} の Windows コードページ経路の見積もり"
+            );
+        }
+    }
+
+    // 受け入れ条件（`PERF-010`）: 極端な入力長でもパニックせず飽和する
+    // （飽和値は予約側の `checked_add` / 予算判定で必ず拒否されるため安全側）。
+    #[test]
+    fn max_decode_peak_bytes_saturates_instead_of_overflowing() {
+        for decided in [decided_utf8(0), decided_windows(932)] {
+            // 係数を掛けた時点で必ずあふれる領域では usize::MAX へ張り付く。
+            for input_len in [usize::MAX, usize::MAX - 1, usize::MAX / 2] {
+                assert_eq!(
+                    max_decode_peak_bytes(&decided, input_len),
+                    usize::MAX,
+                    "飽和するはず（encoding={:?}、input_len={input_len}）",
+                    decided.encoding
+                );
+            }
+
+            // あふれない領域では飽和させず、入力長より大きい比例値を返す
+            // （飽和を理由に一律 usize::MAX を返して常に拒否させることはしない）。
+            let modest = usize::MAX / 16;
+            let estimate = max_decode_peak_bytes(&decided, modest);
+            assert!(
+                estimate > modest && estimate < usize::MAX,
+                "あふれない入力長では比例値を返すはず（encoding={:?}、estimate={estimate}）",
+                decided.encoding
+            );
+        }
+    }
+
+    // 受け入れ条件（`PERF-010`）: UTF-8 経路の実測が見積もりを超えない。最悪比率
+    // （全バイトが不正 = 1バイトが U+FFFD の3バイトへ膨らむ）を含めて確認する。
+    #[test]
+    fn max_decode_peak_bytes_covers_actual_utf8_decode() {
+        let worst_case = vec![0xFFu8; MAX_INVALID_POSITIONS + 10];
+        let samples: [&[u8]; 4] = [
+            b"abc\xFFdef",
+            "日本語のログ行です".as_bytes(),
+            &worst_case,
+            b"",
+        ];
+        for bytes in samples {
+            let decided = decided_utf8(0);
+            let estimate = max_decode_peak_bytes(&decided, bytes.len());
+            let outcome = decode(bytes, &decided).unwrap();
+            assert!(
+                outcome.text.len() <= estimate,
+                "出力長 {} が見積もり {} を超えた（入力長 {}）",
+                outcome.text.len(),
+                estimate,
+                bytes.len()
+            );
+            assert!(
+                outcome.text.capacity() <= estimate,
+                "確保済み容量 {} が見積もり {} を超えた（入力長 {}）",
+                outcome.text.capacity(),
+                estimate,
+                bytes.len()
+            );
+        }
+    }
+
+    // 受け入れ条件（`PERF-010`）: Windows コードページ経路の実測が見積もりを
+    // 超えない（CP932 の日本語、CP1252 の高位バイト、CP932 として不正な組）。
+    // `MultiByteToWideChar` を呼ぶため Windows でのみ実行する。
+    #[cfg(windows)]
+    #[test]
+    fn max_decode_peak_bytes_covers_actual_windows_codepage_decode() {
+        let invalid_cp932 = [0x4Fu8, 0x4B, 0x3A, 0x81, 0x30, 0x3A, 0x45, 0x4E, 0x44];
+        let samples: [(&[u8], u32); 4] = [
+            (&[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA], 932),
+            (&[0x63, 0x61, 0x66, 0xE9, 0x20, 0x80], 1252),
+            (&invalid_cp932, 932),
+            (b"", 932),
+        ];
+        for (bytes, codepage) in samples {
+            let decided = decided_windows(codepage);
+            let estimate = max_decode_peak_bytes(&decided, bytes.len());
+            let outcome = decode(bytes, &decided).unwrap();
+            assert!(
+                outcome.text.len() <= estimate,
+                "出力長 {} が見積もり {} を超えた（コードページ {codepage}、入力長 {}）",
+                outcome.text.len(),
+                estimate,
+                bytes.len()
+            );
+            assert!(
+                outcome.text.capacity() <= estimate,
+                "確保済み容量 {} が見積もり {} を超えた（コードページ {codepage}、入力長 {}）",
+                outcome.text.capacity(),
+                estimate,
+                bytes.len()
+            );
+        }
     }
 }

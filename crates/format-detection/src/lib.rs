@@ -107,7 +107,9 @@ pub use decision::{
     EncodingWarningKind, InvalidEncodingNameError, ProfileEncodingSetting, ProfileSpecifiedKind,
     SelectedEncoding, UnsupportedEncoding, Utf16BomKind, UTF8_AUTO_DETECT_PREFIX_BYTES,
 };
-pub use decode::{decode, DecodeError, DecodeOutcome, MAX_INVALID_POSITIONS};
+pub use decode::{
+    decode, max_decode_peak_bytes, DecodeError, DecodeOutcome, MAX_INVALID_POSITIONS,
+};
 #[cfg(windows)]
 pub use win32::WINDOWS_CODEPAGE_SCAN_CHUNK_BYTES;
 
