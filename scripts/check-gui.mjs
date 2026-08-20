@@ -37,7 +37,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 
-import { SCREENSHOT_DIR, killRunningApp, launchApp } from "./gui/app.mjs";
+import { SAMPLE_TARGETS, SCREENSHOT_DIR, killRunningApp, launchApp } from "./gui/app.mjs";
 import { createChecker } from "./gui/assert.mjs";
 import * as startupSmoke from "./gui/scenarios/01-startup-smoke.mjs";
 import * as openConfiguredSource from "./gui/scenarios/02-open-configured-source.mjs";
@@ -48,6 +48,7 @@ import * as selectAndCopy from "./gui/scenarios/06-select-and-copy.mjs";
 import * as mergedView from "./gui/scenarios/07-merged-view.mjs";
 import * as closeTab from "./gui/scenarios/08-close-tab.mjs";
 import * as detailPanel from "./gui/scenarios/09-detail-panel.mjs";
+import * as horizontalContainment from "./gui/scenarios/10-horizontal-containment.mjs";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const DEFAULT_EXE_PATH = resolve(
@@ -86,6 +87,7 @@ const SCENARIOS = [
   mergedView,
   closeTab,
   detailPanel,
+  horizontalContainment,
 ];
 
 // ---------------------------------------------------------------------------
@@ -138,9 +140,20 @@ function printUsage() {
 /**
  * サンプル一式が使える状態かどうかを判定する。
  *
- * 判定方法は `scripts/start-manual-check.ps1` と同じ。`hakutaku.yaml` の有無だけ
- * では、サンプルが増える前に作られた古い一式が残っている場合を検出できないため、
- * 設定が指すファイルが実際に存在するかまで確認する。
+ * 判定は2段構えにする。`hakutaku.yaml` の有無だけでは、サンプルが増える前に
+ * 作られた古い一式が残っている場合を検出できないためである。
+ *
+ * 1. 設定が指すファイルが実際に存在するか（`scripts/start-manual-check.ps1` と
+ *    同じ判定）
+ * 2. シナリオが開く表示名（`SAMPLE_TARGETS`）が、すべて設定の `name:` 行に
+ *    現れるか
+ *
+ * 2 が要る理由（Issue #78 で恒久対策にした既知の落とし穴）: サンプルを**追加**
+ * したとき、古い一式は「設定が指すファイルがすべて存在する」ため 1 だけでは
+ * 合格してしまい、再生成が省略される。その結果、新しいサンプルを開くシナリオ
+ * だけが「対象が一覧に無い」という原因の分かりにくい失敗になる（`08-large.log`
+ * で実際に踏んだ。`scripts/gui/app.mjs` の `SAMPLE_TARGETS` のコメント参照）。
+ * 表示名まで照合すれば、サンプルが増えるたびに古い一式が自動で作り直される。
  *
  * @param {string} configPath
  * @returns {{ ok: true } | { ok: false, reason: string }}
@@ -156,12 +169,20 @@ function inspectSampleSet(configPath) {
     return { ok: false, reason: `${configPath} を読めません（${error?.message ?? error}）` };
   }
 
-  // 生成される YAML は `    path: '…'` の固定形式（`log_profiles` 側は
-  // `path_pattern` なので混ざらない）。単一引用符スカラーの規則どおり `''` を
-  // `'` へ戻す（`generate-sample-logs.ps1` の `Format-YamlSingleQuoted`）。
+  // 生成される YAML は `  - name: '…'` と `    path: '…'` の固定形式
+  // （`log_profiles` 側は `path_pattern` なので path とは混ざらない。`name:` は
+  // 両方に現れるが、照合は「表示名が現れるか」だけなので誤検出にならない）。
+  // 単一引用符スカラーの規則どおり `''` を `'` へ戻す
+  // （`generate-sample-logs.ps1` の `Format-YamlSingleQuoted`）。
   const missing = [];
+  const declaredNames = new Set();
   let sawPath = false;
   for (const line of text.split(/\r?\n/)) {
+    const matchedName = /^\s*-?\s*name:\s*'(.*)'\s*$/.exec(line);
+    if (matchedName) {
+      declaredNames.add(matchedName[1].replaceAll("''", "'"));
+      continue;
+    }
     const matched = /^\s*path:\s*'(.*)'\s*$/.exec(line);
     if (!matched) {
       continue;
@@ -179,6 +200,18 @@ function inspectSampleSet(configPath) {
     return {
       ok: false,
       reason: `設定が指すファイルのうち ${missing.length} 件がありません（例: ${missing[0]}）`,
+    };
+  }
+
+  const missingNames = Object.values(SAMPLE_TARGETS).filter(
+    (displayName) => !declaredNames.has(displayName),
+  );
+  if (missingNames.length > 0) {
+    return {
+      ok: false,
+      reason:
+        `シナリオが開く対象のうち ${missingNames.length} 件が設定にありません` +
+        `（例: ${missingNames[0]}）。サンプルが増える前の古い一式が残っている可能性があります`,
     };
   }
   return { ok: true };

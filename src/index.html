@@ -70,6 +70,13 @@
             ON で開いている全ソースを横断する統合表示（統合タブ1つ）を表示し、
             OFF でファイル別タブ表示へ戻す（LOG-015。分割表示は作らない）。
             src/shell.js が押下・表示ラベルの更新を行う。
+
+            Issue #83 で一時無効化。再開は #82 の改修実装時（統合表示の表示
+            品質の課題を #82 に仕様改善案として集約済み）。disabled と title
+            はここで静的に付与し、src/shell.js 側は
+            MERGED_VIEW_TEMPORARILY_DISABLED によりクリックハンドラーを
+            登録しない（統合表示の実装本体は削除しない。再開時はこの
+            disabled／title と src/shell.js の定数を外す）。
           -->
           <div class="view-toolbar" id="view-toolbar">
             <button
@@ -77,6 +84,8 @@
               id="merged-view-toggle"
               class="merged-view-toggle"
               aria-pressed="false"
+              disabled
+              title="時系列統合表示は表示の改修中のため一時的に使えません（Issue #82）"
             >
               時系列統合: OFF
             </button>
@@ -94,30 +103,6 @@
             <div class="log-toolbar" id="log-toolbar">
               <span class="log-toolbar__label" id="log-source-label"></span>
               <span class="log-toolbar__count" id="log-total-items"></span>
-              <!--
-                コピー列の選択（P10、COPY-001）。行選択（クリック・
-                Shift+クリック・Ctrl+A）で選ぶのは「どの行を」コピーするかで
-                あり、ここで選ぶのは「どの列を」コピーするか（本文のみ =
-                原文そのまま、複数列 = quoted TSV。ADR-0009）。「選択メニュー
-                （右クリックまたはツールバー）で列の組を選んでコピー」という
-                計画正本の最小実装案のうち、常設のツールバー方式を採用した
-                （src/log_view.js のモジュール doc コメント参照）。
-              -->
-              <div class="log-toolbar__copy-columns" id="log-copy-columns">
-                <span class="log-toolbar__copy-columns-label">コピー列</span>
-                <label class="log-toolbar__copy-columns-option">
-                  <input type="checkbox" id="log-copy-column-line-number" />
-                  行番号
-                </label>
-                <label class="log-toolbar__copy-columns-option">
-                  <input type="checkbox" id="log-copy-column-timestamp" />
-                  日時
-                </label>
-                <label class="log-toolbar__copy-columns-option">
-                  <input type="checkbox" id="log-copy-column-raw-text" checked />
-                  本文
-                </label>
-              </div>
               <!--
                 行番号でジャンプ（P08-2、tasks/phase-08-log-view.md
                 作業項目4）。表示集合内のインデックスへスクロールする（原本の
@@ -155,18 +140,20 @@
               この要素に対して自然に働くようにする（Ctrl+Home／Ctrl+End だけ
               src/log_view.js の handleViewportKeydown が明示的に処理する）。
 
-              P10（COPY-001／002）: 行クリック・Shift+クリックで
-              行を選択し、Ctrl+A で全行選択、Ctrl+C でクリップボードへコピー
-              する（いずれも handleViewportKeydown／handleRowsClick が扱う）。
-              選択はインデックス範囲だけを保持し（PERF-012）、ブラウザ既定の
-              テキスト選択（P04-4 の最小コピー）は置き換えた
+              選択とコピー（COPY-001／002、Issue #85）: クリックで単一行、
+              Shift+クリックでアンカーからの範囲、Ctrl+クリックで行単位の
+              追加・除外（飛び飛びの選択）、ドラッグで連続範囲、Ctrl+A で
+              全行を選び、Ctrl+C で選択行の**原文そのまま**をクリップボードへ
+              コピーする（handleViewportKeydown／handleRowsMouseDown が扱う）。
+              選択はインデックス範囲の集合だけを保持し（PERF-012）、ブラウザ
+              既定のテキスト選択（P04-4 の最小コピー）は置き換えた
               （src/styles.css の .log-rows 参照）。
             -->
             <div
               class="log-viewport"
               id="log-viewport"
               tabindex="0"
-              aria-label="ログ本文の表示領域（クリックで行を選択、Shift+クリックで範囲選択、Ctrl+A で全選択、Ctrl+C でコピー、キーボードでスクロールできます）"
+              aria-label="ログ本文の表示領域（クリックまたはドラッグで行を選択、Shift+クリックで範囲選択、Ctrl+クリックで行の追加と除外、Ctrl+A で全選択、Ctrl+C で原文をコピー、キーボードでスクロールできます）"
             >
               <div class="log-spacer" id="log-spacer-top"></div>
               <div class="log-rows" id="log-rows"></div>

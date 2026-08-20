@@ -2,7 +2,7 @@
 
 - 状態: 採用済み（Accepted）
 - 管理責任者: リポジトリメンテナー
-- 最終更新日: 2026-08-18
+- 最終更新日: 2026-08-21
 
 ## 目的
 
@@ -199,14 +199,15 @@ Rust 以外の資産を変更した場合は、次も実行します。cargo と
 | --- | --- |
 | `src/` の構文、相対 import の解決、`index.html` の参照先 | `node scripts/check-frontend.mjs` |
 | 仮想スクロールの規模依存ロジック（クランプ、比例写像、破棄判定。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-virtual-scroll.mjs` |
+| 行選択モデル（飛び飛びの選択、ドラッグ、クランプ、コピー範囲の変換。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-selection.mjs` |
 | Markdown の相対リンクと見出しアンカーの整合（外部 URL は対象外） | `node scripts/check-docs-links.mjs` |
 | PowerShell スクリプトの構文解析（実行はしない） | `pwsh -File scripts/check-powershell.ps1` |
 
-`src/` のフロントエンドを変更した場合は、次も**手元で**実行します。上の4つと違い、release ビルド済みの実行ファイルと GUI セッションを必要とするため、CI では実行しません（理由と規約は[回帰検査の対象と判定方法](../verification/regression-checks.md#gui-自動検査scriptscheck-guimjs)）。
+`src/` のフロントエンドを変更した場合は、次も**手元で**実行します。上の5つと違い、release ビルド済みの実行ファイルと GUI セッションを必要とするため、CI では実行しません（理由と規約は[回帰検査の対象と判定方法](../verification/regression-checks.md#gui-自動検査scriptscheck-guimjs)）。
 
 | 目的 | 標準コマンド |
 | --- | --- |
-| 画面操作を通したフロントエンドの回帰検査（起動、対象を開く、日時精度、仮想スクロール、ジャンプ、選択とコピー、統合表示、タブ、詳細パネル） | `npm run tauri -- build --no-bundle` のあとに `node scripts/check-gui.mjs` |
+| 画面操作を通したフロントエンドの回帰検査（起動、対象を開く、日時精度、仮想スクロール、ジャンプ、選択とコピー（ドラッグ・Ctrl+クリックを含む）、統合トグルの非活性化確認、タブ、詳細パネル、横スクロールの封じ込め） | `npm run tauri -- build --no-bundle` のあとに `node scripts/check-gui.mjs` |
 
 このコマンドは OS のクリップボードを上書きし、`%TEMP%` へ試験データとスクリーンショットを書き出します（リポジトリ内へは何も生成しません）。実行前に副作用と規約を確認してください。
 

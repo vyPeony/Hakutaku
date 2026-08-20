@@ -36,6 +36,7 @@
     | `08-large.log` | 仮想スクロール、行番号ジャンプ、コピー上限（`PERF-007`、`COPY-004`／`005`） |
     | `09-mixed-app/service/legacy/western.log` | 書式・文字コードが異なる4ファイルの時系列統合（`LOG-006`〜`008`、`LOG-015`、`LOG-016`、`CFG-008`） |
     | `10-medium-100k.log` | 10万行、事前定義データソースから常に開ける（`-LargeLineCount 0` の影響を受けない。`PERF-007`） |
+    | `11-wide-line.log` | 数千文字の行を含み、横スクロールがログ表示領域の内側だけで起きること（Issue #78） |
     | `hakutaku.yaml` | 正常起動と事前定義データソース・解析プロファイル（`CFG-003`、`CFG-008`、`CFG-014`）。事前定義データソースは、生成した通常のログファイルすべて（`hakutaku-invalid.yaml` と、このスクリプトが生成しない `90-locked.log`／`91-append.log` を除く）を指し、1回の起動で概ねのパターンを網羅する。すべて正常に開けるものだけで構成し、エラー確認用の項目は含めない |
     | `hakutaku-invalid.yaml` | 安全モード起動（`CFG-016`） |
 
@@ -278,6 +279,30 @@ New-Sample -FileName "10-medium-100k.log" -LineCount 100000 `
     -Purpose "大きめのログ、事前定義データソースから常に開ける（PERF-007）" `
     -ExtraParameters @{ ProgressEveryLines = 50000 } | Out-Null
 
+# --- 11: 横に長い行を含むログ --------------------------------------------
+# Issue #78: 行を折り返さない設計（white-space: pre）のため、極端に長い行が
+# あると横スクロールが必要になる。そのスクロールがログ表示領域の内側だけで
+# 起き、ウィンドウ全体（左ペインを含む）が横に流れないことを確認するための
+# サンプル。行数は少なくてよい（横方向だけが論点のため）。
+$widePath = New-Sample -FileName "11-wide-line.log" -LineCount 50 `
+    -Purpose "横に長い行の横スクロール封じ込め（Issue #78）" `
+    -ExtraParameters @{ Format = 'LOG-DT-001' }
+
+# 行生成スクリプトは可変長といっても高々200文字程度の行しか作らないため、
+# 生成後に決まった行だけを引き伸ばす（06・07 節と同じ後処理方式）。乱数を
+# 使わず、対象行の位置も長さも固定にして、手順書に期待結果を書けるように
+# する。長さは2,000〜4,000文字級（1行がウィンドウ幅の数十倍になる）。
+$wideLineWidths = @{ 4 = 2000; 14 = 2500; 24 = 3000; 34 = 3500; 44 = 4000 }
+$widePayloadSeed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+$widePayloadBase = $widePayloadSeed * [Math]::Ceiling(4000 / $widePayloadSeed.Length)
+$wideLines = [System.IO.File]::ReadAllLines($widePath, $utf8NoBom)
+foreach ($lineIndex in $wideLineWidths.Keys) {
+    $wideLines[$lineIndex] += " ペイロード=" + $widePayloadBase.Substring(0, $wideLineWidths[$lineIndex])
+}
+[System.IO.File]::WriteAllLines($widePath, $wideLines, $utf8NoBom)
+($generated | Where-Object { $_.FileName -eq "11-wide-line.log" }).Bytes =
+    (Get-Item -LiteralPath $widePath).Length
+
 # --- 設定ファイル --------------------------------------------------------
 
 function Format-YamlSingleQuoted {
@@ -344,6 +369,7 @@ $dataSourceFiles.Add([PSCustomObject]@{ FileName = "09-mixed-service.log"; Displ
 $dataSourceFiles.Add([PSCustomObject]@{ FileName = "09-mixed-legacy.log"; DisplayName = "09 異種 旧システム（LOG-DT-005／CP932）" })
 $dataSourceFiles.Add([PSCustomObject]@{ FileName = "09-mixed-western.log"; DisplayName = "09 異種 海外拠点（LOG-DT-003／CP1252）" })
 $dataSourceFiles.Add([PSCustomObject]@{ FileName = "10-medium-100k.log"; DisplayName = "10 大きめのログ（100,000行）" })
+$dataSourceFiles.Add([PSCustomObject]@{ FileName = "11-wide-line.log"; DisplayName = "11 横に長い行（数千文字）" })
 
 $dataSourceLines = [System.Collections.Generic.List[string]]::new()
 foreach ($entry in $dataSourceFiles) {

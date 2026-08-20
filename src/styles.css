@@ -267,6 +267,19 @@ body {
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
+  /*
+   * Issue #78: 横スクロールを #log-viewport の内側へ閉じ込めるために必須。
+   * flex アイテムの自動最小サイズ（min-width: auto）のままだと、この要素は
+   * 「中身が縮められる最小の幅」を下回れない。中身には行を折り返さない
+   * .log-rows（width: max-content、white-space: pre）があるため、その最小幅は
+   * 最長行の幅そのものになる。それが .app-body（横並びの flex コンテナ）へ
+   * 伝播し、#log-viewport が画面幅より広いまま確定して自身の内側では
+   * スクロールできなくなり、代わりにウィンドウ側へ横スクロールバーが出て
+   * 左ペインごと画面が流れていた。min-width: 0 で自動最小サイズを解除し、
+   * 残り幅に収まるところまで縮めることで、あふれた分は #log-viewport の
+   * overflow: auto が引き受ける。
+   */
+  min-width: 0;
 }
 
 /*
@@ -402,36 +415,6 @@ body {
 }
 
 /*
- * コピー列の選択（P10、COPY-001）。行選択（どの行を）とは独立に
- * 「どの列を」コピーするかを選ぶ常設のツールバー UI（右クリックメニューでは
- * なくツールバー方式を採用。src/index.html のコメント参照）。
- */
-.log-toolbar__copy-columns {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  /* 折り返しは .log-toolbar の flex-wrap によるグループ単位とし、グループ
-   * 自体は縮ませて潰さない（Issue #9）。 */
-  flex: none;
-}
-
-.log-toolbar__copy-columns-label {
-  font-size: 0.8rem;
-  color: #555;
-  white-space: nowrap;
-}
-
-.log-toolbar__copy-columns-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  font-size: 0.8rem;
-  color: #333;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-/*
  * 行番号でジャンプ（P08-2）。ツールバーの右端へ寄せる。
  */
 .log-toolbar__jump {
@@ -470,7 +453,9 @@ body {
  * 仮想スクロールのビューポート（PERF-012）。#log-viewport 自体が
  * 縦横のスクロールを担う。横方向のスクロールは行を折り返さない設計
  * （white-space: pre、下記 .log-row__text）で行高を一定に保つための代償として
- * 発生する（仕様どおり）。
+ * 発生する（仕様どおり）。ただし横スクロールが起きてよいのは**この要素の
+ * 内側だけ**であり、ウィンドウ全体が横に流れて左ペインまで動くのは不具合
+ * である（Issue #78）。内側へ閉じ込める条件は .app-main の min-width: 0。
  */
 .log-viewport {
   flex: 1 1 auto;
@@ -514,6 +499,11 @@ body {
  * 無効化する（user-select: none）。選択の可視化は行単位のハイライト
  * （.log-row--selected）で行い、コピー内容は src/log_view.js が
  * copy_selection コマンド経由で組み立てる（COPY-001 / COPY-002）。
+ *
+ * Issue #85 で行単位のドラッグ選択を追加したが、user-select: none は
+ * そのまま残す。ドラッグ中にブラウザ既定の文字単位のテキスト選択が同時に
+ * 走ると、青い選択範囲が行ハイライトと二重に見え、Ctrl+C の対象がどちらか
+ * 分からなくなるため（コピー内容は常に行単位の選択から組み立てる）。
  */
 .log-rows {
   display: flex;
@@ -529,6 +519,14 @@ body {
  * 一定に保つ（仕様どおり）。日本語が文字化けしないよう、既定のフォント
  * スタック（:root）に加え、行内の等幅整列用に Consolas を優先させる
  * （.config-banner__errors li と同じ考え方のフォントスタック）。
+ *
+ * column-gap は、行番号・（統合表示時の）読み込み元ラベル・各種バッジ・
+ * 本文という列同士の余白を作る唯一の機構である（Issue #80）。かつて
+ * buildRowElement は列の間に半角スペースのテキストノードを挟んでいたが、
+ * flex コンテナでは空白のみの匿名フレックスアイテムは描画されないため
+ * （CSS Flexbox 仕様 4章）、その余白は最初から効いていなかった。Issue #78 で
+ * 日時列（斜体・グレーの視覚的区切り）を廃止した結果、列同士の連結が
+ * 目立つようになって気付かれた。
  */
 .log-row {
   display: flex;
@@ -539,6 +537,7 @@ body {
   white-space: pre;
   font-family: "Consolas", "Yu Gothic UI", "Meiryo", monospace;
   font-size: var(--font-size-body);
+  column-gap: 1ch;
 }
 
 /*
@@ -556,18 +555,6 @@ body {
   min-width: 6ch;
   text-align: right;
   color: #888;
-}
-
-/*
- * 日時列（LOG-024）。解析結果（原文からの派生値）であることが見た目で
- * 分かるよう、本文列とは異なる色に加えて斜体にする（本文列は原文そのもの、
- * 変更しない）。
- */
-.log-row__timestamp {
-  flex: none;
-  min-width: 24ch;
-  color: #555;
-  font-style: italic;
 }
 
 /*
@@ -597,9 +584,10 @@ body {
 }
 
 /*
- * raw_display=true の行（LOG-022 の日時未解析データ）。日時列を空にする
- * ことに加え、行全体の見た目もわずかに変えることで、生データであることが
- * 一覧上でも分かるようにする（P08-2、作業項目3）。
+ * raw_display=true の行（LOG-022 の日時未解析データ）。行全体の見た目を
+ * わずかに変えることで、生データであることが一覧上でも分かるようにする
+ * （P08-2、作業項目3）。日時列は Issue #78 で廃止したため、一覧上でこの行を
+ * 見分ける手掛かりはこの背景色だけになった。
  */
 .log-row--raw {
   background: #f7f5ef;
@@ -677,6 +665,19 @@ body {
   flex-direction: column;
   border-top: 2px solid var(--color-info-text);
   background: #fbfbfd;
+}
+
+/*
+ * hidden 属性の意味を復元する（Issue #78）。この要素は src/index.html で
+ * hidden 付きで置かれ、src/log_view.js の showDetailPanel / hideDetailPanel が
+ * hidden プロパティだけで開閉する。ところが UA スタイルシートの
+ * `[hidden] { display: none }` は、詳細度に関わらず作成者オリジンの宣言に
+ * 必ず負ける。そのため上の `.log-detail-panel { display: flex }` が常に勝ち、
+ * 閉じているはずの空パネル（見出し行と上端の青い罫線）が画面に出たままだった。
+ * 作成者オリジン側で hidden 時の display を明示して打ち消す。
+ */
+.log-detail-panel[hidden] {
+  display: none;
 }
 
 .log-detail-panel__header {

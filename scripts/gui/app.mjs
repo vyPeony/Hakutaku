@@ -325,6 +325,7 @@ export const SAMPLE_TARGETS = {
   MERGE_A: "05 統合 a（同形式・+0ms）",
   MERGE_B: "05 統合 b（同形式・+7ms）",
   LARGE: "10 大きめのログ（100,000行）",
+  WIDE_LINE: "11 横に長い行（数千文字）",
 };
 
 /**
@@ -345,7 +346,7 @@ export function parseItemCount(text) {
  * 先に同期的に更新され、行の描画は次のフレーム以降に進む（`src/log_view.js` の
  * `activate` → `scheduleRender`）。そのため「ラベルが期待どおりになったか」だけを
  * 待つと、**切り替え前のファイルの行がまだ残っている一瞬**を掴んでしまう
- * （実測で発生した。日時列が前のファイルの値のまま表明されるなど、実害が出る）。
+ * （実測で発生した。前のファイルの行番号・本文のまま表明されるなど、実害が出る）。
  *
  * 切り替え前の指紋と一致しなくなったことを併せて待つことで、この一瞬を除外する。
  *
@@ -360,7 +361,6 @@ export function readRowSignature(page) {
       document.querySelector("#log-total-items")?.textContent ?? "",
       String(rows.length),
       first?.querySelector(".log-row__lineno")?.textContent ?? "",
-      first?.querySelector(".log-row__timestamp")?.textContent ?? "",
       (first?.querySelector(".log-row__text")?.textContent ?? "").slice(0, 80),
       rows.at(-1)?.querySelector(".log-row__lineno")?.textContent ?? "",
     ].join(" ");
@@ -382,7 +382,6 @@ export function readRowSignature(page) {
  * @param {import("playwright-core").Page} page
  * @param {string} displayName 表示名（部分一致で探す）
  * @param {object} [options]
- * @param {boolean} [options.requireTimestamp] 日時列も非空であることを要求する
  * @param {number} [options.timeoutMs]
  */
 export async function openTargetByName(page, displayName, options = {}) {
@@ -428,15 +427,14 @@ export async function openTargetByName(page, displayName, options = {}) {
  * @param {object} options
  * @param {string} options.sourceLabel `#log-source-label` に含まれるべき文字列
  * @param {string | null} [options.previousSignature] 切り替え前の指紋
- * @param {boolean} [options.requireTimestamp] 日時列も非空であることを要求する
  * @param {number} [options.timeoutMs]
  */
 export async function waitForLogViewReady(
   page,
-  { sourceLabel, previousSignature = null, requireTimestamp = false, timeoutMs = 60_000 },
+  { sourceLabel, previousSignature = null, timeoutMs = 60_000 },
 ) {
   await page.waitForFunction(
-    ({ label, previous, needTimestamp, placeholder }) => {
+    ({ label, previous, placeholder }) => {
       const shown = document.querySelector("#log-source-label")?.textContent ?? "";
       if (!shown.includes(label)) {
         return false;
@@ -455,12 +453,6 @@ export async function waitForLogViewReady(
       if (text.length === 0) {
         return false;
       }
-      if (
-        needTimestamp &&
-        (first.querySelector(".log-row__timestamp")?.textContent ?? "").trim().length === 0
-      ) {
-        return false;
-      }
       if (previous === null) {
         return true;
       }
@@ -473,7 +465,6 @@ export async function waitForLogViewReady(
         document.querySelector("#log-total-items")?.textContent ?? "",
         String(rows.length),
         first.querySelector(".log-row__lineno")?.textContent ?? "",
-        first.querySelector(".log-row__timestamp")?.textContent ?? "",
         text.slice(0, 80),
         rows.at(-1)?.querySelector(".log-row__lineno")?.textContent ?? "",
       ].join(" ");
@@ -482,7 +473,6 @@ export async function waitForLogViewReady(
     {
       label: sourceLabel,
       previous: previousSignature,
-      needTimestamp: requireTimestamp,
       placeholder: ROW_PLACEHOLDER_TEXT,
     },
     { timeout: timeoutMs },
@@ -563,7 +553,6 @@ export function readRenderedRows(page) {
   return page.evaluate(() =>
     Array.from(document.querySelectorAll("#log-rows .log-row")).map((row) => ({
       lineNumber: row.querySelector(".log-row__lineno")?.textContent ?? "",
-      timestamp: row.querySelector(".log-row__timestamp")?.textContent ?? "",
       sourceLabel: row.querySelector(".log-row__source")?.textContent ?? null,
       text: row.querySelector(".log-row__text")?.textContent ?? "",
       selected: row.classList.contains("log-row--selected"),
@@ -587,8 +576,17 @@ export function readViewState(page) {
       jumpInputValue: document.querySelector("#log-jump-input")?.value ?? "",
       mergedToggleLabel: toggle?.textContent?.trim() ?? "",
       mergedTogglePressed: toggle?.getAttribute("aria-pressed") ?? "",
+      // Issue #83: 統合表示の UI 入口は #82 の改修実装まで非活性化されている。
+      // シナリオ7がこの2値で非活性化そのものを確認する。
+      mergedToggleDisabled: toggle instanceof HTMLButtonElement ? toggle.disabled : false,
+      mergedToggleTitle: toggle?.getAttribute("title") ?? "",
       renderedRowCount: document.querySelectorAll("#log-rows .log-row").length,
       viewportClientHeight: document.querySelector("#log-viewport")?.clientHeight ?? 0,
+      // Issue #78: `clientHeight` は内側の水平スクロールバーの厚みぶん実行中に
+      // 変動する。変動しない外形として `offsetHeight` も返す（`.log-viewport` は
+      // 境界線を持たないため、clientHeight + 水平スクロールバー厚に等しい）。
+      // 使い分けの理由は scenarios/04-virtual-scroll.mjs のコメントを参照。
+      viewportOffsetHeight: document.querySelector("#log-viewport")?.offsetHeight ?? 0,
       viewportScrollTop: Math.round(document.querySelector("#log-viewport")?.scrollTop ?? 0),
       detailPanelHidden: detailPanel === null ? true : detailPanel.hidden,
       detailPanelTitle:
