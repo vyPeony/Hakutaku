@@ -14,6 +14,27 @@
 // 実装側の値が変わったときに検査だけが古い前提のまま通り続けることを防ぐため
 // （`scripts/check-virtual-scroll.mjs` の「前提の同期」と同じ考え方）。
 //
+// # 「ビューポート高さ」に offsetHeight を使う理由（Issue #78）
+//
+// アプリは描画のたびに、その時点の `#log-viewport.clientHeight` から可視行数を
+// 決める（`src/log_view.js` の `computeCurrentRenderTargets`）。かつてはこの値が
+// 実行中に変わらなかったため、対象を開いた時点の `clientHeight` を1回読んで上限を
+// 固定できた。
+//
+// Issue #78 の横スクロール封じ込め以降、その前提は成立しない。#log-viewport の
+// **内側**に水平スクロールバーが出るようになり、それは「描画中の行の最長幅が
+// clientWidth を超えるか」で決まる。スクロールで描画範囲が変われば最長行も変わる
+// ため、水平スクロールバーは実行中に出たり消えたりし、`clientHeight` はその厚み
+// （およそ17px）ぶん増減する。高さが行高の境界を跨ぐと、アプリは（その時点の
+// clientHeight から正しく）可視行数を1行多く／少なく描画する。実際、同じ
+// scrollTop=0 でも1回目と最後で描画行数が食い違う事象を実測した。
+//
+// そこで上限は `offsetHeight`（水平スクロールバーを含む外形。`.log-viewport` は
+// 境界線を持たないため clientHeight + スクロールバー厚）から導く。offsetHeight は
+// スクロールバーの出入りで変わらず、かつ常に clientHeight 以上であるため、
+// そこから導いた値は真の上界のままで、緩みは高々1行に収まる。**アプリ側の挙動は
+// 正しく（DOM 行ノード数は有界のまま）、脆かったのは検査側の前提である。**
+//
 // 実行時間・スクロール応答は一切表明しない（`VER-005`）。
 
 import { readFileSync } from "node:fs";
@@ -66,7 +87,7 @@ export async function run({ page, expect }) {
   }
 
   const target = SAMPLE_TARGETS.LARGE;
-  await openTargetByName(page, target, { requireTimestamp: true, timeoutMs: 90_000 });
+  await openTargetByName(page, target, { timeoutMs: 90_000 });
 
   const opened = await readViewState(page);
   expect.expectEqual(
@@ -76,12 +97,14 @@ export async function run({ page, expect }) {
   );
 
   // 描画行数の上限。ビューポート高さは実行環境のウィンドウ寸法で決まるため、
-  // 実測値から毎回導く。
+  // 実測値から毎回導く。基準に clientHeight ではなく offsetHeight を使う理由は
+  // モジュール冒頭のコメント「『ビューポート高さ』に offsetHeight を使う理由」を
+  // 参照（内側の水平スクロールバーの出入りで clientHeight が実行中に変動する）。
   const maxRenderedRows =
-    Math.ceil(opened.viewportClientHeight / rowHeightPx) + 1 + bufferRows * 2;
+    Math.ceil(opened.viewportOffsetHeight / rowHeightPx) + 1 + bufferRows * 2;
   expect.expectAtLeast(
     "前提: ビューポートに高さがある（ウィンドウが生成されている）",
-    opened.viewportClientHeight,
+    opened.viewportOffsetHeight,
     1,
   );
 

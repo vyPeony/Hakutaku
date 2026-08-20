@@ -68,6 +68,11 @@
 // で固定のまま、継続行は「+N行」バッジ→下部詳細パネル（`showDetailPanel`）で
 // 改行を保って全文表示する）。
 //
+// このうち**日時列は Issue #78 で廃止した**（`buildRowElement`）。行の原文は
+// 先頭に日時を含むため、その左に解析済みの日時列を置くと同じ日時が画面上で
+// 2回並ぶ。`LOG-024` が求める「元の精度を保持した日時を書式変換せずに提示
+// する」ことは、ツールバーのコピー列「日時」（ADR-0009）が引き続き満たす。
+//
 // # P10: 選択・上限判定・コピー生成とクリップボード設定
 //
 // P04-4 の「ブラウザ既定のテキスト選択 + Ctrl+C」による最小コピーを、正式な
@@ -1257,7 +1262,15 @@ function renderRows(visibleRange) {
 }
 
 /**
- * 1行分の DOM 要素を作る。行番号・日時・（未確定／継続行バッジ）・原文の列。
+ * 1行分の DOM 要素を作る。行番号・（統合表示のときだけ読み込み元ラベル）・
+ * （未確定／継続行バッジ）・原文の列。
+ *
+ * Issue #78: かつては行番号と原文の間に解析済みの日時列を置いていたが、
+ * 原文の先頭には元々日時が含まれており、画面上で同じ日時が2回並んで見えて
+ * いたため廃止した。解析済み日時（`LOG-024` の元精度を保持した表示文字列）を
+ * 利用者へ提示する経路は、ツールバーのコピー列「日時」（ADR-0009）に一本化
+ * してある。
+ *
  * 行ごとのイベントリスナーは追加しない（PERF-012 の累積源になるため。
  * 禁止事項）。継続行バッジは `<button>` 要素だが、リスナーは付けず
  * `elements.rows` の委譲クリックハンドラー（`handleRowsClick`）に拾わせる
@@ -1285,8 +1298,9 @@ function buildRowElement(rowIndex) {
   const item = lookupItem(rowIndex);
 
   if (item && item.raw_display) {
-    // LOG-022: 日時未解析の生データ行。日時列を空にすることに加え、行全体の
-    // 見た目もわずかに変える（CSS の .log-row--raw）。
+    // LOG-022: 日時未解析の生データ行。行全体の見た目をわずかに変える
+    // （CSS の .log-row--raw）。日時列を廃止した Issue #78 以降、一覧上で
+    // この行と通常行を見分ける手掛かりはこの背景色だけである。
     row.classList.add("log-row--raw");
   }
   if (item && !item.confirmed) {
@@ -1304,12 +1318,6 @@ function buildRowElement(rowIndex) {
   lineNumber.className = "log-row__lineno";
   lineNumber.textContent = item ? String(item.source_line_number) : "";
   row.appendChild(lineNumber);
-  row.appendChild(document.createTextNode(" "));
-
-  const timestamp = document.createElement("span");
-  timestamp.className = "log-row__timestamp";
-  timestamp.textContent = formatTimestampCell(item);
-  row.appendChild(timestamp);
   row.appendChild(document.createTextNode(" "));
 
   if (state.isMerged) {
@@ -1370,32 +1378,6 @@ function buildRowElement(rowIndex) {
   row.appendChild(text);
 
   return row;
-}
-
-/**
- * 日時列の表示文字列を決める。
- *
- * - `raw_display`（LOG-022 の生データ行）: 空文字。日時が無いこと自体を
- *   「解析を試みたが失敗した（null → 「—」）」行と区別するため、あえて
- *   「—」も表示しない（作業項目3・受け入れ条件）
- * - 通常行で `timestamp` が `null`（解析失敗）: 「—」
- * - それ以外: `timestamp` をそのまま表示する（`LOG-024`: 元の精度を保持した
- *   表示文字列を、書式変換せずそのまま出す）
- *
- * @param {LogItemDto | null} item
- * @returns {string}
- */
-function formatTimestampCell(item) {
-  if (!item) {
-    return "";
-  }
-  if (item.raw_display) {
-    return "";
-  }
-  if (item.timestamp === null) {
-    return "—";
-  }
-  return item.timestamp;
 }
 
 /**

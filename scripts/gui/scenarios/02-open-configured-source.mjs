@@ -22,7 +22,7 @@ const EXPECTED_ITEM_COUNT = 2_000;
 export async function run({ page, expect }) {
   const target = SAMPLE_TARGETS.BASIC;
 
-  await openTargetByName(page, target, { requireTimestamp: true });
+  await openTargetByName(page, target);
 
   const view = await readViewState(page);
   expect.expectEqual("ツールバーの読み込み元ラベルが対象の表示名になる", view.sourceLabel, target);
