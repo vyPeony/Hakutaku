@@ -70,61 +70,77 @@
 //
 // このうち**日時列は Issue #78 で廃止した**（`buildRowElement`）。行の原文は
 // 先頭に日時を含むため、その左に解析済みの日時列を置くと同じ日時が画面上で
-// 2回並ぶ。`LOG-024` が求める「元の精度を保持した日時を書式変換せずに提示
-// する」ことは、ツールバーのコピー列「日時」（ADR-0009）が引き続き満たす。
+// 2回並ぶ。`LOG-024` が求める「元の精度を保持した日時を利用者へ提示する」
+// 経路は、Issue #85 でコピー列も廃止したため**現在の UI には無い**（統合表示
+// の改修（Issue #82）で正規化した日時の列を出す予定。それまでの解析結果の
+// 確認手段は IPC 境界の自動検査と Rust 側の単体テスト）。
 //
-// # P10: 選択・上限判定・コピー生成とクリップボード設定
+// # 選択とコピー（P10、Issue #85 で刷新）
 //
 // P04-4 の「ブラウザ既定のテキスト選択 + Ctrl+C」による最小コピーを、正式な
 // 選択モデル（`src/selection.js`）と `copy_selection` コマンド経由の経路へ
-// 置き換えた（`COPY-001`〜`006`）。
+// 置き換えた（`COPY-001`〜`006`）。**コピーする内容は常に選択行の原文
+// そのまま**であり、列の選択（旧ツールバーの「コピー列」）と quoted TSV は
+// Issue #85 で廃止した（ADR-0011）。
 //
-// - **行選択**: クリックで単一行、Shift+クリックで範囲、Ctrl+A で全行。
-//   選択は表示集合全体のインデックス範囲（`state.selection`）として保持し、
-//   表示されていない行（未取得のチャンク）も選択できる（全選択が仮想
-//   スクロールと両立する。`PERF-012`: 選択はインデックスだけを保持し、
-//   行の本文を一切保持しない）。選択行は `.log-row--selected` でハイライト
-//   する。
-// - **セル範囲（複数列）**: 行選択とは独立に、ツールバーの「コピー列」
-//   チェックボックス（`state.copyColumns`）で「行番号／日時／本文」の
-//   組を選ぶ。本文のみ（既定）を選んだ場合は原文そのまま、複数列を選んだ
-//   場合は quoted TSV としてコピーされる（`ADR-0009`。生成そのものは
-//   `hakutaku_core::assemble_copy` が行う）。計画正本が示す「選択メニュー
-//   （右クリックまたはツールバー）で列の組を選んでコピー」のうち、
-//   常設ツールバー方式を採用した（右クリックメニューの開閉・外側クリックで
-//   の消去といった追加の状態管理を避け、実装を単純に保つ判断）。
+// - **行選択**: クリックで単一行、Shift+クリックでアンカーからの範囲、
+//   Ctrl+クリックで行単位の追加・除外（飛び飛びの選択）、ドラッグで連続
+//   範囲、Ctrl+A で全行。選択は表示集合全体のインデックス範囲の集合
+//   （`state.selection`）として保持し、表示されていない行（未取得のチャンク）
+//   も選択できる（全選択が仮想スクロールと両立する。`PERF-012`: 選択は
+//   インデックスだけを保持し、行の本文を一切保持しない）。選択行は
+//   `.log-row--selected` でハイライトする。仮想スクロールで行 DOM は作り直され
+//   るため、選択状態はモデル側だけが持ち、描画のたびに `isRowSelected` で
+//   復元する。
 // - **Ctrl+C**: 選択があれば `copy_selection` を呼ぶ（`preventDefault` で
 //   ブラウザ既定のコピーを抑止し、常にこの経路を通す）。選択が無ければ
-//   何もしない（クリップボードを変更しない。`COPY-006`）。上限判定・
-//   quoted TSV の生成・Win32 クリップボード書き込みはすべて Rust 側
-//   （`hakutaku_core::assemble_copy`・`src-tauri/src/clipboard.rs`）が行う。
-//   スクロールや選択変更（クリック・Shift+クリック・Ctrl+A 自体）では
-//   `copy_selection` を呼ばない（`COPY-006`／`SEC-004`: 明示的な操作時だけ）。
+//   何もしない（クリップボードを変更しない。`COPY-006`）。上限判定
+//   （選択範囲すべての合計に対して行う）・本文の連結・Win32 クリップボード
+//   書き込みはすべて Rust 側（`hakutaku_core::assemble_copy`・
+//   `src-tauri/src/clipboard.rs`）が行う。スクロールや選択変更（クリック・
+//   ドラッグ・Ctrl+クリック・Ctrl+A 自体）では `copy_selection` を呼ばない
+//   （`COPY-006`／`SEC-004`: 明示的な操作時だけ）。
 // - ファイルエクスポート機能は作らない（`COPY-003`／`LOG-019`）。
 // - **時系列統合表示（P09-1）でも同じ経路でコピーする**（Issue #37）。
 //   `copy_selection` へ渡す `display_set_id`／`generation` は範囲取得と同じ
 //   （`state` が保持している現在の表示集合のもの）で、統合表示かどうかで
-//   分岐しない。コピーに含まれる列も個別ファイルと同じ「行番号／日時／本文」
-//   であり、統合表示の画面にだけ出る読み込み元ラベル列（`LOG-007`）は
-//   含まれない（列の並びは ADR-0009 が固定しているため）。
+//   分岐しない。統合表示の画面にだけ出る読み込み元ラベル列（`LOG-007`）は
+//   コピーに含まれない（コピーは原文そのままのため）。
+//
+// ## 選択操作を mousedown へ一本化した理由（Issue #85）
+//
+// ドラッグ選択を追加するには押した瞬間に開始行を決める必要があるため、行の
+// 選択は `mousedown` の委譲ハンドラー（`handleRowsMouseDown`）だけが行う。
+// `click` の委譲ハンドラー（`handleRowsClick`）は継続行バッジの処理だけを
+// 担い、行選択には一切触れない。両方で選択を更新すると、1回のクリックで
+// 選択が2度書き換わり、Ctrl+クリックのトグルが必ず元へ戻ってしまう。
+//
+// バッジ（`<button>`）上の `mousedown` では選択を開始しない（バッジの
+// クリックは詳細パネルを開く操作であり、選択の変更を伴わない。Issue #78 以前
+// からの挙動をそのまま維持する）。バッジの Enter / Space による操作は
+// `mousedown` を伴わず `click` だけが届くため、この分担でキーボード操作も
+// 従来どおり動く。
 //
 // ## 新しい単一購読（PERF-012: 行ごとのイベントリスナーを追加しない設計の継続）
 //
 // 継続行バッジ（`.log-row__badge--continuation`）はクリック可能だが、行ごとに
 // リスナーを追加すると PERF-012 の禁止事項に反する。そのため、他の行 DOM と
 // 同様にバッジ自身へはリスナーを一切付けず、`#log-rows`（`elements.rows`）へ
-// `initLogView` 時に1つだけ登録したクリックの委譲ハンドラー
-// （`handleRowsClick`）が `event.target.closest(...)` で判定する。バッジは
-// 実体が `<button>` 要素であるため、Enter / Space キーでの操作も委譲された
-// `click` イベントとして自然に届く（キーボード操作用に別途リスナーを足す
-// 必要がない）。行選択のクリックも同じ委譲ハンドラーの中で扱う（行ごとに
-// 別のリスナーを足さない）。
+// `initLogView` 時に1つだけ登録したクリック・`mousedown` の委譲ハンドラー
+// （`handleRowsClick`／`handleRowsMouseDown`）が `event.target.closest(...)`
+// で判定する。バッジは実体が `<button>` 要素であるため、Enter / Space キーでの
+// 操作も委譲された `click` イベントとして自然に届く（キーボード操作用に別途
+// リスナーを足す必要がない）。
 //
-// ジャンプ入力欄・ジャンプボタン・詳細パネルの閉じるボタン・コピー列の
-// チェックボックス・ビューポートの keydown（Ctrl+Home／Ctrl+End／Ctrl+A／
-// Ctrl+C）も、既存の scroll・resize 購読と同じく `initLogView` で1回だけ
-// 登録する単一の購読であり、行数に比例して増えるものではない（PERF-012 の
-// 累積源にならない）。
+// ジャンプ入力欄・ジャンプボタン・詳細パネルの閉じるボタン・ビューポートの
+// keydown（Ctrl+Home／Ctrl+End／Ctrl+A／Ctrl+C）も、既存の scroll・resize
+// 購読と同じく `initLogView` で1回だけ登録する単一の購読であり、行数に比例して
+// 増えるものではない（PERF-012 の累積源にならない）。
+//
+// ドラッグ中だけは例外的に `window` へ `mousemove`／`mouseup` を追加するが、
+// これは**同時に1組だけ**であり（`state.dragSelection` が存在する間のみ）、
+// `mouseup` で必ず解除する（`endDragSelection`）。行数にも操作回数にも比例
+// しないため、PERF-012 が禁じる累積には当たらない。
 //
 // # Issue #48: タブ切り替え時のスクロール・選択の復元、無効なジャンプ入力の明示
 //
@@ -157,14 +173,15 @@ import {
   computeScrollTopForRowIndexScaled,
 } from "./virtual_scroll.js";
 import {
+  clampSelectionToTotalItems,
   createSelectionState,
-  selectSingleRow,
   extendSelectionTo,
-  selectAll,
-  getSelectionRange,
   isRowSelected,
-  defaultCopyColumns,
-  hasAnyCopyColumn,
+  selectAll,
+  selectSingleRow,
+  toCopyRanges,
+  toggleRowSelection,
+  updateDragSelection,
 } from "./selection.js";
 import { showErrorBanner, showInfoBanner } from "./banner.js";
 import * as retentionStats from "./retention_stats.js";
@@ -226,6 +243,27 @@ const FETCH_RETRY_MAX_DELAY_MS = 30_000;
 const MAX_SAVED_TAB_VIEW_STATES = 32;
 
 /**
+ * ドラッグ選択中に、ビューポートの外へポインターが出ている間の自動スクロールを
+ * 進める間隔（ミリ秒。Issue #85）。
+ *
+ * `mousemove` は領域の外へ出ると届かなくなる（ボタンを押したまま静止して
+ * いれば1件も来ない）ため、自動スクロールはタイマーで駆動する。20回/秒 は、
+ * 押しっぱなしのスクロールが引っかかって見えない程度に細かく、かつ
+ * `PERF-014` が求める端末負荷の抑制に反しない程度に粗い間隔として選んだ。
+ */
+const DRAG_AUTO_SCROLL_INTERVAL_MS = 50;
+
+/**
+ * ドラッグ選択の自動スクロールで、1回のタイマーごとに動かす最大量（px。
+ * Issue #85）。
+ *
+ * ポインターがビューポートの外へ出た距離に比例して速くするが、上限を置かないと
+ * 画面の遥か外まで動かしたときに1回で数千行ぶん飛び、選択の範囲を利用者が
+ * 制御できなくなる。3行ぶん × 20回/秒 = 毎秒60行を上限とする。
+ */
+const DRAG_AUTO_SCROLL_MAX_STEP_PX = ROW_HEIGHT_PX * 3;
+
+/**
  * @typedef {Object} SavedTabViewState タブを離れる直前に保存する、そのタブへ
  * 戻ったときに復元する最小限のビュー状態（Issue #48、主セッション裁定2）。
  * @property {number} generation 保存時点の世代。`activateDisplaySet` は、
@@ -234,8 +272,8 @@ const MAX_SAVED_TAB_VIEW_STATES = 32;
  *   エントリは二度と一致しなくなり（世代は増える一方のため）、結果として
  *   常に先頭へ戻る（主セッション裁定の「再読み込みは先頭へ戻す」）。
  * @property {number} scrollTop 保存時点の `elements.viewport.scrollTop`（px）。
- * @property {import("./selection.js").SelectionState} selection 保存時点の選択範囲
- *   （アンカー・フォーカスの2つの数値のみ。行データは含まない）。
+ * @property {import("./selection.js").SelectionState} selection 保存時点の選択
+ *   （アンカーと、選択範囲1つあたり数値2つのみ。行データは含まない）。
  */
 
 /**
@@ -247,10 +285,11 @@ const MAX_SAVED_TAB_VIEW_STATES = 32;
  * タブ（対象）の識別子として安定して使える。
  *
  * PERF-012「取得済みの行を累積しない」への抵触検討: ここに保持するのは
- * displaySetId 1件あたり数値4つ（世代・scrollTop・アンカー・フォーカス）
- * だけであり、行の本文・バイト数は一切保持しない。エントリ数も
- * `MAX_SAVED_TAB_VIEW_STATES` で頭打ちにしているため、PERF-012 が問題視する
- * 「行データの累積」には当たらない。
+ * displaySetId 1件あたり数値3つ（世代・scrollTop・アンカー）と選択範囲
+ * （1範囲あたり数値2つ）だけであり、行の本文・バイト数は一切保持しない。
+ * 範囲の個数は利用者の Ctrl+クリック操作の回数でしか増えず（`src/selection.js`
+ * のモジュール冒頭コメント）、エントリ数も `MAX_SAVED_TAB_VIEW_STATES` で
+ * 頭打ちにしているため、PERF-012 が問題視する「行データの累積」には当たらない。
  */
 const savedTabViewStates = new Map();
 
@@ -290,27 +329,6 @@ function rememberCurrentTabViewStateIfApplicable() {
     scrollTop: elements.viewport.scrollTop,
     selection: state.selection,
   });
-}
-
-/**
- * 保存済みの選択範囲を、現在の `totalItems` の範囲へクランプする（Issue #48、
- * 主セッション裁定「復元時は totalItems の範囲へクランプ」）。表示集合が
- * タブを離れている間に縮む通常の経路は無い（読み込みは伸びる方向にしか
- * 進まない設計）が、防御的に丸める。
- *
- * @param {import("./selection.js").SelectionState} selection
- * @param {number} totalItems
- * @returns {import("./selection.js").SelectionState}
- */
-function clampSelectionToTotalItems(selection, totalItems) {
-  if (selection.anchorIndex === null || selection.focusIndex === null || totalItems <= 0) {
-    return createSelectionState();
-  }
-  const maxIndex = totalItems - 1;
-  return {
-    anchorIndex: Math.min(selection.anchorIndex, maxIndex),
-    focusIndex: Math.min(selection.focusIndex, maxIndex),
-  };
 }
 
 /**
@@ -387,17 +405,21 @@ const state = {
   everCachedChunkIndices: new Set(),
   renderScheduled: false,
   /**
-   * 行選択（P10、COPY-001）。表示集合内のインデックス範囲だけを
+   * 行選択（P10、COPY-001）。表示集合内のインデックス範囲の集合だけを
    * 保持し、行の本文は一切保持しない（PERF-012）。
    * @type {import("./selection.js").SelectionState}
    */
   selection: createSelectionState(),
   /**
-   * コピーする列の組（P10、COPY-001）。行選択とは独立に、ツールバーの
-   * チェックボックスで変更する。
-   * @type {import("./selection.js").CopyColumns}
+   * ドラッグによる範囲選択の進行状態（Issue #85）。ドラッグ中だけ値が入り、
+   * `mouseup`（`endDragSelection`）で必ず `null` へ戻す。
+   * @type {{
+   *   startIndex: number,
+   *   pointerClientY: number,
+   *   autoScrollTimerId: ReturnType<typeof setInterval> | null,
+   * } | null}
    */
-  copyColumns: defaultCopyColumns(),
+  dragSelection: null,
   /** @type {boolean} copy_selection 呼び出し中の多重実行防止。 */
   copyInFlight: false,
 };
@@ -415,9 +437,6 @@ const state = {
  *   detailPanelTitle: HTMLElement,
  *   detailPanelBody: HTMLElement,
  *   detailPanelCloseButton: HTMLButtonElement,
- *   copyColumnLineNumber: HTMLInputElement,
- *   copyColumnTimestamp: HTMLInputElement,
- *   copyColumnRawText: HTMLInputElement,
  * } | null} */
 let elements = null;
 
@@ -430,9 +449,14 @@ function invokeFetchLogRange(args) {
 }
 
 /**
- * `copy_selection` コマンドを呼び出す（P10、COPY-002）。
+ * `copy_selection` コマンドを呼び出す（P10、COPY-002、Issue #85）。
  *
- * @param {{ displaySetId: number, generation: number, start: number, count: number, columns: import("./selection.js").CopyColumns }} args
+ * `ranges` は `start` 昇順・互いに素・`count` が1以上で、すべて表示集合の
+ * 範囲内でなければならない（Rust 側 `hakutaku_core::assemble_copy` が同じ
+ * 条件を検証し、満たさない場合は `invalid_selection` で拒否する）。この形は
+ * `src/selection.js` の `toCopyRanges` が保証する。
+ *
+ * @param {{ displaySetId: number, generation: number, ranges: import("./selection.js").SelectionRange[] }} args
  * @returns {Promise<
  *   | { copied: { bytes: number, lines: number } }
  *   | { rejected: { limit_bytes: number, limit_lines: number, selected_lines: number, selected_bytes?: number } }
@@ -472,35 +496,21 @@ export function initLogView(retentionLimits) {
     detailPanelCloseButton: /** @type {HTMLButtonElement} */ (
       document.getElementById("log-detail-panel-close")
     ),
-    copyColumnLineNumber: /** @type {HTMLInputElement} */ (
-      document.getElementById("log-copy-column-line-number")
-    ),
-    copyColumnTimestamp: /** @type {HTMLInputElement} */ (
-      document.getElementById("log-copy-column-timestamp")
-    ),
-    copyColumnRawText: /** @type {HTMLInputElement} */ (
-      document.getElementById("log-copy-column-raw-text")
-    ),
   };
 
-  // コピー列チェックボックスの初期表示を state.copyColumns（既定値）と揃える。
-  syncCopyColumnCheckboxesFromState();
-
-  // scroll・resize・rows のクリック委譲・ジャンプ操作・詳細パネルの開閉・
-  // コピー列の変更・ビューポートの keydown は、いずれも行数に関わらず1つ
-  // だけ持つ購読（行ごとの購読を増やさない。PERF-012 の禁止事項。モジュール
-  // 冒頭のコメント「新しい単一購読」参照）。
+  // scroll・resize・rows のクリック／mousedown 委譲・ジャンプ操作・詳細パネルの
+  // 開閉・ビューポートの keydown は、いずれも行数に関わらず1つだけ持つ購読
+  // （行ごとの購読を増やさない。PERF-012 の禁止事項。モジュール冒頭のコメント
+  // 「新しい単一購読」参照）。
   elements.viewport.addEventListener("scroll", scheduleRender);
   window.addEventListener("resize", scheduleRender);
   elements.viewport.addEventListener("keydown", handleViewportKeydown);
   elements.rows.addEventListener("click", handleRowsClick);
+  elements.rows.addEventListener("mousedown", handleRowsMouseDown);
   elements.jumpButton.addEventListener("click", handleJumpRequest);
   elements.jumpInput.addEventListener("keydown", handleJumpInputKeydown);
   elements.jumpInput.addEventListener("input", handleJumpInputInput);
   elements.detailPanelCloseButton.addEventListener("click", hideDetailPanel);
-  elements.copyColumnLineNumber.addEventListener("change", handleCopyColumnsChange);
-  elements.copyColumnTimestamp.addEventListener("change", handleCopyColumnsChange);
-  elements.copyColumnRawText.addEventListener("change", handleCopyColumnsChange);
 
   renderVisibleRows();
 }
@@ -534,6 +544,10 @@ export function initLogView(retentionLimits) {
  * @param {DisplaySetDescriptor} descriptor
  */
 export function activateDisplaySet(descriptor) {
+  // 進行中のドラッグ選択は、切り替え前の表示集合のインデックスを指している。
+  // 残したままだと、次の mousemove が新しい表示集合の行を古い開始行と結んで
+  // しまうため、先に打ち切る（リスナーとタイマーも解放される）。
+  endDragSelection();
   rememberCurrentTabViewStateIfApplicable();
 
   clearCache();
@@ -590,6 +604,8 @@ export function activateDisplaySet(descriptor) {
  * 契約のうち `showEmpty` の実体。
  */
 export function showEmptyState() {
+  // 表示するものが無くなるため、進行中のドラッグ選択も打ち切る（Issue #85）。
+  endDragSelection();
   clearCache();
   forgetInFlightChunkFetches();
   clearFailedChunkFetches();
@@ -1267,9 +1283,10 @@ function renderRows(visibleRange) {
  *
  * Issue #78: かつては行番号と原文の間に解析済みの日時列を置いていたが、
  * 原文の先頭には元々日時が含まれており、画面上で同じ日時が2回並んで見えて
- * いたため廃止した。解析済み日時（`LOG-024` の元精度を保持した表示文字列）を
- * 利用者へ提示する経路は、ツールバーのコピー列「日時」（ADR-0009）に一本化
- * してある。
+ * いたため廃止した。当時は解析済み日時（`LOG-024` の元精度を保持した表示
+ * 文字列）の提示経路をツールバーのコピー列「日時」へ一本化していたが、
+ * その列も Issue #85 で廃止したため、**現在の UI に提示箇所は無い**
+ * （統合表示の改修（Issue #82）で表示する予定）。
  *
  * 行ごとのイベントリスナーは追加しない（PERF-012 の累積源になるため。
  * 禁止事項）。継続行バッジは `<button>` 要素だが、リスナーは付けず
@@ -1283,7 +1300,8 @@ function renderRows(visibleRange) {
  * コピー内容はこの DOM から生成するのではなく、
  * `hakutaku_core::assemble_copy` が選択インデックス範囲から本文を
  * 読み直して組み立てる（`copy_selection` コマンド）ため、この列間表示の
- * 変更はコピー結果には一切影響しない。
+ * 変更はコピー結果には一切影響しない（Issue #85 以降のコピーは常に原文
+ * そのまま）。
  *
  * @param {number} rowIndex
  * @returns {HTMLDivElement}
@@ -1381,9 +1399,12 @@ function buildRowElement(rowIndex) {
 /**
  * `elements.rows` へ1つだけ登録するクリックの委譲ハンドラー（PERF-012:
  * 行ごとのイベントリスナーを追加しない設計。モジュール冒頭のコメント
- * 「新しい単一購読」参照）。継続行バッジ（`.log-row__badge--continuation`）の
- * クリックは詳細パネルを開き、それ以外の行クリックは行選択（P10、
- * COPY-001）を更新する。
+ * 「新しい単一購読」参照）。
+ *
+ * **扱うのは継続行バッジ（`.log-row__badge--continuation`）だけ**であり、行選択
+ * には一切触れない（Issue #85 で `mousedown` へ一本化した。モジュール冒頭の
+ * コメント「選択操作を mousedown へ一本化した理由」参照）。バッジは
+ * `<button>` 要素のため、Enter / Space による操作もこの `click` として届く。
  *
  * @param {MouseEvent} event
  */
@@ -1391,43 +1412,298 @@ function handleRowsClick(event) {
   const target = /** @type {HTMLElement} */ (event.target);
 
   const badge = target.closest(".log-row__badge--continuation");
-  if (badge) {
-    const rowIndex = Number(/** @type {HTMLElement} */ (badge).dataset.rowIndex);
-    if (!Number.isInteger(rowIndex)) {
-      return;
-    }
-    const item = lookupItem(rowIndex);
-    if (!item) {
-      // 描画とクリックの間にチャンクが破棄された場合の防御（通常は起こらない。
-      // バッジは可視範囲＋バッファの行にしか存在せず、その範囲のチャンクは
-      // evictFarChunks の保護対象のため、表示中のバッジのクリック時点では
-      // 必ずキャッシュに残っているはず）。
-      return;
-    }
-    showDetailPanel(item);
+  if (!badge) {
+    return;
+  }
+  const rowIndex = parseRowIndex(badge);
+  if (rowIndex === null) {
+    return;
+  }
+  const item = lookupItem(rowIndex);
+  if (!item) {
+    // 描画とクリックの間にチャンクが破棄された場合の防御（通常は起こらない。
+    // バッジは可視範囲＋バッファの行にしか存在せず、その範囲のチャンクは
+    // evictFarChunks の保護対象のため、表示中のバッジのクリック時点では
+    // 必ずキャッシュに残っているはず）。
+    return;
+  }
+  showDetailPanel(item);
+}
+
+/**
+ * 行 DOM（またはバッジ）の `data-row-index` を数値として読む。壊れた・欠けた
+ * 添字は `null` を返し、呼び出し側は何もしない。
+ *
+ * @param {Element | null} element
+ * @returns {number | null}
+ */
+function parseRowIndex(element) {
+  const raw = /** @type {HTMLElement | null} */ (element)?.dataset?.rowIndex;
+  if (raw === undefined) {
+    return null;
+  }
+  const rowIndex = Number(raw);
+  return Number.isInteger(rowIndex) ? rowIndex : null;
+}
+
+/**
+ * `elements.rows` へ1つだけ登録する `mousedown` の委譲ハンドラー（PERF-012:
+ * 行ごとのイベントリスナーを追加しない設計）。行選択（`COPY-001`）の起点は
+ * すべてここで、修飾キーによって次の3つに分かれる（Issue #85）。
+ *
+ * - 修飾キーなし: 単一行選択にしたうえで**ドラッグ選択を開始する**
+ * - `Shift`: アンカーからこの行までの範囲へ置き換える（ドラッグは開始しない）
+ * - `Ctrl`: この行の選択・非選択を反転する（飛び飛びの選択。ドラッグは開始しない）
+ *
+ * 行の内容（item）が未取得でも、インデックスさえ分かれば選択できる
+ * （PERF-012: 選択はインデックスだけを保持し、表示外の選択と両立する）。
+ *
+ * 継続行バッジ上で押した場合は何もしない（バッジのクリックは詳細パネルを
+ * 開く操作であり、選択を変えない。`handleRowsClick` が処理する）。左ボタン
+ * 以外（中・右ボタン）も対象外にする（貼り付けや将来の文脈メニューで選択が
+ * 勝手に変わらないようにするため）。
+ *
+ * @param {MouseEvent} event
+ */
+function handleRowsMouseDown(event) {
+  if (event.button !== 0) {
+    return;
+  }
+  const target = /** @type {HTMLElement} */ (event.target);
+  if (target.closest(".log-row__badge--continuation")) {
+    return;
+  }
+  const rowIndex = parseRowIndex(target.closest(".log-row"));
+  if (rowIndex === null) {
     return;
   }
 
-  const row = target.closest(".log-row");
-  if (!row) {
-    return;
+  if (event.ctrlKey) {
+    state.selection = toggleRowSelection(state.selection, rowIndex);
+  } else if (event.shiftKey) {
+    state.selection = extendSelectionTo(state.selection, rowIndex);
+  } else {
+    state.selection = selectSingleRow(rowIndex);
+    beginDragSelection(rowIndex, event.clientY);
   }
-  const rowIndex = Number(/** @type {HTMLElement} */ (row).dataset.rowIndex);
-  if (!Number.isInteger(rowIndex)) {
-    return;
-  }
-  // P10（COPY-001）: クリックで単一行選択、Shift+クリックで範囲選択。行の
-  // 内容（item）が未取得でも、インデックスさえ分かれば選択できる
-  // （PERF-012: 選択はインデックスだけを保持し、表示外の選択と両立する）。
-  state.selection = event.shiftKey
-    ? extendSelectionTo(state.selection, rowIndex)
-    : selectSingleRow(rowIndex);
-  // Ctrl+A／Ctrl+C がクリック直後も効くよう、キーボードフォーカスを
+
+  // ブラウザ既定の（この場では意味がない）ドラッグ開始・フォーカス移動を
+  // 抑止する。フォーカスは下で明示的にビューポートへ移すため、既定動作に
+  // 任せる必要がない。
+  event.preventDefault();
+  // Ctrl+A／Ctrl+C が操作直後も効くよう、キーボードフォーカスを
   // ビューポートへ移す（#log-viewport は tabindex="0" でフォーカス可能。
-  // クリックした行 <div> 自体はフォーカス不可のため、ブラウザに任せると
+  // 押した行 <div> 自体はフォーカス不可のため、ブラウザに任せると
   // フォーカスが移動しないことがある）。
   elements.viewport.focus();
   scheduleRender();
+}
+
+/**
+ * ドラッグによる範囲選択を開始する（Issue #85）。
+ *
+ * `mousemove`／`mouseup` を `window` へ登録するのは、ドラッグ中にポインターが
+ * ビューポートの外（別のペイン、ウィンドウの外）へ出ても追従を切らさず、
+ * どこでボタンを離しても必ず終了処理へ入れるため。ここで登録した2つと自動
+ * スクロールのタイマーは、`endDragSelection` が必ずまとめて解放する。
+ *
+ * @param {number} startIndex 押した行。
+ * @param {number} pointerClientY 押した位置（ビューポート座標）。
+ */
+function beginDragSelection(startIndex, pointerClientY) {
+  // 直前のドラッグが（想定外の経路で）残っていた場合に、リスナーとタイマーを
+  // 二重に持たないよう必ず畳んでから始める。
+  endDragSelection();
+  state.dragSelection = { startIndex, pointerClientY, autoScrollTimerId: null };
+  window.addEventListener("mousemove", handleDragSelectionMove);
+  window.addEventListener("mouseup", handleDragSelectionEnd);
+}
+
+/**
+ * ドラッグ選択を終了し、登録したリスナーと自動スクロールのタイマーを解放する
+ * （Issue #85）。ドラッグ中でなければ何もしない。
+ *
+ * 表示集合の切り替え・空表示でも呼ぶ（進行中のドラッグが切り替え後の表示へ
+ * 持ち越されないようにするため）。
+ */
+function endDragSelection() {
+  const drag = state.dragSelection;
+  if (drag === null) {
+    return;
+  }
+  if (drag.autoScrollTimerId !== null) {
+    clearInterval(drag.autoScrollTimerId);
+  }
+  state.dragSelection = null;
+  window.removeEventListener("mousemove", handleDragSelectionMove);
+  window.removeEventListener("mouseup", handleDragSelectionEnd);
+}
+
+/**
+ * ドラッグ中のポインター移動（Issue #85）。指している行まで選択を伸ばし、
+ * ビューポートの外へ出ていれば自動スクロールを回し始める。
+ *
+ * @param {MouseEvent} event
+ */
+function handleDragSelectionMove(event) {
+  const drag = state.dragSelection;
+  if (drag === null) {
+    return;
+  }
+  drag.pointerClientY = event.clientY;
+  applyDragSelectionAtPointer();
+  updateDragAutoScroll();
+}
+
+/** ドラッグ終了（どこでボタンを離しても必ず止める。Issue #85）。 */
+function handleDragSelectionEnd() {
+  endDragSelection();
+}
+
+/**
+ * 現在のポインター位置が指す行まで、ドラッグ選択を更新する（Issue #85）。
+ *
+ * 行の特定は `document.elementFromPoint` → `.log-row` の `data-row-index` で
+ * 行う。座標から行インデックスを計算し直す方法（スクロール位置と行高からの
+ * 逆算）を採らないのは、大規模な表示集合ではスクロール座標と行インデックスが
+ * 1:1ではなく比例写像になる（`src/virtual_scroll.js` の
+ * `computeVisibleRangeForScroll`）ため、同じ写像をここへ再実装すると
+ * 2か所が食い違う余地を作るから。描画済みの行 DOM を読めば、その写像の結果を
+ * そのまま使える。
+ */
+function applyDragSelectionAtPointer() {
+  const drag = state.dragSelection;
+  if (drag === null) {
+    return;
+  }
+  const rowIndex = findRowIndexAtClientY(drag.pointerClientY);
+  if (rowIndex === null) {
+    return;
+  }
+  state.selection = updateDragSelection(drag.startIndex, rowIndex);
+  scheduleRender();
+}
+
+/**
+ * ビューポート座標 `clientY` の位置にある行のインデックスを返す（Issue #85）。
+ * 行が見つからない場合は `null`。
+ *
+ * `clientY` はビューポートの内側へ丸める。ドラッグ中はポインターが領域の外に
+ * 出ている（自動スクロール中）ことが常態であり、そのときに指すべき行は
+ * 「その方向の端に見えている行」だからである。
+ *
+ * @param {number} clientY
+ * @returns {number | null}
+ */
+function findRowIndexAtClientY(clientY) {
+  const viewportRect = elements.viewport.getBoundingClientRect();
+  if (viewportRect.height <= 0 || viewportRect.width <= 0) {
+    return null;
+  }
+  const clampedY = Math.min(Math.max(clientY, viewportRect.top + 1), viewportRect.bottom - 1);
+  // 横方向はビューポートの左端付近を見る（行は #log-rows の幅いっぱいに広がる
+  // ため、横スクロール位置に関わらず必ず行の上に当たる）。
+  const probeX = viewportRect.left + Math.min(4, viewportRect.width / 2);
+  const rowIndex = parseRowIndex(document.elementFromPoint(probeX, clampedY)?.closest(".log-row"));
+  if (rowIndex !== null) {
+    return rowIndex;
+  }
+
+  // 行の外（総行数がビューポートの高さに満たず、末尾の下に余白がある場合など）。
+  // 描画済みの端の行へ丸める。
+  const rendered = elements.rows.children;
+  if (rendered.length === 0) {
+    return null;
+  }
+  const firstRect = rendered[0].getBoundingClientRect();
+  return clampedY < firstRect.top
+    ? parseRowIndex(rendered[0])
+    : parseRowIndex(rendered[rendered.length - 1]);
+}
+
+/**
+ * ポインターがビューポートの上下端の外にある間だけ、自動スクロールのタイマーを
+ * 回す（Issue #85）。範囲内へ戻ったら止める。
+ */
+function updateDragAutoScroll() {
+  const drag = state.dragSelection;
+  if (drag === null) {
+    return;
+  }
+  const step = computeDragAutoScrollStepPx(drag.pointerClientY);
+  if (step === 0) {
+    if (drag.autoScrollTimerId !== null) {
+      clearInterval(drag.autoScrollTimerId);
+      drag.autoScrollTimerId = null;
+    }
+    return;
+  }
+  if (drag.autoScrollTimerId !== null) {
+    return;
+  }
+  drag.autoScrollTimerId = setInterval(tickDragAutoScroll, DRAG_AUTO_SCROLL_INTERVAL_MS);
+}
+
+/**
+ * 自動スクロールの1回分（Issue #85）。スクロール位置を動かしてから、同じ
+ * ポインター位置が指す行（＝新しく端に現れた行）まで選択を伸ばす。
+ *
+ * `scrollTop` の代入は `scroll` イベント経由で `scheduleRender` を呼ぶため、
+ * 行 DOM は次のフレームで作り直される。`applyDragSelectionAtPointer` が読む
+ * のは1フレーム前の DOM になり得るが、選択は次のタイマーで追いつくため
+ * ずれは残らない（1回あたりの移動量を上限
+ * `DRAG_AUTO_SCROLL_MAX_STEP_PX` で抑えているのもこのため）。
+ */
+function tickDragAutoScroll() {
+  const drag = state.dragSelection;
+  if (drag === null) {
+    return;
+  }
+  const step = computeDragAutoScrollStepPx(drag.pointerClientY);
+  if (step === 0) {
+    updateDragAutoScroll();
+    return;
+  }
+  const maxScrollTopPx = Math.max(
+    0,
+    elements.viewport.scrollHeight - elements.viewport.clientHeight,
+  );
+  const nextScrollTop = Math.min(
+    Math.max(0, elements.viewport.scrollTop + step),
+    maxScrollTopPx,
+  );
+  elements.viewport.scrollTop = nextScrollTop;
+  applyDragSelectionAtPointer();
+}
+
+/**
+ * ポインターがビューポートの外へ出た距離から、1回あたりのスクロール量（px）を
+ * 求める（Issue #85）。内側なら0。
+ *
+ * 出た距離に比例させるのは、少し外へ出したときはゆっくり、大きく外へ出した
+ * ときは速く動かすため。最低でも1行ぶんは動かす（端のすぐ外で止まったまま
+ * 進まないのを防ぐ）。
+ *
+ * @param {number} pointerClientY
+ * @returns {number} 上方向は負、下方向は正。
+ */
+function computeDragAutoScrollStepPx(pointerClientY) {
+  const viewportRect = elements.viewport.getBoundingClientRect();
+  const overshoot =
+    pointerClientY < viewportRect.top
+      ? pointerClientY - viewportRect.top
+      : pointerClientY > viewportRect.bottom
+        ? pointerClientY - viewportRect.bottom
+        : 0;
+  if (overshoot === 0) {
+    return 0;
+  }
+  const direction = overshoot < 0 ? -1 : 1;
+  const magnitude = Math.min(
+    Math.max(Math.abs(overshoot), ROW_HEIGHT_PX),
+    DRAG_AUTO_SCROLL_MAX_STEP_PX,
+  );
+  return direction * magnitude;
 }
 
 /**
@@ -1576,29 +1852,15 @@ function handleSelectAllRequest() {
 }
 
 /**
- * コピー列チェックボックスの変更を `state.copyColumns` へ反映する
- * （P10、COPY-001）。
- */
-function handleCopyColumnsChange() {
-  state.copyColumns = {
-    lineNumber: elements.copyColumnLineNumber.checked,
-    timestamp: elements.copyColumnTimestamp.checked,
-    rawText: elements.copyColumnRawText.checked,
-  };
-}
-
-/** `state.copyColumns`（既定値）をチェックボックスの表示へ反映する。 */
-function syncCopyColumnCheckboxesFromState() {
-  elements.copyColumnLineNumber.checked = state.copyColumns.lineNumber;
-  elements.copyColumnTimestamp.checked = state.copyColumns.timestamp;
-  elements.copyColumnRawText.checked = state.copyColumns.rawText;
-}
-
-/**
  * Ctrl+C: 選択があれば `copy_selection` を呼び、成功・拒否を通知する
- * （P10、COPY-002／COPY-005／COPY-006）。選択が無ければ何もしない
+ * （P10、COPY-002／COPY-005／COPY-006）。コピーする内容は常に選択行の原文
+ * そのままで、列の選択は無い（Issue #85、ADR-0011）。選択が無ければ何もしない
  * （クリップボードを変更しない）。呼び出し中の多重実行（Ctrl+C 連打）は
  * `state.copyInFlight` で防ぐ。
+ *
+ * 飛び飛びの選択（Ctrl+クリック）は複数の範囲としてそのまま渡し、Rust 側が
+ * `start` 昇順に連結する。上限判定（`COPY-004`／`COPY-005`）も全範囲の
+ * 合計に対して行われる。
  */
 async function handleCopyRequest() {
   if (state.copyInFlight) {
@@ -1607,13 +1869,9 @@ async function handleCopyRequest() {
   if (state.displaySetId === null || state.generation === null) {
     return;
   }
-  const range = getSelectionRange(state.selection, state.totalItems);
-  if (!range) {
+  const ranges = toCopyRanges(state.selection, state.totalItems);
+  if (ranges.length === 0) {
     // COPY-006／SEC-004: 選択が無ければクリップボードに一切触れない。
-    return;
-  }
-  if (!hasAnyCopyColumn(state.copyColumns)) {
-    showErrorBanner("コピーする列が選択されていません。ツールバーの「コピー列」で列を選んでください。");
     return;
   }
 
@@ -1627,9 +1885,7 @@ async function handleCopyRequest() {
     const response = await invokeCopySelection({
       displaySetId: context.displaySetId,
       generation: context.generation,
-      start: range.start,
-      count: range.count,
-      columns: state.copyColumns,
+      ranges,
     });
 
     if ("copied" in response) {
@@ -1690,8 +1946,14 @@ function handleCopySelectionError(error, context) {
             "必要なら再読み込みしてからもう一度お試しください。",
         );
         return;
-      case "no_columns_selected":
-        showErrorBanner("コピーする列が選択されていません。ツールバーの「コピー列」で列を選んでください。");
+      case "invalid_selection":
+        // Issue #85: フロントエンドが送る範囲は `toCopyRanges` が正規化して
+        // いるため、通常は発生しない防御的な失敗（Rust 側も同じ条件を検証
+        // する）。原因の特定に必要なので、Rust 側の理由をそのまま添える。
+        showErrorBanner(
+          `選択範囲が正しくないため、コピーできませんでした（${error.reason}）。` +
+            "選択し直してもう一度お試しください。",
+        );
         return;
       case "memory_reservation_rejected":
         showErrorBanner(`メモリ不足のためコピーできませんでした（${error.reason}）。`);

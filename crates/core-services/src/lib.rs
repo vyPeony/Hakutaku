@@ -30,8 +30,8 @@ pub use budget::{
     MAX_TOTAL_BYTES,
 };
 pub use copy::{
-    assemble_copy, CopyBuffer, CopyColumns, CopyError, CopyLimits, CopyOutcome, CopyRejection,
-    CopySelection,
+    assemble_copy, CopyBuffer, CopyError, CopyLimits, CopyOutcome, CopyRange, CopyRejection,
+    CopySelection, InvalidSelectionReason,
 };
 pub use display_set::{
     DisplaySet, ItemDto, RangeFetchError, RangeRequest, RangeResponse, MAX_ITEMS_PER_RESPONSE,

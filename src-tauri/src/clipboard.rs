@@ -8,7 +8,8 @@
 //!    向けの応答型（[`CopySelectionResponse`]）へ変換すること。
 //! 2. 生成に成功した場合だけ、Win32 のクリップボード API（[`set_unicode_text`]）
 //!    でクリップボードへ書き込むこと（COPY-002、初期リリースは ADR-0009 に
-//!    従い CF_UNICODETEXT のみ）。
+//!    従い CF_UNICODETEXT のみ。コピー内容の形式そのものは Issue #85 の
+//!    ADR-0011 で「常に原文そのまま」へ変えた）。
 //!
 //! `SEC-004`／`COPY-006`（明示的な操作時のみコピーする）は、この関数自体が
 //! 「明示的に呼ばれたときだけ実行される」ことで満たされます。スクロールや
@@ -25,22 +26,23 @@ use hakutaku_diagnostics::{diag_info, diag_warn, Diagnostics};
 use crate::bootstrap::config::ConfigState;
 use crate::log_view::DisplaySetRegistryState;
 
-/// フロントエンドが指定する列の集合（`hakutaku_core::CopyColumns` の
-/// serde 化）。JS 側は camelCase（`lineNumber` 等）で渡します。
+/// フロントエンドが指定するコピー範囲（`hakutaku_core::CopyRange` の
+/// serde 化。Issue #85）。JS 側は `{ start, count }` の配列で渡します。
+///
+/// 受け入れ条件（`start` 昇順・互いに素・`count` が1以上・表示集合の範囲内）
+/// は `hakutaku_core::assemble_copy` が検証します。ここでは形だけを受け取り、
+/// 判定は持ちません（このモジュールの責務はモジュール doc コメントの2点だけ）。
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CopyColumnsArg {
-    pub line_number: bool,
-    pub timestamp: bool,
-    pub raw_text: bool,
+pub struct CopyRangeArg {
+    pub start: u64,
+    pub count: u64,
 }
 
-impl From<CopyColumnsArg> for hakutaku_core::CopyColumns {
-    fn from(value: CopyColumnsArg) -> Self {
-        hakutaku_core::CopyColumns {
-            line_number: value.line_number,
-            timestamp: value.timestamp,
-            raw_text: value.raw_text,
+impl From<CopyRangeArg> for hakutaku_core::CopyRange {
+    fn from(value: CopyRangeArg) -> Self {
+        hakutaku_core::CopyRange {
+            start: value.start,
+            count: value.count,
         }
     }
 }
@@ -80,8 +82,12 @@ pub enum CopySelectionError {
         expected: u64,
         current: u64,
     },
-    /// UI 側では通常発生しない防御的エラー（列を1つも指定していない）。
-    NoColumnsSelected,
+    /// UI 側では通常発生しない防御的エラー（選択範囲が受け入れ条件を満たさ
+    /// ない。Issue #85）。`reason` は利用者向けの日本語の理由文
+    /// （`hakutaku_core::InvalidSelectionReason`）。
+    InvalidSelection {
+        reason: String,
+    },
     /// `PERF-008`。`CFG-018` の上限内でも、他の用途でメモリ予算が逼迫して
     /// いる場合に発生し得る。
     MemoryReservationRejected {
@@ -106,7 +112,11 @@ impl From<hakutaku_core::CopyError> for CopySelectionError {
             hakutaku_core::CopyError::Fetch(
                 hakutaku_core::FetchRangeError::GenerationMismatch { expected, current },
             ) => CopySelectionError::GenerationMismatch { expected, current },
-            hakutaku_core::CopyError::NoColumnsSelected => CopySelectionError::NoColumnsSelected,
+            hakutaku_core::CopyError::InvalidSelection(reason) => {
+                CopySelectionError::InvalidSelection {
+                    reason: reason.to_string(),
+                }
+            }
             hakutaku_core::CopyError::MemoryReservationRejected(reason) => {
                 CopySelectionError::MemoryReservationRejected {
                     reason: reason.to_string(),
@@ -121,21 +131,19 @@ impl From<hakutaku_core::CopyError> for CopySelectionError {
 ///
 /// `hakutaku_core::assemble_copy` が上限内と判定した場合だけ、実際に
 /// クリップボードへ書き込みます（`COPY-005`: 拒否時はクリップボードに一切
-/// 触れません）。`display_set_id`・`generation`・`start`・`count` の意味は
-/// `fetch_log_range` と同じです（表示集合内のインデックス範囲。表示外の
-/// 範囲を含んでいても構いません）。時系列統合表示の表示集合（P09-1）も
+/// 触れません）。`display_set_id`・`generation` の意味は `fetch_log_range` と
+/// 同じです。`ranges` は表示集合内のインデックス範囲の集合で、飛び飛びの
+/// 選択（Ctrl+クリック）をそのまま表します（Issue #85）。表示外の範囲を
+/// 含んでいても構いません。時系列統合表示の表示集合（P09-1）も
 /// `fetch_log_range` と同じくそのまま指定できます（Issue #37）。
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 pub fn copy_selection(
     registry: State<'_, DisplaySetRegistryState>,
     config: State<'_, ConfigState>,
     diagnostics: State<'_, Arc<Diagnostics>>,
     display_set_id: u32,
     generation: u64,
-    start: u64,
-    count: u64,
-    columns: CopyColumnsArg,
+    ranges: Vec<CopyRangeArg>,
 ) -> Result<CopySelectionResponse, CopySelectionError> {
     let diagnostics_ref: &Diagnostics = diagnostics.inner();
 
@@ -147,10 +155,16 @@ pub fn copy_selection(
         max_lines: u64::from(clipboard_config.max_copy_lines),
     };
 
+    // 診断ログ用の合計行数。`assemble_copy` の検証を通る前の生の値なので、
+    // 溢れないよう飽和加算で数える（本文は記録しない。SEC-004／LOG-024）。
+    let selected_lines = ranges
+        .iter()
+        .fold(0u64, |total, range| total.saturating_add(range.count));
     let selection = hakutaku_core::CopySelection {
-        start,
-        count,
-        columns: columns.into(),
+        ranges: ranges
+            .into_iter()
+            .map(hakutaku_core::CopyRange::from)
+            .collect(),
     };
 
     let assembled = {
@@ -159,7 +173,7 @@ pub fn copy_selection(
             &mut registry_guard,
             display_set_id,
             generation,
-            selection,
+            &selection,
             limits,
             hakutaku_memory_accounting::global_budget(),
         )
@@ -179,7 +193,7 @@ pub fn copy_selection(
                     "選択範囲の本文を読み出せなかったためコピーを中止しました\
                      （COPY-005）: display_set_id={}, 選択行数={}",
                     display_set_id,
-                    count
+                    selected_lines
                 );
             }
             return Err(CopySelectionError::from(error));
@@ -343,17 +357,35 @@ fn write_after_open(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // 受け入れ条件（Issue #85）: フロントエンドが送る `{ start, count }` の
+    // 配列が、コア層の範囲へそのまま（順序も値も変えずに）渡る。
     #[test]
-    fn copy_columns_arg_converts_field_by_field() {
-        let arg = CopyColumnsArg {
-            line_number: true,
-            timestamp: false,
-            raw_text: true,
-        };
-        let converted: hakutaku_core::CopyColumns = arg.into();
-        assert!(converted.line_number);
-        assert!(!converted.timestamp);
-        assert!(converted.raw_text);
+    fn copy_range_args_convert_in_order_without_changing_values() {
+        let args = vec![
+            CopyRangeArg { start: 0, count: 2 },
+            CopyRangeArg { start: 5, count: 1 },
+        ];
+        let converted: Vec<hakutaku_core::CopyRange> = args
+            .into_iter()
+            .map(hakutaku_core::CopyRange::from)
+            .collect();
+        assert_eq!(
+            converted,
+            vec![
+                hakutaku_core::CopyRange { start: 0, count: 2 },
+                hakutaku_core::CopyRange { start: 5, count: 1 },
+            ]
+        );
+    }
+
+    // 受け入れ条件（Issue #85）: JS 側が渡す JSON（`{ "start": .., "count": .. }`）
+    // をそのまま受け取れる（フィールド名の読み替えを入れていないこと）。
+    #[test]
+    fn copy_range_arg_deserializes_from_the_frontend_json_shape() {
+        let arg: CopyRangeArg =
+            serde_json::from_str(r#"{"start":3,"count":4}"#).expect("解釈できるはず");
+        assert_eq!(arg.start, 3);
+        assert_eq!(arg.count, 4);
     }
 
     #[test]
@@ -376,9 +408,30 @@ mod tests {
             }
             other => panic!("GenerationMismatch を期待したが {other:?} だった"),
         }
+    }
 
-        let no_columns = CopySelectionError::from(hakutaku_core::CopyError::NoColumnsSelected);
-        assert!(matches!(no_columns, CopySelectionError::NoColumnsSelected));
+    // 受け入れ条件（Issue #85）: 選択範囲の検証で拒否した失敗は、理由の文言を
+    // 添えた別種別としてフロントエンドへ届く（利用者へ「選び直す」と案内でき、
+    // 原因の特定にも使えるようにするため）。
+    #[test]
+    fn copy_selection_error_conversion_carries_the_invalid_selection_reason() {
+        let converted = CopySelectionError::from(hakutaku_core::CopyError::InvalidSelection(
+            hakutaku_core::InvalidSelectionReason::NoRanges,
+        ));
+        match &converted {
+            CopySelectionError::InvalidSelection { reason } => {
+                assert_eq!(
+                    reason,
+                    &hakutaku_core::InvalidSelectionReason::NoRanges.to_string()
+                );
+            }
+            other => panic!("InvalidSelection を期待したが {other:?} だった"),
+        }
+        let json = serde_json::to_string(&converted).expect("直列化できるはず");
+        assert!(
+            json.starts_with(r#"{"kind":"invalid_selection","reason":"#),
+            "フロントエンド（src/log_view.js）が分岐に使う kind と reason を含むはず: {json}"
+        );
     }
 
     // 受け入れ条件（COPY-005、Issue #37）: 本文を読み出せずに中止した失敗は、

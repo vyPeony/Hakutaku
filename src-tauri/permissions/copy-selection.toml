@@ -6,5 +6,5 @@
 
 [[permission]]
 identifier = "allow-copy-selection"
-description = "選択範囲（開始位置・件数・期待する世代・列の組）を指定してクリップボードへコピーすることを許可する。"
+description = "選択範囲（表示集合内のインデックス範囲の集合・期待する世代）を指定して、選択行の原文をクリップボードへコピーすることを許可する。"
 commands.allow = ["copy_selection"]

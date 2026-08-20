@@ -415,36 +415,6 @@ body {
 }
 
 /*
- * コピー列の選択（P10、COPY-001）。行選択（どの行を）とは独立に
- * 「どの列を」コピーするかを選ぶ常設のツールバー UI（右クリックメニューでは
- * なくツールバー方式を採用。src/index.html のコメント参照）。
- */
-.log-toolbar__copy-columns {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  /* 折り返しは .log-toolbar の flex-wrap によるグループ単位とし、グループ
-   * 自体は縮ませて潰さない（Issue #9）。 */
-  flex: none;
-}
-
-.log-toolbar__copy-columns-label {
-  font-size: 0.8rem;
-  color: #555;
-  white-space: nowrap;
-}
-
-.log-toolbar__copy-columns-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  font-size: 0.8rem;
-  color: #333;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-/*
  * 行番号でジャンプ（P08-2）。ツールバーの右端へ寄せる。
  */
 .log-toolbar__jump {
@@ -529,6 +499,11 @@ body {
  * 無効化する（user-select: none）。選択の可視化は行単位のハイライト
  * （.log-row--selected）で行い、コピー内容は src/log_view.js が
  * copy_selection コマンド経由で組み立てる（COPY-001 / COPY-002）。
+ *
+ * Issue #85 で行単位のドラッグ選択を追加したが、user-select: none は
+ * そのまま残す。ドラッグ中にブラウザ既定の文字単位のテキスト選択が同時に
+ * 走ると、青い選択範囲が行ハイライトと二重に見え、Ctrl+C の対象がどちらか
+ * 分からなくなるため（コピー内容は常に行単位の選択から組み立てる）。
  */
 .log-rows {
   display: flex;
