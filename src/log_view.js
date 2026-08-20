@@ -1276,12 +1276,14 @@ function renderRows(visibleRange) {
  * `elements.rows` の委譲クリックハンドラー（`handleRowsClick`）に拾わせる
  * （モジュール冒頭のコメント「新しい単一購読」参照）。
  *
- * 列の間に半角スペースのテキストノードを挟み、画面上で列同士が詰まって
- * 見えないようにする（CSS の余白だけでなく実テキストとして挟む）。P10
- * 以降、コピー内容はこの DOM から生成するのではなく、
+ * 列同士の余白は `src/styles.css` の `.log-row` の `column-gap` が担う
+ * （Issue #80）。かつてはここで列の間に半角スペースのテキストノードを
+ * 挟んでいたが、flex コンテナでは空白のみの匿名フレックスアイテムは
+ * 描画されないため、実際には余白として効いていなかった。P10 以降、
+ * コピー内容はこの DOM から生成するのではなく、
  * `hakutaku_core::assemble_copy` が選択インデックス範囲から本文を
- * 読み直して組み立てる（`copy_selection` コマンド）ため、この空白文字は
- * コピー結果には一切影響しない。
+ * 読み直して組み立てる（`copy_selection` コマンド）ため、この列間表示の
+ * 変更はコピー結果には一切影響しない。
  *
  * @param {number} rowIndex
  * @returns {HTMLDivElement}
@@ -1318,7 +1320,6 @@ function buildRowElement(rowIndex) {
   lineNumber.className = "log-row__lineno";
   lineNumber.textContent = item ? String(item.source_line_number) : "";
   row.appendChild(lineNumber);
-  row.appendChild(document.createTextNode(" "));
 
   if (state.isMerged) {
     // P09-1（LOG-007）: 統合表示では、どのファイル由来かを行ごとに識別
@@ -1328,7 +1329,6 @@ function buildRowElement(rowIndex) {
     source.className = "log-row__source";
     source.textContent = item ? item.source_label : "";
     row.appendChild(source);
-    row.appendChild(document.createTextNode(" "));
   }
 
   if (item && !item.confirmed) {
@@ -1342,7 +1342,6 @@ function buildRowElement(rowIndex) {
     unconfirmedBadge.title =
       "ログファイルへの書き込みが完了していない可能性がある末尾の行です（LOG-026）。解析エラーではありません。";
     row.appendChild(unconfirmedBadge);
-    row.appendChild(document.createTextNode(" "));
   }
 
   if (item && item.continuation_count > 0) {
@@ -1356,7 +1355,6 @@ function buildRowElement(rowIndex) {
     // （item への参照）は持たせない（PERF-012: DOM に行データを保持しない）。
     continuationBadge.dataset.rowIndex = String(rowIndex);
     row.appendChild(continuationBadge);
-    row.appendChild(document.createTextNode(" "));
   }
 
   const text = document.createElement("span");
