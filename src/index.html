@@ -70,6 +70,13 @@
             ON で開いている全ソースを横断する統合表示（統合タブ1つ）を表示し、
             OFF でファイル別タブ表示へ戻す（LOG-015。分割表示は作らない）。
             src/shell.js が押下・表示ラベルの更新を行う。
+
+            Issue #83 で一時無効化。再開は #82 の改修実装時（統合表示の表示
+            品質の課題を #82 に仕様改善案として集約済み）。disabled と title
+            はここで静的に付与し、src/shell.js 側は
+            MERGED_VIEW_TEMPORARILY_DISABLED によりクリックハンドラーを
+            登録しない（統合表示の実装本体は削除しない。再開時はこの
+            disabled／title と src/shell.js の定数を外す）。
           -->
           <div class="view-toolbar" id="view-toolbar">
             <button
@@ -77,6 +84,8 @@
               id="merged-view-toggle"
               class="merged-view-toggle"
               aria-pressed="false"
+              disabled
+              title="時系列統合表示は表示の改修中のため一時的に使えません（Issue #82）"
             >
               時系列統合: OFF
             </button>

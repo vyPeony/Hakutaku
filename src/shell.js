@@ -111,6 +111,18 @@ const POLL_INTERVAL_MS = 500;
  */
 const LIST_TARGETS_FAILURE_LIMIT = 5;
 
+/**
+ * 時系列統合表示の UI 入口（`#merged-view-toggle`）を一時的に閉じるか
+ * （Issue #83）。表示品質の課題（表示改善案は Issue #82 に集約済み）のため、
+ * #82 の改修実装まで統合表示のトグルを非活性化する。実装本体
+ * （`invokeEnableMergedView`／`invokeDisableMergedView`、
+ * `handleMergedViewToggleClick` を含む統合表示の経路）は #82 の改修版で
+ * そのまま再利用するため削除しない。再開する場合は、この定数を `false` に
+ * 戻し、`src/index.html` の `#merged-view-toggle` から `disabled` 属性と
+ * `title` 属性を外す。
+ */
+const MERGED_VIEW_TEMPORARILY_DISABLED = true;
+
 /** モジュール内部状態。 */
 const state = {
   /** @type {string[]} `get_config_status` の `data_source_names`（CFG-003／PROD-006）。 */
@@ -482,7 +494,13 @@ export function initShell({ retentionLimits, dataSourceNames }) {
   };
 
   elements.openFileButton.addEventListener("click", handleOpenFileButtonClick);
-  elements.mergedViewToggle.addEventListener("click", handleMergedViewToggleClick);
+  // Issue #83: 表示品質の改修（#82）まで統合表示の UI 入口を閉じる。
+  // `src/index.html` 側の `disabled` 属性だけでも押下は防げるが、ハンドラー
+  // 自体を登録しないことで、`disabled` が何らかの理由で外れても統合表示へは
+  // 遷移しない二重の安全策にしている。
+  if (!MERGED_VIEW_TEMPORARILY_DISABLED) {
+    elements.mergedViewToggle.addEventListener("click", handleMergedViewToggleClick);
+  }
 
   // 現時点ではビュー領域の実装はテキストログビューア（src/log_view.js）
   // 1種類のみのため、その初期化（DOM 要素の取得・スクロール購読）は
@@ -850,6 +868,10 @@ async function handleOpenFileButtonClick() {
  *   （無ければ空表示）へ戻す。
  *
  * いずれの操作も参照対象ファイルそのものは変更しない（`ERR-003`）。
+ *
+ * `MERGED_VIEW_TEMPORARILY_DISABLED` が真の間（Issue #83）、`initShell` は
+ * このハンドラーをクリックイベントへ登録しないため呼ばれない。#82 の改修
+ * 実装で再開するまで、この関数自体は実装を保持したまま到達不能になる。
  */
 async function handleMergedViewToggleClick() {
   elements.mergedViewToggle.disabled = true;

@@ -576,6 +576,10 @@ export function readViewState(page) {
       jumpInputValue: document.querySelector("#log-jump-input")?.value ?? "",
       mergedToggleLabel: toggle?.textContent?.trim() ?? "",
       mergedTogglePressed: toggle?.getAttribute("aria-pressed") ?? "",
+      // Issue #83: 統合表示の UI 入口は #82 の改修実装まで非活性化されている。
+      // シナリオ7がこの2値で非活性化そのものを確認する。
+      mergedToggleDisabled: toggle instanceof HTMLButtonElement ? toggle.disabled : false,
+      mergedToggleTitle: toggle?.getAttribute("title") ?? "",
       renderedRowCount: document.querySelectorAll("#log-rows .log-row").length,
       viewportClientHeight: document.querySelector("#log-viewport")?.clientHeight ?? 0,
       // Issue #78: `clientHeight` は内側の水平スクロールバーの厚みぶん実行中に
