@@ -544,6 +544,14 @@ body {
  * 一定に保つ（仕様どおり）。日本語が文字化けしないよう、既定のフォント
  * スタック（:root）に加え、行内の等幅整列用に Consolas を優先させる
  * （.config-banner__errors li と同じ考え方のフォントスタック）。
+ *
+ * column-gap は、行番号・（統合表示時の）読み込み元ラベル・各種バッジ・
+ * 本文という列同士の余白を作る唯一の機構である（Issue #80）。かつて
+ * buildRowElement は列の間に半角スペースのテキストノードを挟んでいたが、
+ * flex コンテナでは空白のみの匿名フレックスアイテムは描画されないため
+ * （CSS Flexbox 仕様 4章）、その余白は最初から効いていなかった。Issue #78 で
+ * 日時列（斜体・グレーの視覚的区切り）を廃止した結果、列同士の連結が
+ * 目立つようになって気付かれた。
  */
 .log-row {
   display: flex;
@@ -554,6 +562,7 @@ body {
   white-space: pre;
   font-family: "Consolas", "Yu Gothic UI", "Meiryo", monospace;
   font-size: var(--font-size-body);
+  column-gap: 1ch;
 }
 
 /*
