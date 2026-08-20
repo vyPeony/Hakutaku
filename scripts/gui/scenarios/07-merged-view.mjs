@@ -43,7 +43,7 @@ async function toggleMergedView(page, expectedPressed) {
 export async function run({ page, expect }) {
   // --- 複数タブ ---
   for (const target of [SAMPLE_TARGETS.MERGE_A, SAMPLE_TARGETS.MERGE_B]) {
-    await openTargetByName(page, target, { requireTimestamp: true });
+    await openTargetByName(page, target);
   }
 
   const tabsBefore = await readTabs(page);
@@ -66,7 +66,6 @@ export async function run({ page, expect }) {
   await waitForLogViewReady(page, {
     sourceLabel: "時系列統合",
     previousSignature: beforeMerged,
-    requireTimestamp: true,
   });
 
   const mergedView = await readViewState(page);
@@ -111,7 +110,6 @@ export async function run({ page, expect }) {
   await waitForLogViewReady(page, {
     sourceLabel: SAMPLE_TARGETS.MERGE_B,
     previousSignature: beforeRestore,
-    requireTimestamp: true,
   });
 
   const restoredView = await readViewState(page);

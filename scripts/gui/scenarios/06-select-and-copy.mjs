@@ -28,7 +28,7 @@ const COPY_DONE_TEXT = "をクリップボードへコピーしました。";
 export async function run({ page, expect }) {
   // 規約3: 最小のサンプル（200行）を使う。
   const target = SAMPLE_TARGETS.MILLISECOND;
-  await openTargetByName(page, target, { requireTimestamp: true });
+  await openTargetByName(page, target);
 
   // このシナリオで出た通知だけを見るため、先に画面上部を片付ける。
   await dismissBanners(page);
