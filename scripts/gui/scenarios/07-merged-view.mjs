@@ -1,44 +1,20 @@
-// シナリオ7: 複数タブと時系列統合表示の ON/OFF（`LOG-007`、`LOG-008`、`LOG-015`）。
+// シナリオ7: 複数タブと時系列統合トグルの非活性化（Issue #83、`LOG-006`、`LOG-015`）。
 //
-// 統合表示は「開いている全ソースを横断する1つの表示集合」を作り、タブは統合タブ
-// 1つだけになる（`LOG-015`: 分割表示は作らない）。OFF に戻すと、直前にアクティブ
-// だったファイル別タブへ戻る（`src/shell.js` の `handleMergedViewToggleClick`）。
+// 時系列統合表示は表示品質の課題（表示改善案は Issue #82 に集約済み）のため、
+// #82 の改修実装まで UI 入口（`#merged-view-toggle`）を一時的に非活性化して
+// いる（`src/shell.js` の `MERGED_VIEW_TEMPORARILY_DISABLED`）。統合表示の
+// 実装本体（`enable_merged_view`／`disable_merged_view`、`src/log_view.js` の
+// 統合経路）は削除していないが、UI から到達できない間は検査しようがないため、
+// このシナリオは非活性化そのもの（disabled・title・aria-pressed・統合タブが
+// 現れないこと）だけを確認する。統合表示の ON/OFF・混在表示・並び順の確認は、
+// #82 の改修実装後にこのシナリオへ戻す（旧手順は Git 履歴を参照）。
 //
-// 後続シナリオ（タブを閉じる）は統合表示が OFF であることを前提にするため、
-// このシナリオは必ず OFF へ戻して終わる。
+// 後続シナリオ（タブを閉じる）はこのシナリオが開いたタブに依存するため、
+// このシナリオは複数タブを開いた状態のまま終わる。
 
-import {
-  SAMPLE_TARGETS,
-  openTargetByName,
-  parseItemCount,
-  readRenderedRows,
-  readRowSignature,
-  readTabs,
-  readViewState,
-  waitForLogViewReady,
-} from "../app.mjs";
+import { SAMPLE_TARGETS, openTargetByName, readTabs, readViewState } from "../app.mjs";
 
-export const name = "複数タブと時系列統合表示";
-
-/**
- * 統合表示のトグルを押し、押下状態が期待どおりになるまで待つ。
- *
- * トグルは処理中 `disabled` になり、完了時にラベルと `aria-pressed` が更新される
- * （`updateMergedViewToggleLabel`）。押下状態を待つことで、統合表示集合の構築
- * （Tauri コマンド）の完了まで待てる。
- *
- * @param {import("playwright-core").Page} page
- * @param {boolean} expectedPressed
- */
-async function toggleMergedView(page, expectedPressed) {
-  await page.click("#merged-view-toggle");
-  await page.waitForFunction(
-    (pressed) =>
-      document.querySelector("#merged-view-toggle")?.getAttribute("aria-pressed") === pressed,
-    String(expectedPressed),
-    { timeout: 30_000 },
-  );
-}
+export const name = "複数タブと時系列統合トグルの非活性化（#83）";
 
 export async function run({ page, expect }) {
   // --- 複数タブ ---
@@ -55,75 +31,34 @@ export async function run({ page, expect }) {
       `タブ ${JSON.stringify(tabsBefore.map((tab) => tab.title))}`,
     );
   }
-  const singleFileItemCount = parseItemCount((await readViewState(page)).totalItemsText);
 
-  // --- 統合表示 ON ---
-  // 統合表示への切り替えも、読み込み元ラベルが先に更新されてから行が描画される
-  // （`src/log_view.js` の `activate`）。切り替え前の指紋を渡し、前のファイルの
-  // 行が残っている一瞬を掴まないようにする。
-  const beforeMerged = await readRowSignature(page);
-  await toggleMergedView(page, true);
-  await waitForLogViewReady(page, {
-    sourceLabel: "時系列統合",
-    previousSignature: beforeMerged,
-  });
-
-  const mergedView = await readViewState(page);
-  expect.expectEqual("統合表示 ON のラベルになる", mergedView.mergedToggleLabel, "時系列統合: ON");
-  expect.expectEqual("統合表示 ON で aria-pressed が true になる", mergedView.mergedTogglePressed, "true");
-  expect.expectEqual("統合表示のビューは読み込み元ラベルが「時系列統合」になる", mergedView.sourceLabel, "時系列統合");
-
-  const mergedTabs = await readTabs(page);
-  expect.expectEqual("LOG-015: 統合表示ではタブが1つだけになる（分割表示を作らない）", mergedTabs.length, 1);
-  expect.expectEqual("統合タブの見出しが「時系列統合」である", mergedTabs[0]?.title, "時系列統合");
+  // --- 統合トグルの非活性化（Issue #83） ---
+  const viewState = await readViewState(page);
+  expect.check(
+    "統合トグルが disabled である（#82 の改修実装まで一時無効化。Issue #83）",
+    viewState.mergedToggleDisabled === true,
+    `disabled ${JSON.stringify(viewState.mergedToggleDisabled)}`,
+  );
   expect.expectEqual(
-    "統合タブには閉じるボタンが無い（OFF はトグルで行う）",
-    mergedTabs[0]?.closable,
-    false,
+    "統合トグルの表示ラベルは「時系列統合: OFF」のまま",
+    viewState.mergedToggleLabel,
+    "時系列統合: OFF",
+  );
+  expect.expectEqual(
+    "統合トグルの aria-pressed が false のまま変化しない",
+    viewState.mergedTogglePressed,
+    "false",
+  );
+  expect.check(
+    "統合トグルの title に案内先の Issue #82 への参照がある",
+    viewState.mergedToggleTitle.includes("82"),
+    `title ${JSON.stringify(viewState.mergedToggleTitle)}`,
   );
 
-  const mergedItemCount = parseItemCount(mergedView.totalItemsText);
+  const tabsAfter = await readTabs(page);
   expect.check(
-    "統合表示の件数が、単一ファイルの件数より多い（全ソースを横断している。LOG-006）",
-    Number.isFinite(mergedItemCount) && mergedItemCount > singleFileItemCount,
-    `統合 ${mergedItemCount} / 単一 ${singleFileItemCount}`,
-  );
-
-  // 統合表示では行ごとに読み込み元ラベル列が出る（`LOG-007`）。複数のソースの行が
-  // 実際に混ざって並んでいることを、描画済みの行に現れるラベルの種類数で見る。
-  const mergedRows = await readRenderedRows(page);
-  expect.check(
-    "LOG-007: 統合表示の行に読み込み元ラベル列が出る",
-    mergedRows.length > 0 && mergedRows.every((row) => (row.sourceLabel ?? "").length > 0),
-    `先頭行 ${JSON.stringify(mergedRows[0])}`,
-  );
-  const distinctSources = new Set(mergedRows.map((row) => row.sourceLabel));
-  expect.expectAtLeast(
-    "LOG-006／LOG-008: 描画範囲に複数のソース由来の行が混在する",
-    distinctSources.size,
-    2,
-  );
-
-  // --- 統合表示 OFF ---
-  const beforeRestore = await readRowSignature(page);
-  await toggleMergedView(page, false);
-  await waitForLogViewReady(page, {
-    sourceLabel: SAMPLE_TARGETS.MERGE_B,
-    previousSignature: beforeRestore,
-  });
-
-  const restoredView = await readViewState(page);
-  expect.expectEqual("統合表示 OFF のラベルへ戻る", restoredView.mergedToggleLabel, "時系列統合: OFF");
-  expect.check(
-    "OFF に戻すとファイル別タブの表示へ戻る",
-    restoredView.sourceLabel !== "時系列統合" && restoredView.sourceLabel.length > 0,
-    `読み込み元 ${JSON.stringify(restoredView.sourceLabel)}`,
-  );
-  const restoredTabs = await readTabs(page);
-  expect.expectAtLeast("OFF に戻すとファイル別タブが並び直す", restoredTabs.length, 2);
-  expect.check(
-    "OFF に戻すと統合タブが無くなる",
-    restoredTabs.every((tab) => !tab.merged),
-    `タブ ${JSON.stringify(restoredTabs.map((tab) => tab.title))}`,
+    "統合タブ（tab--merged）は存在しない",
+    tabsAfter.every((tab) => !tab.merged),
+    `タブ ${JSON.stringify(tabsAfter.map((tab) => tab.title))}`,
   );
 }
