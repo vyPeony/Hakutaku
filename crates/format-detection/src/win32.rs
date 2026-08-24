@@ -26,6 +26,15 @@ use crate::decode::{DecodeError, RawDecodeResult, MAX_INVALID_POSITIONS};
 /// （`tasks/phase-05-log-parsing-core.md` 作業項目4「位置特定の粒度はチャンク
 /// 単位の近似でもよい」を採用した暫定設計）。
 ///
+/// したがって、この経路が報告する位置は**常にこの定数の倍数**（0、4096、8192…）
+/// であり、1チャンク内に不正バイトがいくつあっても1件しか報告されません。
+/// UTF-8 経路（`crate::decode` の `decode_utf8_lossy_with_positions`）は
+/// 標準ライブラリの判定に基づくバイト単位の正確な位置を報告するため、**同じ
+/// [`crate::DecodeOutcome::invalid_positions`] でも経路によって粒度が異なります**。
+/// 呼び出し側がこの一覧を利用者へ表示する際は、Windows コードページ経路の値を
+/// バイト単位の正確な位置として扱わないでください（Issue #38 で明文化。粒度の
+/// 統一そのものは行っていません）。
+///
 /// CP932 のような DBCS（2バイト文字）コードページでは、チャンク境界がリード
 /// バイトとトレイルバイトの間をちょうど分断した場合、実際には正当な2バイト
 /// 文字であっても前後どちらかのチャンクが「不正」と判定され得ます。この場合、
@@ -57,9 +66,17 @@ pub(crate) fn codepage_exists(codepage: u32) -> bool {
 
 /// `flags` を使って `bytes` を `codepage` から UTF-16 へ変換します。
 ///
-/// 失敗（不正なバイト列を含む、または `codepage` が不正）した場合は `None`
-/// を返します。呼び出し側が厳密モード／許容モードの切り替えと、失敗時の
-/// フォールバックに使います。
+/// 失敗（不正なバイト列を含む、`codepage` が不正、または `flags` をその
+/// `codepage` が受け付けない）した場合は `None` を返します。呼び出し側が厳密
+/// モード／許容モードの切り替えと、失敗時のフォールバックに使います。
+///
+/// # 入力長の上限（`i32::MAX` バイト = 2 GiB 未満）
+///
+/// `MultiByteToWideChar` はバイト数を `i32` で受け取るため、`bytes.len()` が
+/// [`i32::MAX`] を超えるとパニックします（`windows` クレートの束縛が
+/// `try_into().unwrap()` で変換するため）。呼び出し側はこの上限を守る必要が
+/// あります。読み込み経路はチャンク単位でデコードするため実際には到達しません
+/// が、公開 API（[`crate::decode`]）の契約として明記しています（Issue #38）。
 fn multi_byte_to_wide(
     bytes: &[u8],
     codepage: u32,
@@ -100,12 +117,40 @@ fn multi_byte_to_wide(
 ///    チャンクへ分割し、チャンクごとに厳密モードを試して不正位置を近似特定する
 /// 4. 許容モード（フラグなし）で全体を変換し、実際のテキストを得る
 ///    （不正バイトは Windows がコードページの既定文字へ置き換える）
+///
+/// # 厳密モードを使えないコードページ（Issue #38）
+///
+/// [`crate::codepage_rejection`] が理由を返すコードページ（UTF-16、および
+/// `MB_ERR_INVALID_CHARS` を受け付けないコードページ）では、手順3のチャンク走査
+/// を行いません。行っても全チャンクが `ERROR_INVALID_FLAGS` で失敗し、実際には
+/// 妥当なバイト列であっても「全チャンクが不正位置」という実態と食い違う報告に
+/// なるためです。これらのコードページは設定の起動時検証（`CFG-016`）が先に弾く
+/// ので通常は到達しませんが、到達した場合は不正位置の報告をあきらめ、テキストの
+/// 取得だけを試みます。
+///
+/// # 入力長の上限
+///
+/// `bytes.len()` は [`i32::MAX`] 以下である必要があります（[`multi_byte_to_wide`]
+/// の doc コメント参照）。
 pub(crate) fn decode_windows_codepage(
     bytes: &[u8],
     codepage: u32,
 ) -> Result<RawDecodeResult, DecodeError> {
     if !codepage_exists(codepage) {
         return Err(DecodeError::UnknownCodepage(codepage));
+    }
+
+    // 厳密モードが意味を持つコードページかを先に判定する。順序が逆だと、
+    // 厳密モードの失敗が「不正バイトがある」のか「フラグを受け付けない」のか
+    // 区別できないまま、下のチャンク走査へ進んでしまう。
+    if crate::decision::codepage_rejection(codepage).is_some() {
+        let wide = multi_byte_to_wide(bytes, codepage, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0))
+            .ok_or(DecodeError::UnknownCodepage(codepage))?;
+        return Ok(RawDecodeResult {
+            text: String::from_utf16_lossy(&wide),
+            invalid_offsets: Vec::new(),
+            truncated: false,
+        });
     }
 
     if let Some(wide) = multi_byte_to_wide(bytes, codepage, MB_ERR_INVALID_CHARS) {
@@ -218,5 +263,97 @@ mod tests {
     #[test]
     fn environment_ansi_codepage_is_positive() {
         assert!(environment_ansi_codepage() > 0);
+    }
+
+    // ---------------------------------------------------------------
+    // 特殊コードページの実挙動確認（CFG-016、ENC-006、Issue #38）。
+    // ---------------------------------------------------------------
+
+    /// 起動時検証の分類（`crate::decision::codepage_rejection`）と突き合わせる
+    /// 対象のコードページ。ISO-2022 系・ISCII 系・UTF-7・Symbol・UTF-16 と、
+    /// 比較のための通常のコードページを含む。
+    fn probed_codepages() -> Vec<u32> {
+        let mut codepages: Vec<u32> = (50220..=50229).chain(57002..=57011).collect();
+        codepages.extend([
+            42, 52936, 54936, 65000, 65001, 1200, 1201, 12000, 12001, 20127, 932, 1252,
+        ]);
+        codepages
+    }
+
+    /// `codepage` に対する `MultiByteToWideChar` の実挙動を1バイトの ASCII
+    /// （どのコードページでも文字として妥当）で確かめる。戻り値は
+    /// （厳密モードが成功したか, 許容モードが成功したか）。
+    fn probe_modes(codepage: u32) -> (bool, bool) {
+        let sample = b"A";
+        let strict = multi_byte_to_wide(sample, codepage, MB_ERR_INVALID_CHARS).is_some();
+        let lenient =
+            multi_byte_to_wide(sample, codepage, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0)).is_some();
+        (strict, lenient)
+    }
+
+    // 受け入れ条件（`CFG-016`、`ENC-006`）: 起動時検証が使う分類
+    // （`codepage_supports_strict_validation` / `codepage_rejection`）が、この
+    // 実行環境の `MultiByteToWideChar` の実挙動と一致する。分類は MSDN の記述を
+    // 元にした固定の一覧なので、実挙動と食い違えば「起動時検証は通ったのに
+    // ファイルを開くと全チャンクが不正位置になる」状態を生む。実挙動を正とし、
+    // 一覧のほうを直すためのテストである。
+    #[test]
+    fn codepages_without_strict_mode_match_win32_behavior() {
+        for codepage in probed_codepages() {
+            if !codepage_exists(codepage) {
+                // 実行環境に無いコードページは、そもそも存在確認
+                // （`crate::codepage_available`）が起動時に弾く。厳密モードの
+                // 可否は問わない。
+                println!("cp={codepage:5} exists=false");
+                continue;
+            }
+            let (strict, lenient) = probe_modes(codepage);
+            let rejection = crate::decision::codepage_rejection(codepage);
+            println!(
+                "cp={codepage:5} exists=true  strict={strict:5} lenient={lenient:5} rejection={rejection:?}"
+            );
+
+            if strict {
+                assert!(
+                    crate::decision::codepage_supports_strict_validation(codepage),
+                    "コードページ {codepage} は厳密モードを受け付けるのに、非対応として分類されている"
+                );
+            } else if lenient {
+                // 許容モードは通るのに厳密モードだけ失敗する = フラグ自体を
+                // 受け付けないコードページ。
+                assert!(
+                    !crate::decision::codepage_supports_strict_validation(codepage),
+                    "コードページ {codepage} は厳密モードを受け付けないのに、対応として分類されている"
+                );
+            } else {
+                // どちらのモードでも変換できない（UTF-16 など）。文字コードとして
+                // 選べないことが分類に現れている必要がある。
+                assert!(
+                    rejection.is_some(),
+                    "コードページ {codepage} は変換自体ができないのに、選択可能として分類されている"
+                );
+            }
+        }
+    }
+
+    // 受け入れ条件（`ENC-006`、Issue #38）: 厳密モードを使えないコードページで
+    // デコードしても、妥当なバイト列が「全チャンク不正」にならない
+    // （`decode_windows_codepage` がチャンク走査を行わない）。
+    #[test]
+    fn decode_with_codepage_without_strict_mode_does_not_report_every_chunk_as_invalid() {
+        // UTF-7（65000）は MB_ERR_INVALID_CHARS を受け付けない代表例。
+        let codepage = 65000;
+        if !codepage_exists(codepage) {
+            return;
+        }
+        let bytes = b"plain ASCII line".repeat(600); // 4096 バイト超（複数チャンク）。
+        let result =
+            decode_windows_codepage(&bytes, codepage).expect("許容モードでの変換は成功するはず");
+        assert!(
+            result.invalid_offsets.is_empty(),
+            "妥当な ASCII なのに不正位置が報告された: {:?}",
+            result.invalid_offsets
+        );
+        assert!(!result.truncated);
     }
 }

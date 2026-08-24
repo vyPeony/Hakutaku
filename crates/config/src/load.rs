@@ -50,9 +50,12 @@ pub enum LoadOutcome {
 ///   検証に1件でも失敗した → [`LoadOutcome::Invalid`]（`CFG-016`）
 /// - 全項目の検証に成功した → [`LoadOutcome::Loaded`]
 ///
-/// `log_profiles[].ansi_codepage` は値域（1 以上）だけを検証し、その番号の
-/// コードページが実行環境に存在するかは確認しない。存在確認まで起動時に
-/// 一括提示したい呼び出し側は [`load_config_with_codepage_check`] を使う。
+/// `log_profiles[].ansi_codepage` と `log_profiles[].encoding` の
+/// `windows-<コードページ番号>` 指定については、値域（1 以上）と、Hakutaku が
+/// 文字コードとして選べる番号かどうか（`ENC-006` の UTF-16 と、厳密な判定が
+/// できないコードページを弾く。Issue #38）を検証する。その番号のコードページが
+/// **実行環境に存在するか**は確認しない。存在確認まで起動時に一括提示したい
+/// 呼び出し側は [`load_config_with_codepage_check`] を使う。
 #[must_use]
 pub fn load_config(config_path: &Path) -> LoadOutcome {
     load_config_with_codepage_check(config_path, &|_| true)
@@ -64,11 +67,15 @@ pub fn load_config(config_path: &Path) -> LoadOutcome {
 /// # なぜ注入するのか
 ///
 /// `ansi_codepage` に書かれた番号が実行環境に存在するかは、Win32 の
-/// `GetCPInfoExW` にしか答えられない。一方このクレートは `hakutaku.yaml` の
-/// 解釈だけを担い、Win32 へは依存しない（ADR-0004 で `saphyr` 依存をこの
-/// クレートに封じ込めたのと同じく、層の依存の向きを保つため）。そこで確認手段
-/// だけを呼び出し側から受け取り、判定結果を他の値検証と同じ
-/// [`ConfigError`] として**起動時に一括提示**する。
+/// `GetCPInfoExW` にしか答えられず、しかも答えは実行する端末によって変わる。
+/// 確認手段だけを呼び出し側から受け取ることで、テストが「存在するとみなす番号」
+/// を与えて実行環境に左右されずに検証できるようにし、判定結果は他の値検証と
+/// 同じ [`ConfigError`] として**起動時に一括提示**する。
+///
+/// 一方、文字コード名の受理範囲（`utf-8`／`windows-<番号>`）と、コードページを
+/// 文字コードとして選べるかの分類（`ENC-006` の UTF-16 など）は実行環境に依存
+/// しない純粋な判断なので、注入せずに
+/// [`hakutaku_format_detection`] の関数を直接呼ぶ（Issue #38）。
 ///
 /// これが無いと、誤ったコードページ番号は「そのプロファイルが適用される
 /// ファイルを実際に開いた時点」まで表面化せず、`CFG-016` の「誤設定を起動時に
@@ -730,6 +737,11 @@ impl<'check> Validator<'check> {
             let mut encoding = EncodingSetting::default();
             let mut ansi_codepage: Option<u32> = None;
             let mut datetime_format = DateTimeFormatSetting::default();
+            // 同時指定の検証（validate_encoding_and_ansi_codepage_are_exclusive）
+            // 用の記録。値が妥当だったかではなく「キーが書かれていたか」を見る
+            // 必要があるため、検証結果（encoding／ansi_codepage）とは別に持つ。
+            let mut named_encoding_marker: Option<Marker> = None;
+            let mut ansi_codepage_marker: Option<Marker> = None;
 
             for (key_node, value_node) in mapping {
                 let Some(key) = key_node.data.as_str() else {
@@ -762,10 +774,20 @@ impl<'check> Validator<'check> {
                         }
                     }
                     "encoding" => {
+                        // `auto` は明示指定ではないため、同時指定の記録には残さない
+                        // （`encoding: auto` + `ansi_codepage` は正しい書き方）。
+                        if value_node
+                            .data
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty() && value != "auto")
+                        {
+                            named_encoding_marker = Some(value_node.span.start);
+                        }
                         encoding =
                             self.validate_encoding(value_node, &format!("{prefix}.encoding"));
                     }
                     "ansi_codepage" => {
+                        ansi_codepage_marker = Some(value_node.span.start);
                         ansi_codepage = self
                             .validate_ansi_codepage(value_node, &format!("{prefix}.ansi_codepage"));
                     }
@@ -793,6 +815,12 @@ impl<'check> Validator<'check> {
                     format!("{prefix}.path_pattern が指定されていません"),
                 );
             }
+
+            self.validate_encoding_and_ansi_codepage_are_exclusive(
+                &prefix,
+                named_encoding_marker,
+                ansi_codepage_marker,
+            );
 
             if let (Some(name), Some(path_pattern), Some(path_pattern_marker)) =
                 (name, path_pattern, path_pattern_marker)
@@ -901,36 +929,107 @@ impl<'check> Validator<'check> {
 
     /// `log_profiles[].ansi_codepage` を検証する（`CFG-008`、`ENC-007`）。
     ///
-    /// 値域（1 以上の `u32`）に加えて、その番号のコードページが**実行環境に
-    /// 存在するか**も確認する（Issue #39）。存在確認の手段は呼び出し側から
-    /// 注入する（理由は [`load_config_with_codepage_check`] を参照）。
+    /// 値域（1 以上の `u32`）に加えて、次の2つを確認する。
     ///
-    /// 存在しない番号は、そのプロファイルが適用されるファイルを開いた時点で
-    /// どのみち失敗する。起動時に位置つきで示すほうが、利用者は「どの行を
-    /// 直せばよいか」へ直接たどり着ける（`CFG-016`）。
+    /// 1. Hakutaku が文字コードとして**選べる**コードページか
+    ///    （[`hakutaku_format_detection::codepage_rejection`]。`ENC-006` の
+    ///    UTF-16、および厳密な判定ができないコードページを弾く。Issue #38）
+    /// 2. その番号のコードページが**実行環境に存在するか**（Issue #39）。存在
+    ///    確認の手段は呼び出し側から注入する（理由は
+    ///    [`load_config_with_codepage_check`] を参照）
+    ///
+    /// 順序が重要である。UTF-16（1200／1201）は `GetCPInfoExW` でも取得できず、
+    /// 存在確認を先に行うと「この実行環境に存在しないコードページです」という、
+    /// 実態（`ENC-006` により初期リリースでは未対応）と食い違う理由を利用者へ
+    /// 示すことになる。
+    ///
+    /// いずれの誤りも、そのプロファイルが適用されるファイルを開いた時点でどの
+    /// みち失敗する。起動時に位置つきで示すほうが、利用者は「どの行を直せば
+    /// よいか」へ直接たどり着ける（`CFG-016`）。
     fn validate_ansi_codepage(&mut self, node: &MarkedYaml, item_path: &str) -> Option<u32> {
         let codepage = self.validate_u32(node, item_path, 1)?;
-        if (self.codepage_exists)(codepage) {
-            return Some(codepage);
+        if !self.check_codepage_is_usable(node.span.start, item_path, codepage) {
+            return None;
         }
-        self.push(
-            node.span.start,
-            item_path.to_string(),
-            format!(
-                "{item_path} の値 {codepage} は、この実行環境に存在しない Windows コードページです。実行環境で使用できるコードページ番号を指定してください"
-            ),
-        );
-        None
+        Some(codepage)
     }
 
+    /// コードページ番号1件を、`ansi_codepage` と `encoding: windows-<番号>` の
+    /// 両方から共通して検証する（`CFG-016`、`ENC-006`、`ENC-007`、Issue #38）。
+    ///
+    /// 使える場合だけ `true` を返し、そうでなければエラーを積む。判断と理由の
+    /// 文言は形式判定層（[`hakutaku_format_detection`]）を唯一の実装とし、
+    /// ここでは項目パスを添えるだけにする。設定側にも同じ規則を書くと、両者が
+    /// 食い違ったときに「起動時検証は通ったのにファイルを開くと失敗する」状態を
+    /// 生むためである。
+    fn check_codepage_is_usable(&mut self, marker: Marker, item_path: &str, codepage: u32) -> bool {
+        if let Some(rejection) = hakutaku_format_detection::codepage_rejection(codepage) {
+            self.push(
+                marker,
+                item_path.to_string(),
+                format!("{item_path} の値 {codepage} は使用できません。{rejection}"),
+            );
+            return false;
+        }
+        if !(self.codepage_exists)(codepage) {
+            self.push(
+                marker,
+                item_path.to_string(),
+                format!(
+                    "{item_path} の値 {codepage} は、この実行環境に存在しない Windows コードページです。実行環境で使用できるコードページ番号を指定してください"
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// `log_profiles[].encoding` を検証する（`CFG-008`、`ENC-005`）。
+    ///
+    /// 受理するのは `auto` と、形式判定層が解釈できる名前
+    /// （[`hakutaku_format_detection::parse_named_encoding`]。`utf-8` と
+    /// `windows-<コードページ番号>`）だけである。
+    ///
+    /// # 非空の確認だけをやめた理由（Issue #38）
+    ///
+    /// 以前は「文字コード名が実在するかは消費側（P05 の文字コード判定）が判定
+    /// する」として、ここでは非空であることだけを確認していた。その結果、
+    /// `shift_jis` のような受理されない名前は起動時検証を通過し、そのプロファイル
+    /// が適用されるファイルを開いた時点で初めてエラーになっていた。これは
+    /// `CFG-016` の「誤設定を起動時に一括提示する」から外れる。判断そのものは
+    /// 形式判定層の関数をそのまま呼ぶため、受理範囲が二か所へ分かれることはない。
     fn validate_encoding(&mut self, node: &MarkedYaml, item_path: &str) -> EncodingSetting {
         match node.data.as_str() {
             Some("auto") => EncodingSetting::Auto,
-            // 文字コード名が実在するかはここでは判定しない。判定できる知識を持つのは
-            // 消費側（P05 の文字コード判定）であり、P03 が確定させるのはスキーマの形
-            // までだからである（`tasks/phase-03-configuration.md` の「このフェーズが
-            // 確定させるもの／させないもの」）。ここは非空であることだけを検証する。
-            Some(value) if !value.is_empty() => EncodingSetting::Named(value.to_string()),
+            Some(value) if !value.is_empty() => {
+                match hakutaku_format_detection::parse_named_encoding(value) {
+                    Ok(parsed) => {
+                        // `windows-<番号>` は `ansi_codepage` と同じコードページ
+                        // 番号を指すので、同じ確認（選択可否・存在）を通す。
+                        // `utf-8` にはコードページ番号がないため確認対象がない。
+                        if let hakutaku_format_detection::SelectedEncoding::Windows(codepage) =
+                            parsed
+                        {
+                            if !self.check_codepage_is_usable(node.span.start, item_path, codepage)
+                            {
+                                return EncodingSetting::Auto;
+                            }
+                        }
+                        EncodingSetting::Named(value.to_string())
+                    }
+                    Err(error) => {
+                        // 理由の本文（受理する形式の案内を含む）は
+                        // `InvalidEncodingNameError` を唯一の出どころとし、ここでは
+                        // どの項目かだけを添える。
+                        self.push(
+                            node.span.start,
+                            item_path.to_string(),
+                            format!("{item_path} の指定が不正です。{error}"),
+                        );
+                        EncodingSetting::Auto
+                    }
+                }
+            }
             Some(_) => {
                 self.push(
                     node.span.start,
@@ -951,6 +1050,41 @@ impl<'check> Validator<'check> {
                 EncodingSetting::Auto
             }
         }
+    }
+
+    /// `encoding` の名前指定と `ansi_codepage` が同時に書かれていないことを
+    /// 検証する（`CFG-008`、`ENC-005`、Issue #38）。
+    ///
+    /// # なぜ排他にするのか
+    ///
+    /// 消費側（`crates/format-detection` の `detect_encoding`）は、両方が指定
+    /// された場合に `encoding` を優先し、`ansi_codepage` を黙って無視する。
+    /// 利用者から見ると「書いたのに使われない設定」であり、`CFG-016` の「誤設定
+    /// を黙って既定値へ置換しない」と同じ理由で起動時検証エラーにする。
+    ///
+    /// `encoding: auto` と `ansi_codepage` の併記は誤りではない。`auto` は明示
+    /// 指定ではなく、任意の Windows コードページを明示する正しい書き方だからで
+    /// ある（`ENC-007`）。そのため呼び出し側は、`auto` 以外の名前が書かれた
+    /// ときだけ `named_encoding_marker` を渡す。
+    ///
+    /// エラーの位置は `ansi_codepage` 側に付ける。`encoding` を残して
+    /// `ansi_codepage` を消すのが最も多い直し方であり、直す行を直接指すため。
+    fn validate_encoding_and_ansi_codepage_are_exclusive(
+        &mut self,
+        prefix: &str,
+        named_encoding_marker: Option<Marker>,
+        ansi_codepage_marker: Option<Marker>,
+    ) {
+        let (Some(_), Some(ansi_marker)) = (named_encoding_marker, ansi_codepage_marker) else {
+            return;
+        };
+        self.push(
+            ansi_marker,
+            format!("{prefix}.ansi_codepage"),
+            format!(
+                "{prefix}.encoding に文字コード名を指定した場合、{prefix}.ansi_codepage は同時に指定できません。両方を書くと encoding の指定だけが使われ、ansi_codepage は黙って無視されます。どちらか一方だけを残してください（ansi_codepage を使う場合は encoding を auto にするか、encoding の行を削除してください）"
+            ),
+        );
     }
 
     /// `log_profiles[].datetime_format` を検証する（`CFG-008`）。
