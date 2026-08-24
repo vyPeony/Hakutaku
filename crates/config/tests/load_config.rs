@@ -243,14 +243,14 @@ fn log_profile_named_encoding_is_preserved() {
         r#"
 config_version: 1
 log_profiles:
-  - name: shift_jis_log
+  - name: cp932_log
     path_pattern: "C:/Device/Logs/*.log"
-    encoding: shift_jis
+    encoding: windows-932
 "#,
     );
     assert_eq!(
         config.log_profiles[0].encoding,
-        EncodingSetting::Named("shift_jis".to_string())
+        EncodingSetting::Named("windows-932".to_string())
     );
     // ansi_codepage 省略時は None（未指定時のみ実行環境の ANSI を使用する。CFG-008）。
     assert_eq!(config.log_profiles[0].ansi_codepage, None);
@@ -997,6 +997,160 @@ fn load_config_without_injection_does_not_check_codepage_existence() {
         "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    ansi_codepage: 99999\n",
     );
     assert_eq!(config.log_profiles[0].ansi_codepage, Some(99999));
+}
+
+// ---------------------------------------------------------------------
+// 文字コード指定の起動時検証（CFG-016、ENC-005、ENC-006、Issue #38）。
+// ---------------------------------------------------------------------
+
+// 受け入れ条件: 受理できない文字コード名は、そのプロファイルが適用される
+// ファイルを開く時点まで待たずに起動時検証エラーになる（位置つき）。
+#[test]
+fn unsupported_encoding_name_is_invalid_at_startup() {
+    let errors = expect_invalid(
+        "encoding-unsupported-name",
+        "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    encoding: shift_jis\n",
+    );
+    assert_eq!(errors.len(), 1);
+    let error = &errors.as_slice()[0];
+    assert_eq!(error.item_path, "log_profiles[0].encoding");
+    assert_eq!(error.line, Some(5));
+    assert!(
+        error.reason.contains("shift_jis") && error.reason.contains("windows-"),
+        "受理できる形式を案内するはず: {}",
+        error.reason
+    );
+}
+
+// 受け入れ条件: 受理できる文字コード名（utf-8 / windows-<番号>）は、大文字・
+// 小文字を問わずそのまま読める（判定は format-detection の parse_named_encoding
+// と同じ）。
+#[test]
+fn accepted_encoding_names_are_loaded() {
+    for name in ["utf-8", "UTF-8", "windows-932", "Windows-1252"] {
+        let config = expect_loaded(
+            "encoding-accepted",
+            &format!(
+                "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    encoding: {name}\n"
+            ),
+        );
+        assert_eq!(
+            config.log_profiles[0].encoding,
+            EncodingSetting::Named(name.to_string()),
+            "文字コード名 {name}"
+        );
+    }
+}
+
+// 受け入れ条件: UTF-16 のコードページ（1200 / 1201）は、「実行環境に存在しない」
+// ではなく「初期リリースでは未対応（ENC-006）」という実態に合う理由で拒否する。
+#[test]
+fn utf16_codepage_is_rejected_with_the_unsupported_reason() {
+    for codepage in [1200, 1201] {
+        let errors = expect_invalid(
+            "codepage-utf16",
+            &format!(
+                "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    ansi_codepage: {codepage}\n"
+            ),
+        );
+        assert_eq!(errors.len(), 1, "コードページ {codepage}");
+        let error = &errors.as_slice()[0];
+        assert_eq!(error.item_path, "log_profiles[0].ansi_codepage");
+        assert!(
+            error.reason.contains("ENC-006"),
+            "UTF-16 未対応を理由にするはず: {}",
+            error.reason
+        );
+        assert!(
+            !error.reason.contains("存在しない"),
+            "存在しないことを理由にしてはいけない: {}",
+            error.reason
+        );
+    }
+}
+
+// 受け入れ条件: 厳密な判定（MB_ERR_INVALID_CHARS）ができないコードページは、
+// 起動時検証で拒否する。ファイルを開くと全チャンクが不正位置として報告される
+// ため、設定として受理しない。
+#[test]
+fn codepage_without_strict_validation_is_rejected() {
+    // 65000 = UTF-7、50220 = ISO-2022-JP、57002 = ISCII デーヴァナーガリー。
+    for codepage in [65000, 50220, 57002] {
+        let errors = expect_invalid(
+            "codepage-no-strict",
+            &format!(
+                "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    ansi_codepage: {codepage}\n"
+            ),
+        );
+        assert_eq!(errors.len(), 1, "コードページ {codepage}");
+        assert_eq!(
+            errors.as_slice()[0].item_path,
+            "log_profiles[0].ansi_codepage"
+        );
+        assert!(
+            errors.as_slice()[0].reason.contains("MB_ERR_INVALID_CHARS"),
+            "理由: {}",
+            errors.as_slice()[0].reason
+        );
+    }
+}
+
+// 受け入れ条件: encoding の windows-<番号> 指定も ansi_codepage と同じ確認を
+// 通る（同じコードページ番号を指す以上、片方だけ通してはいけない）。
+#[test]
+fn named_windows_encoding_goes_through_the_same_codepage_checks() {
+    let errors = expect_invalid(
+        "encoding-windows-utf16",
+        "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    encoding: windows-1200\n",
+    );
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors.as_slice()[0].item_path, "log_profiles[0].encoding");
+    assert!(errors.as_slice()[0].reason.contains("ENC-006"));
+
+    let outcome = load_from_contents_with_codepage_check(
+        "encoding-windows-unknown",
+        "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    encoding: windows-99999\n",
+        &[932, 1252],
+    );
+    let LoadOutcome::Invalid(errors) = outcome else {
+        panic!("Invalid を期待しました");
+    };
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors.as_slice()[0].item_path, "log_profiles[0].encoding");
+    assert!(errors.as_slice()[0].reason.contains("存在しない"));
+}
+
+// 受け入れ条件: encoding の名前指定と ansi_codepage の同時指定は起動時検証
+// エラーになる（両方書くと encoding だけが使われ、ansi_codepage が黙って
+// 無視されるため。CFG-016 の「書いたのに使われない設定」と同じ扱い）。
+#[test]
+fn named_encoding_and_ansi_codepage_together_are_invalid() {
+    let errors = expect_invalid(
+        "encoding-and-codepage",
+        "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    encoding: utf-8\n    ansi_codepage: 932\n",
+    );
+    assert_eq!(errors.len(), 1);
+    let error = &errors.as_slice()[0];
+    assert_eq!(error.item_path, "log_profiles[0].ansi_codepage");
+    assert_eq!(error.line, Some(6));
+    assert!(
+        error.reason.contains("同時に指定できません"),
+        "理由: {}",
+        error.reason
+    );
+}
+
+// 受け入れ条件: encoding: auto と ansi_codepage の併記は誤りではない
+// （auto は明示指定ではなく、任意の Windows コードページを明示する正しい
+// 書き方。ENC-007）。
+#[test]
+fn auto_encoding_with_ansi_codepage_is_accepted() {
+    let config = expect_loaded(
+        "auto-encoding-with-codepage",
+        "config_version: 1\nlog_profiles:\n  - name: a\n    path_pattern: \"C:/Device/Logs/*.log\"\n    encoding: auto\n    ansi_codepage: 932\n",
+    );
+    assert_eq!(config.log_profiles[0].encoding, EncodingSetting::Auto);
+    assert_eq!(config.log_profiles[0].ansi_codepage, Some(932));
 }
 
 // ---------------------------------------------------------------------

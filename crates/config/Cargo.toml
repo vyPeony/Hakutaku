@@ -8,3 +8,11 @@ license = "MIT"
 
 [dependencies]
 saphyr = "0.0.11"
+
+# `log_profiles[].encoding` の名前（`utf-8`／`windows-<番号>`）と、コードページを
+# 文字コードとして選べるかの分類を、起動時検証で使う（`CFG-016`、Issue #38）。
+# 受理範囲を設定側へ書き写すと、起動時検証を通ったのにファイルを開くと失敗する
+# 食い違いが起き得るため、判定を持つ形式判定層をそのまま呼ぶ。使うのは実行環境に
+# 依存しない純粋な関数だけで、Win32 を必要とする存在確認は従来どおり
+# `load_config_with_codepage_check` で注入する。
+hakutaku-format-detection = { path = "../format-detection" }
