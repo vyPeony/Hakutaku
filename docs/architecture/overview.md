@@ -2,7 +2,7 @@
 
 - 状態: 採用済み（Accepted）
 - 管理責任者: リポジトリメンテナー
-- 最終更新日: 2026-08-15
+- 最終更新日: 2026-08-24
 - 要件の基準: Hakutaku 初期仕様 版 1.10
 
 ## 目的
@@ -51,7 +51,7 @@ Rust + Tauri 2系は確定技術ではなく暫定採用です。段階0の完�
 | DIST-005 | 配布物一式（本体 ZIP、および必要な環境向けの WebView2 Runtime 追加パッケージ）だけで、実行時にネットワークからの取得を行わずに起動できること。オフライン環境での自動ダウンロードを前提としない。 |
 | DIST-006 | 起動時は、互換性のあるOS導入済みのEvergreen WebView2 Runtimeを最初に使用し、見つからない場合は実行ファイル直下の `WebView2Runtime` フォルダに配置されたFixed Version Runtimeを使用する。 |
 | DIST-007 | Fixed Version RuntimeはHakutaku本体へ常時同梱せず、必要な環境向けの任意追加パッケージとして別のZIPで提供できること。追加パッケージのサイズは `DIST-003` のHakutaku本体サイズ目標に含めない。 |
-| DIST-008 | ローカルのFixed Version Runtimeはインストーラー、レジストリ登録、システムフォルダへの配置を必要としない。Hakutakuのプロセス内で `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` 相当を設定し、実行ファイルからの相対パスで使用する。 |
+| DIST-008 | ローカルのFixed Version Runtimeはインストーラー、レジストリ登録、システムフォルダへの配置を必要としない。実行ファイルからの相対位置（実行ファイル直下の `WebView2Runtime`）に配置したRuntimeを、Hakutakuのプロセス内で `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` 相当へ実行時に解決した絶対パスとして設定し、使用する。 |
 | DIST-009 | Evergreen RuntimeとローカルFixed Version Runtimeのどちらも使用できない場合は、Tauri初期化前にWindowsのネイティブダイアログで、必要なRuntime、配置先、再起動手順を通知して終了する。Runtime配置後の次回起動では、そのまま使用できること。 |
 | DIST-010 | Windows 10上のFixed Version RuntimeでApp Container用のフォルダACLが必要な場合、Hakutakuは `WebView2Runtime` フォルダだけを対象に必要性を確認し、現在の権限で可能ならACLを設定する。設定できない場合は必要な権限と手順を通知する。システム登録やRuntimeインストールは行わない。 |
 | DIST-011 | ローカルのFixed Version Runtimeは自動更新しない。更新する場合はHakutakuを終了し、`WebView2Runtime` フォルダ一式を新しい任意追加パッケージで置き換える。 |

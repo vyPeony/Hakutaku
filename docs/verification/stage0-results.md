@@ -2,7 +2,7 @@
 
 - 状態: 草案（Draft）
 - 管理責任者: 未定（TBD）
-- 最終更新日: 2026-08-02
+- 最終更新日: 2026-08-24
 
 ## 位置づけ
 
@@ -222,6 +222,16 @@ Hakutaku 自身のコードを Grep ツールで確認しました。
 ```
 
 `windows` クレートは Win32 の `Win32_Networking` 系モジュールを feature に含めていません（`src-tauri/Cargo.toml` の feature 一覧は `Win32_Foundation`、`Win32_Security`、`Win32_Security_Authorization`、`Win32_Storage_FileSystem`、`Win32_System_Com`、`Win32_System_Memory`、`Win32_System_SystemServices`、`Win32_System_Threading`、`Win32_UI_Shell`、`Win32_UI_WindowsAndMessaging` のみ）。
+
+#### 3.2.1 推移的依存（`Cargo.lock`）の評価手法
+
+`Cargo.lock` には、`tauri` 経由で解決される `reqwest`・`hyper`・`tokio` 等、ネットワーク API を持ち得るクレートが推移的依存として記録されます。**`Cargo.lock` に名前が現れることだけを根拠に、そのクレートが実際に組み込まれていると判断しません。** 評価は次の手順で行います。
+
+1. 対象クレートが、ビルド対象である Windows ターゲット（`x86_64-pc-windows-msvc`）の依存グラフに現れるかを `cargo tree --target x86_64-pc-windows-msvc` で照合する
+2. Windows ターゲットのグラフに現れないもの（Linux 等の別プラットフォーム限定の条件付き依存としてのみ解決されるもの）は、本プロダクトの配布物に含まれないため、**不使用（`not used`）** と判定する
+3. Windows ターゲットのグラフに現れるものは、上記の分類（Tauri／WebView2 の IPC・カスタムプロトコル・ウィンドウ管理のための利用か）まで確認する
+
+この手順は Dependabot のセキュリティアラート対応で実績のある評価方法であり、アラート対象が Linux 限定の推移依存だった場合は「不使用」を理由に対応を判断しています。
 
 **結論: Hakutaku 自身のコード（`crates/`、`src-tauri/`、`src/`）は外部通信経路を実装・呼び出していません。** 依存クレートの中には HTTP/ネットワーク関連の型を持つものがありますが、いずれも WebView2/Tauri の内部処理（IPC、カスタムプロトコル、ウィンドウ管理）のために使われており、実行時通信の主体は WebView2 ランタイム自身です（3.3節参照）。
 

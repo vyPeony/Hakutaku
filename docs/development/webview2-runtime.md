@@ -2,7 +2,7 @@
 
 - 状態: 採用済み（Accepted）
 - 管理責任者: リポジトリメンテナー
-- 最終更新日: 2026-08-19
+- 最終更新日: 2026-08-24
 
 ## 目的
 
@@ -19,7 +19,7 @@
 Hakutaku は、Tauri を初期化する前に Rust 側で次の3経路のいずれかを解決します。
 
 1. **導入済み Evergreen Runtime。** OS にインストール済みの WebView2 Runtime（Evergreen）を最初に確認します。
-2. **実行ファイル直下の `WebView2Runtime`（Fixed Version）。** Evergreen が使用できない場合、実行ファイルと同じフォルダの `WebView2Runtime` を確認します。インストーラーやレジストリ登録、システムフォルダへの配置は行わず、プロセス内で `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`（`DIST-008`）相当の環境変数を実行ファイルからの相対パスで設定するだけで使用可能にします。
+2. **実行ファイル直下の `WebView2Runtime`（Fixed Version）。** Evergreen が使用できない場合、実行ファイルと同じフォルダの `WebView2Runtime` を確認します。インストーラーやレジストリ登録、システムフォルダへの配置は行わず、プロセス内で `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`（`DIST-008`）相当の環境変数を設定するだけで使用可能にします。配置場所は実行ファイルからの相対位置で決まりますが、環境変数へ設定する値は、実行時に実行ファイルの位置から解決した絶対パス（`<実行ファイルのあるフォルダ>\WebView2Runtime`）です。
 3. **どちらも無い場合。** ネイティブダイアログ（Win32 の `MessageBoxW`。Tauri を使わない）で、必要な Runtime・配置先（絶対パス）・再起動手順を通知し、Tauri を初期化せず終了します（`DIST-009`）。
 
 ## 解決順序
@@ -29,7 +29,7 @@ P01（起動ブートストラップ）の実装計画が定めた「起動手�
 1. `webview2.force_fixed_version_runtime`（`DIST-017`／`CFG-023`）の先行読み込みを行う。強制指定があれば手順3へ進む
 2. 互換性のある導入済み Evergreen Runtime を確認する
 3. 見つからない場合、実行ファイルと同じフォルダの `WebView2Runtime` を確認する
-4. Fixed Version が見つかった場合、必要なフォルダ ACL を確認してから相対パスを指定する
+4. Fixed Version が見つかった場合、必要なフォルダ ACL を確認してから、実行時に解決した絶対パスを環境変数へ指定する
 5. 使用する Runtime が決まったら、ユーザーデータフォルダとして実行ファイル直下の `WebView2` を指定し、Tauri を初期化する。作成・書き込みできない場合は通知して終了する（`DIST-014`）
 6. どちらの Runtime も使用できない場合はネイティブダイアログで配置方法を通知し、Tauri を初期化せず終了する
 
@@ -42,7 +42,7 @@ P01（起動ブートストラップ）の実装計画が定めた「起動手�
 | フォルダ名 | 役割 | 固定するファイル・要件 |
 | --- | --- | --- |
 | `WebView2` | WebView2 の**ユーザーデータ**（閲覧・実行状態、キャッシュなど）の保存先 | `DIST-013`。実行ファイル直下に固定し、既定の `<実行ファイル名>.exe.WebView2` は使わない。作成・書き込み不可時は別の場所へフォールバックせず起動を中止する（`DIST-014`） |
-| `WebView2Runtime` | **Fixed Version Runtime 本体**（`msedgewebview2.exe` など）の配置先 | `DIST-008`。実行ファイル直下からの相対パスで `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` 相当を設定する。フォルダの ACL（メタデータ）だけ例外的に変更し得る（`DIST-010`）。ファイル内容は変更しない（`DIST-011`） |
+| `WebView2Runtime` | **Fixed Version Runtime 本体**（`msedgewebview2.exe` など）の配置先 | `DIST-008`。実行ファイル直下に置き、実行時にそこから解決した絶対パスを `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` 相当へ設定する。フォルダの ACL（メタデータ）だけ例外的に変更し得る（`DIST-010`）。ファイル内容は変更しない（`DIST-011`） |
 
 `SEC-009` は実行時データの書き込み先を `logs`・`temp`・`WebView2` に限定していますが、`WebView2Runtime` はこの「実行時データ」には該当しません。`DIST-010` による ACL（メタデータ）変更だけが明示的な例外として認められています。
 
