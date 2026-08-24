@@ -25,10 +25,12 @@
     UTF-8 を既定にして解析の妨げにならないようにしています）。
 
     生成したファイルはリポジトリの外（一時領域など）に置いてください。試験
-    データをリポジトリ内に残さないでください。
+    データをリポジトリ内に残さないでください。リポジトリ内を追記先に指定した
+    場合はエラーで停止します。
 
 .PARAMETER OutputPath
-    追記先のファイルパス。存在しない場合は新規作成します。
+    追記先のファイルパス。存在しない場合は新規作成します。リポジトリ内は
+    指定できません。
 
 .PARAMETER IntervalMilliseconds
     1行を追記するごとの待機時間（ミリ秒）。既定は 500ms。
@@ -111,6 +113,16 @@ function New-LogLine {
     $timestampText = $Timestamp.ToString("yyyy/MM/dd HH:mm:ss.fff")
     $fragment = $messageFragments[$Index % $messageFragments.Length]
     return "$timestampText $fragment [連番=$Index]"
+}
+
+# 追記先がリポジトリ内でないことを確認する（試験データをリポジトリへ残さない。
+# scripts/generate-sample-logs.ps1 の OutputDir 判定と同じ考え方）。ファイルや
+# フォルダを作る前に判定するのは、弾く経路でリポジトリ内へ空のファイル・
+# フォルダを残さないため。
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path.TrimEnd('\') + '\'
+$outputPathFull = [System.IO.Path]::GetFullPath($OutputPath)
+if ($outputPathFull.StartsWith($repoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "OutputPath がリポジトリ内です ($OutputPath)。試験データをリポジトリへ残さないため、リポジトリ外（一時領域など）を指定してください。"
 }
 
 $outputDir = Split-Path -Parent $OutputPath

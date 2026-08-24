@@ -1,12 +1,13 @@
 // 仮想スクロールの規模依存ロジックの回帰検査（Issue #16）。
 //
 // `src/virtual_scroll.js` の純粋関数（DOM にも Tauri IPC にも触れない）を Node から
-// 直接呼び、大規模データで壊れやすい3種類の判断を検証する。
+// 直接呼び、大規模データで壊れやすい判断を検証する。
 //
 //   1. スクロール高さのクランプ（`MAX_TOTAL_HEIGHT_PX`）
 //   2. クランプ超過時の比例写像（スクロール座標 ↔ 行インデックス）
 //   3. 行番号ジャンプと実際の描画位置の一致（画素座標側の不変条件。Issue #33）
 //   4. 保持上限（`CFG-022`）に基づく破棄判定（`PERF-012`）
+//   5. 取得（非同期）と破棄の順序競合（`stage0-results.md` 2.3.1／10.1。Issue #52）
 //
 // 段階0の実測（`docs/verification/stage0-results.md` 2.3節・10節）で実際に起きた
 // 退行——保持行数が上限を一時的に超える、2000万行規模でスクロールの末尾へ到達
@@ -1087,13 +1088,207 @@ function checkRequiredChunks() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. 前提の同期（`src/log_view.js` の動作点）
+// 8. 取得（非同期）と破棄の順序競合（`stage0-results.md` 2.3.1／10.1）
+// ---------------------------------------------------------------------------
+//
+// 段階0の2000万行実測では、241サンプル中18件で保持行数が上限を一時的に超えた
+// （最大 11,264 行 = 上限 +12.6%。`stage0-results.md` 2.3.1）。原因は、
+// `src/log_view.js` の再描画が
+//
+//   ensureChunksLoaded（新規チャンクの取得を**開始するだけ**。完了を待たない）
+//     → evictFarChunks（**その時点で**キャッシュ済みのものだけを破棄対象にする）
+//
+// の順に進むことにある。取得が完了してキャッシュへ入る瞬間と、次のスクロール
+// ステップで破棄判定が走る瞬間の間に、上限を超えた状態の窓が開く。10.1節で
+// 採用した対処は「取得完了直後にも破棄判定を再実行する」方式（`log_view.js` の
+// `runPostFetchEvictionPass`）である。
+//
+// ここでは、その順序関係だけを取り出したモデルを2通り（旧方式=バッチ末尾で
+// しか破棄しない／新方式=取得完了ごとにも破棄する）走らせ、
+//
+//   - 新方式では、どの観測点でも保持上限（`CFG-022`）を満たすこと
+//   - 旧方式では実際に超過が再現すること（**対照実験**。再現しなくなったら、
+//     このモデルが競合を表現できていないので検査として無意味になる）
+//
+// を確認する。使うのは `computeVisibleRangeForScroll`・
+// `computeRequiredChunkIndices`・`computeChunkRange`・`selectChunksToEvict` の
+// 4つの純粋関数だけで、DOM も IPC も Promise も使わない（順序は明示的に組む）。
+//
+// このモデルが表明できないもの（`log_view.js` 本体の非同期経路そのもの、
+// `state.chunkCache` への実際の格納、`requestAnimationFrame` の合流）は、
+// 下の「前提の同期」でソースの呼び出し順を突き合わせて補う。両者は別のものを
+// 見ているため、片方だけでは足りない
+// （範囲と限界は `docs/verification/regression-checks.md`）。
+
+/** 観測点1件分の保持量。 */
+function retentionOf(cache) {
+  let rows = 0;
+  let bytes = 0;
+  for (const chunk of cache.values()) {
+    rows += chunk.rowCount;
+    bytes += chunk.byteCount;
+  }
+  return { rows, bytes };
+}
+
+/**
+ * `evictFarChunks`（`log_view.js`）と同じ入力の組み立て方で破棄を適用する。
+ * 基準行は可視範囲の中心、保護対象は現在の必要チャンク。
+ */
+function applyEviction(cache, requiredChunkIndices, visibleRange, limits) {
+  const descriptors = [...cache.entries()].map(([chunkIndex, chunk]) => ({
+    chunkIndex,
+    rowCount: chunk.rowCount,
+    byteCount: chunk.byteCount,
+  }));
+  const referenceRowIndex = Math.floor((visibleRange.startIndex + visibleRange.endIndex) / 2);
+  for (const chunkIndex of selectChunksToEvict(
+    descriptors,
+    new Set(requiredChunkIndices),
+    referenceRowIndex,
+    CHUNK_SIZE,
+    limits,
+  )) {
+    cache.delete(chunkIndex);
+  }
+}
+
+// 1行あたりの概算バイト数。段階0の実測（2.3.1節）と同じく、この動作点では
+// バイト数上限（64 MiB）には到底届かず、行数上限だけで破棄が決まる。
+const MODEL_BYTES_PER_ROW = 80;
+// スクロールのステップ数。実測の連続スクロール検証（241サンプル）と同程度の
+// 回数を、末尾までの範囲へ等間隔で割り付ける。
+const MODEL_STEP_COUNT = 240;
+// 1ステップあたりに完了させる取得の件数。実装では応答が届いた順に完了するが、
+// 「開始したその場では完了しない（次のステップ以降にずれ込む）」ことが競合の
+// 本質なので、モデルでは件数だけを決めて順序は先入れ先出しにする。
+const MODEL_COMPLETIONS_PER_STEP = 2;
+
+/**
+ * 取得と破棄の順序をモデル化して走らせ、観測点ごとの保持量の最大を返す。
+ *
+ * @param {boolean} evictAfterEachFetch 取得完了直後にも破棄判定を行うか
+ *   （`true` = 現在の実装。`false` = 10.1節で修正する前の旧方式）。
+ */
+function simulateFetchEvictOrder(evictAfterEachFetch) {
+  const limits = { maxRows: DEFAULT_MAX_ROWS, maxBytes: DEFAULT_MAX_BYTES };
+  /** @type {Map<number, {rowCount: number, byteCount: number}>} */
+  const cache = new Map();
+  /** @type {number[]} 取得中（完了待ち）のチャンク番号。先入れ先出し。 */
+  const pending = [];
+
+  let maxRows = 0;
+  let maxBytes = 0;
+  let evictedVisibleChunk = null;
+
+  const observe = (requiredChunkIndices) => {
+    const { rows, bytes } = retentionOf(cache);
+    maxRows = Math.max(maxRows, rows);
+    maxBytes = Math.max(maxBytes, bytes);
+    for (const chunkIndex of requiredChunkIndices) {
+      // 表示中のチャンクを破棄すると、行が「（読み込み中…）」へ戻って
+      // 取り直しになる（破棄と再取得のループ）。取得が完了した後に限り、
+      // 可視範囲のチャンクは必ず残っていなければならない。
+      if (!cache.has(chunkIndex) && !pending.includes(chunkIndex)) {
+        evictedVisibleChunk ??= chunkIndex;
+      }
+    }
+  };
+
+  for (let step = 0; step < MODEL_STEP_COUNT; step += 1) {
+    const scrollTop = (HUGE_MAX_SCROLL_TOP_PX * step) / (MODEL_STEP_COUNT - 1);
+    const visibleRange = scaledRange(scrollTop);
+    const requiredChunkIndices = computeRequiredChunkIndices(
+      visibleRange.startIndex,
+      visibleRange.endIndex,
+      CHUNK_SIZE,
+      HUGE_TOTAL_ITEMS,
+    );
+
+    // `ensureChunksLoaded` 相当: 未取得かつ取得中でないものの取得を開始する。
+    for (const chunkIndex of requiredChunkIndices) {
+      if (!cache.has(chunkIndex) && !pending.includes(chunkIndex)) {
+        pending.push(chunkIndex);
+      }
+    }
+
+    // `evictFarChunks` 相当: この時点でキャッシュ済みのものだけが対象。
+    applyEviction(cache, requiredChunkIndices, visibleRange, limits);
+    observe(requiredChunkIndices);
+
+    // 取得の完了（`fetchChunk` の後半）。キャッシュへ格納した直後に破棄判定を
+    // 行うかどうかだけが、2つの方式の違い。
+    for (let i = 0; i < MODEL_COMPLETIONS_PER_STEP && pending.length > 0; i += 1) {
+      const chunkIndex = pending.shift();
+      const { count } = computeChunkRange(chunkIndex, CHUNK_SIZE, HUGE_TOTAL_ITEMS);
+      cache.set(chunkIndex, { rowCount: count, byteCount: count * MODEL_BYTES_PER_ROW });
+      if (evictAfterEachFetch) {
+        applyEviction(cache, requiredChunkIndices, visibleRange, limits);
+      }
+      observe(requiredChunkIndices);
+    }
+  }
+
+  return { maxRows, maxBytes, evictedVisibleChunk };
+}
+
+function checkFetchEvictOrder() {
+  // 参考（合否には使わない）: この動作点でのモデルの観測最大は、新方式で
+  // 9,984 行、旧方式で 10,752 行になる。旧方式の値は、段階0の実測が観測した
+  // 超過（10,240／10,752／11,264 行。2.3.1節）と同じ桁であり、モデルが同じ
+  // 現象を表していることの傍証になる。判定は上限との大小だけで行う。
+  const current = simulateFetchEvictOrder(true);
+  const legacy = simulateFetchEvictOrder(false);
+
+  check(
+    "順序競合: 取得完了ごとに破棄すれば保持行数が上限を超えない（CFG-022）",
+    current.maxRows <= DEFAULT_MAX_ROWS,
+    `観測した最大保持行数 ${current.maxRows} / 上限 ${DEFAULT_MAX_ROWS}`,
+  );
+  check(
+    "順序競合: 保持バイト数も上限を超えない",
+    current.maxBytes <= DEFAULT_MAX_BYTES,
+    `観測した最大保持バイト数 ${current.maxBytes} / 上限 ${DEFAULT_MAX_BYTES}`,
+  );
+  check(
+    "順序競合: 表示中のチャンクを破棄しない（破棄と再取得のループにしない）",
+    current.evictedVisibleChunk === null,
+    `可視範囲のチャンク ${current.evictedVisibleChunk} が失われた`,
+  );
+
+  // 対照実験。旧方式（バッチ末尾でしか破棄しない）では、取得完了の観測点で
+  // 上限を超えるはず。超えなくなったら、このモデルは競合を再現できておらず、
+  // 上の3件が通っても意味を持たない。
+  check(
+    "順序競合: 対照実験（バッチ末尾でしか破棄しない旧方式では超過が再現する）",
+    legacy.maxRows > DEFAULT_MAX_ROWS,
+    `旧方式の最大保持行数 ${legacy.maxRows} が上限 ${DEFAULT_MAX_ROWS} を超えていない（モデルが競合を再現できていません）`,
+  );
+  check(
+    "順序競合: 対照実験でもバイト数上限には届かない（行数上限だけで決まる）",
+    legacy.maxBytes <= DEFAULT_MAX_BYTES,
+    `旧方式の最大保持バイト数 ${legacy.maxBytes} / 上限 ${DEFAULT_MAX_BYTES}`,
+  );
+
+  // 決定性（同じ入力なら同じ結果。失敗したときに再現できること）。
+  expectEqual(
+    "順序競合: モデルは決定的",
+    simulateFetchEvictOrder(true).maxRows,
+    current.maxRows,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 9. 前提の同期（`src/log_view.js` の動作点と呼び出し順）
 // ---------------------------------------------------------------------------
 //
 // 上の境界値は `log_view.js` の定数（行高22px、チャンク512行、バッファ50行）を
 // 動作点として選んでいる。これらは `log_view.js` の内部定数で import できない
 // ため、値がずれたまま検査だけが通り続けることを防ぐ目的で、ソースから読み出して
 // 突き合わせる。ずれた場合は、この検査の境界値も選び直す必要がある。
+//
+// 8節のモデルについても同様で、`log_view.js` 側の呼び出し順が変われば
+// モデルの前提そのものが崩れる。こちらはソースの並びを突き合わせる。
 
 function checkPremises() {
   const source = readFileSync(resolve(ROOT, "src", "log_view.js"), "utf8");
@@ -1115,6 +1310,32 @@ function checkPremises() {
     DEFAULT_BUFFER_ROWS,
     readConstant("BUFFER_ROWS"),
   );
+
+  // 8節のモデルが前提にしている呼び出し順（`stage0-results.md` 10.1）。
+  // 再描画は「取得を開始する → その時点のキャッシュだけを破棄対象にする」の順で
+  // 進む。この順序自体は変えていない（変えても取得は非同期なので競合は消えない）。
+  check(
+    "前提: renderVisibleRows が ensureChunksLoaded → evictFarChunks の順で呼ぶ",
+    /ensureChunksLoaded\(requiredChunkIndices\);\s*\n\s*evictFarChunks\(requiredChunkIndices, visibleRange\);/.test(
+      source,
+    ),
+    "8節のモデルが前提とする順序と一致しません",
+  );
+  // 競合への対処そのもの。チャンクをキャッシュへ格納した直後に破棄判定を
+  // 再実行する（`runPostFetchEvictionPass`）。この呼び出しが失われると、
+  // 保持行数の一時超過（2.3.1節で観測した退行）がそのまま戻る。
+  check(
+    "前提: fetchChunk がキャッシュ格納の直後に runPostFetchEvictionPass を呼ぶ",
+    /state\.chunkCache\.set\([\s\S]{0,800}?runPostFetchEvictionPass\(\);/.test(source),
+    "取得完了時の破棄判定が失われています（stage0-results.md 10.1 の対処）",
+  );
+  check(
+    "前提: runPostFetchEvictionPass が破棄判定へ委ねる",
+    /function runPostFetchEvictionPass\(\)[\s\S]{0,600}?evictFarChunks\(requiredChunkIndices, visibleRange\);/.test(
+      source,
+    ),
+    "取得完了時の破棄判定が evictFarChunks を通っていません",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1349,7 @@ checkSpacerHeights();
 checkJumpAlignment();
 checkEviction();
 checkRequiredChunks();
+checkFetchEvictOrder();
 checkPremises();
 
 if (problems.length > 0) {
@@ -1140,5 +1362,5 @@ if (problems.length > 0) {
 }
 
 console.log(
-  `仮想スクロールの規模依存ロジック（クランプ、比例写像、ジャンプと描画位置の一致、破棄判定）を ${checkCount} 項目検査しました。問題はありません。`,
+  `仮想スクロールの規模依存ロジック（クランプ、比例写像、ジャンプと描画位置の一致、破棄判定、取得と破棄の順序競合）を ${checkCount} 項目検査しました。問題はありません。`,
 );

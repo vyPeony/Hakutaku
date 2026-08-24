@@ -2,7 +2,7 @@
 
 - 状態: 採用済み（Accepted）
 - 管理責任者: リポジトリメンテナー
-- 最終更新日: 2026-08-21
+- 最終更新日: 2026-08-25
 
 ## 目的
 
@@ -198,10 +198,18 @@ Rust 以外の資産を変更した場合は、次も実行します。cargo と
 | 目的 | 標準コマンド |
 | --- | --- |
 | `src/` の構文、相対 import の解決、`index.html` の参照先 | `node scripts/check-frontend.mjs` |
-| 仮想スクロールの規模依存ロジック（クランプ、比例写像、破棄判定。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-virtual-scroll.mjs` |
+| 仮想スクロールの規模依存ロジック（クランプ、比例写像、破棄判定、取得と破棄の順序競合。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-virtual-scroll.mjs` |
 | 行選択モデル（飛び飛びの選択、ドラッグ、クランプ、コピー範囲の変換。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-selection.mjs` |
+| タブの状態モデル（追加と再オープン、後継タブの選択、フォーカスを動かさない内容更新。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-tabs.mjs` |
+| 参照対象一覧の状態モデル（並び順、行の鍵の安定性、状態 DTO の変換。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-targets.mjs` |
+| 登録コマンドと Capability の許可の対応（`SEC-012`。[対象と判定方法](../verification/regression-checks.md)） | `node scripts/check-capabilities.mjs` |
 | Markdown の相対リンクと見出しアンカーの整合（外部 URL は対象外） | `node scripts/check-docs-links.mjs` |
 | PowerShell スクリプトの構文解析（実行はしない） | `pwsh -File scripts/check-powershell.ps1` |
+
+`node scripts/check-capabilities.mjs` は Rust 以外の資産に限らず、`src-tauri/src/lib.rs` の
+コマンド登録、`src-tauri/permissions/`、`src-tauri/capabilities/` を変更した場合にも実行します。
+片方だけを書いた状態（登録したが許可していない、許可だけが残っている）はビルドでは
+検出できず、その画面を操作するまで表面化しないためです。
 
 `src/` のフロントエンドを変更した場合は、次も**手元で**実行します。上の5つと違い、release ビルド済みの実行ファイルと GUI セッションを必要とするため、CI では実行しません（理由と規約は[回帰検査の対象と判定方法](../verification/regression-checks.md#gui-自動検査scriptscheck-guimjs)）。
 
@@ -213,6 +221,11 @@ Rust 以外の資産を変更した場合は、次も実行します。cargo と
 
 `--locked` を付けた検査では、意図しない `Cargo.lock` の更新を許可しません。`--no-bundle` はアプリ本体の release ビルドを検証し、正式な配布物は生成しません。
 
+依存関係の脆弱性検査（`cargo audit`・`npm audit`）は、上記の標準検査には含めません。
+勧告は依存の更新と無関係に公開されるため、PR ごとの必須検査にすると差分と因果関係の
+ない失敗でマージが止まります。代わりに週1回の定期実行（[`.github/workflows/audit.yml`](../../.github/workflows/audit.yml)。
+手動実行も可能）で確認します。位置づけと結果の読み方は[回帰検査の対象と判定方法](../verification/regression-checks.md#依存の脆弱性検査githubworkflowsaudityml)を参照します。
+
 これらの検査は CI（[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)）でも push と PR ごとに自動実行されます。CI は目的ごとにジョブへ分かれ、ビルド入力に影響しない変更（文書、タスク記録、スクリプトなど）では Windows 上の Rust ジョブを省略します。判定できない場合は安全側で実行します。省略されたジョブが PR を滞らせないよう、ブランチ保護の必須ステータスチェックには、常に結果を返す集約ジョブ `CI 完了判定` を指定しています。設定は[リポジトリ運用規則の「`main` のブランチ保護」](repository-operations.md#main-のブランチ保護)を参照します。
 
 技術スタックの最終確定後に、上記の標準コマンドを必要に応じて見直し、次をこの文書または専用の採用済み（`Accepted`）文書へ追加します。
@@ -220,5 +233,5 @@ Rust 以外の資産を変更した場合は、次も実行します。cargo と
 - 開発環境の構築
 - テストの分類と必須範囲
 - 段階1（P13）の実機検証を踏まえて追加する CI の検査
-- 依存関係の更新とセキュリティ検査
+- 依存関係の更新方針（脆弱性の定期検査は [`audit.yml`](../../.github/workflows/audit.yml) で実施済み。更新の頻度、勧告への対処の期限、承認手順は未定）
 - バージョン付け、リリース、移行、サポート
