@@ -1,4 +1,7 @@
-//! 文字コード判定（`ENC-005` の4段階）です。[`detect_encoding`] が公開入口です。
+//! 文字コード判定（`ENC-005`、`ENC-006`）です。[`detect_encoding`] が公開入口です。
+//!
+//! 判定順序と、明示指定・BOM・UTF-16 の優先関係はクレートルートの doc コメント
+//! （`crate` の「判定順序」節）を正本とし、ここでは複製しません。
 
 use std::fmt;
 
@@ -90,24 +93,120 @@ pub struct EncodingWarning {
 pub enum EncodingWarningKind {
     /// 検出した BOM と、プロファイルの明示指定が矛盾している
     /// （`tasks/phase-05-log-parsing-core.md` の暫定設計 4.3）。
+    ///
+    /// UTF-16 の BOM はこの警告には至りません。明示指定より前に未対応
+    /// （`ENC-006`、[`EncodingDecision::Unsupported`]）として返すためです
+    /// （Issue #38）。
     BomConflictsWithExplicitSetting,
 }
 
 impl EncodingWarning {
-    fn bom_conflict(detected: BomKind, explicit: SelectedEncoding) -> Self {
-        let bom_label = match detected {
-            BomKind::Utf8 => "UTF-8",
-            BomKind::Utf16Le => "UTF-16 LE",
-            BomKind::Utf16Be => "UTF-16 BE",
-        };
+    /// UTF-8 BOM があるのに、プロファイルが UTF-8 以外を明示指定している場合の
+    /// 警告を組み立てます。
+    ///
+    /// UTF-16 の BOM を引数に取らないのは、[`detect_encoding`] が UTF-16 BOM を
+    /// 明示指定より前に [`EncodingDecision::Unsupported`] として返し、この関数
+    /// へ到達しないためです（Issue #38）。
+    fn utf8_bom_conflict(explicit: SelectedEncoding) -> Self {
         EncodingWarning {
             kind: EncodingWarningKind::BomConflictsWithExplicitSetting,
             message: format!(
-                "検出した BOM（{bom_label}）と、プロファイルで明示指定された文字コード\
+                "検出した BOM（UTF-8）と、プロファイルで明示指定された文字コード\
                 （{explicit}）が矛盾しています。明示指定を優先し、暗黙には切り替えません。"
             ),
         }
     }
+}
+
+/// コードページを Hakutaku の文字コードとして選べない理由です
+/// （`CFG-016`、`ENC-006`、Issue #38）。
+///
+/// # 何のために公開しているか
+///
+/// `hakutaku.yaml` の `log_profiles[].ansi_codepage`、および
+/// `log_profiles[].encoding` の `windows-<コードページ番号>` 指定に、実行環境に
+/// 存在はするが Hakutaku では使えないコードページ（UTF-16、厳密な判定ができない
+/// コードページ）が書かれた場合、そのプロファイルが適用されるファイルを開くまで
+/// 失敗が表面化しません。起動時に一括提示する（`CFG-016`）ため、設定の検証
+/// （`hakutaku_config`）がこの分類を使います。理由の文言をここへ置くことで、
+/// 起動時検証の表示と本クレートの判断が食い違わないようにしています。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodepageRejection {
+    /// UTF-16（1200 = LE、1201 = BE）。`ENC-006` により初期リリースの対応対象外。
+    Utf16,
+    /// `MultiByteToWideChar` が厳密モード（`MB_ERR_INVALID_CHARS`）を受け付けない
+    /// コードページ。デコードできないバイト列の位置を報告できないため使いません。
+    NoStrictValidation,
+}
+
+impl fmt::Display for CodepageRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CodepageRejection::Utf16 => write!(
+                f,
+                "UTF-16（コードページ 1200 / 1201）は初期リリースの対応対象に含まれていません（ENC-006）"
+            ),
+            CodepageRejection::NoStrictValidation => write!(
+                f,
+                "このコードページは、Windows の変換 API（MultiByteToWideChar）が不正バイトの厳密な検出（MB_ERR_INVALID_CHARS）を受け付けないため、デコードできないバイト列の位置を報告できません"
+            ),
+        }
+    }
+}
+
+/// UTF-16 のコードページ番号（1200 = LE、1201 = BE。`ENC-006`）。
+const UTF16_CODEPAGES: [u32; 2] = [1200, 1201];
+
+/// `codepage` が厳密モード（`MB_ERR_INVALID_CHARS`）での変換を受け付けるかを
+/// 返します。
+///
+/// # なぜ一覧を持つのか
+///
+/// `MultiByteToWideChar` は一部のコードページに対し、`dwFlags` が 0 以外だと
+/// 変換内容によらず `ERROR_INVALID_FLAGS` で失敗します（MSDN の
+/// `MultiByteToWideChar` の `dwFlags` の説明）。`crate::win32` のデコードは
+/// 不正バイトの位置特定に厳密モードを使うため、これらのコードページでは実際には
+/// 妥当なバイト列でも「全チャンクが不正位置」という、実態と食い違う報告に
+/// なります。そのため設定の起動時検証で先に弾きます（`CFG-016`）。
+///
+/// 一覧が実行環境の実挙動と一致することは、`crate::win32` の
+/// `codepages_without_strict_mode_match_win32_behavior` が Win32 API を実際に
+/// 呼んで確認します（Issue #38）。
+///
+/// この一覧に**UTF-16（1200／1201）は含みません**。UTF-16 はフラグの可否以前に
+/// `MultiByteToWideChar` で変換できず、拒否する理由も別（`ENC-006`）だからです。
+/// 設定として選べるかを判定したい場合は、常に [`codepage_rejection`] を使って
+/// ください。
+#[must_use]
+pub fn codepage_supports_strict_validation(codepage: u32) -> bool {
+    !matches!(
+        codepage,
+        // 42: Symbol、50220〜50229: ISO-2022 系、52936: HZ-GB2312、
+        // 57002〜57011: ISCII 系、65000: UTF-7。
+        42 | 50220..=50229 | 52936 | 57002..=57011 | 65000
+    )
+}
+
+/// `codepage` を Hakutaku の文字コードとして選べるかを判定します。選べる場合は
+/// `None`、選べない場合はその理由を返します（`CFG-016`、`ENC-006`、Issue #38）。
+///
+/// **実行環境にそのコードページが存在するかは判定しません。** 存在確認は Win32
+/// の `GetCPInfoExW` が必要であり、[`crate::codepage_available`] が担います。
+/// この関数は実行環境に依存しない純粋な分類であり、Windows 以外でも同じ結果に
+/// なります。
+#[must_use]
+pub fn codepage_rejection(codepage: u32) -> Option<CodepageRejection> {
+    if UTF16_CODEPAGES.contains(&codepage) {
+        // UTF-16 は `GetCPInfoExW` でも取得できず、`MultiByteToWideChar` でも
+        // 変換できない。それを「存在しない」「厳密モードを使えない」と報告すると
+        // 実態と食い違うので、利用者にとって意味のある理由（`ENC-006` により
+        // 初期リリースでは未対応）を、他のどの判定よりも先に返す。
+        return Some(CodepageRejection::Utf16);
+    }
+    if !codepage_supports_strict_validation(codepage) {
+        return Some(CodepageRejection::NoStrictValidation);
+    }
+    None
 }
 
 /// プロファイル側のエンコーディング設定です。
@@ -185,7 +284,16 @@ impl std::error::Error for InvalidEncodingNameError {}
 ///
 /// - `utf-8`
 /// - `windows-<コードページ番号>`（数字1文字以上、先頭ゼロを含めて可）
-fn parse_named_encoding(name: &str) -> Result<SelectedEncoding, InvalidEncodingNameError> {
+///
+/// # 何のために公開しているか
+///
+/// `hakutaku.yaml` の `log_profiles[].encoding` に受理できない名前
+/// （例: `shift_jis`）が書かれていた場合、そのプロファイルが適用されるファイルを
+/// 開くまで失敗が表面化しません。起動時に一括提示する（`CFG-016`、Issue #38）
+/// ため、設定の検証（`hakutaku_config`）がこの関数をそのまま呼びます。受理範囲を
+/// 二か所へ書き分けると、起動時検証を通ったのにファイルを開くと失敗する（または
+/// その逆の）食い違いが起き得るため、判断は本関数を唯一の実装とします。
+pub fn parse_named_encoding(name: &str) -> Result<SelectedEncoding, InvalidEncodingNameError> {
     let normalized = name.trim().to_ascii_lowercase();
     if normalized == "utf-8" {
         return Ok(SelectedEncoding::Utf8);
@@ -235,8 +343,8 @@ pub enum EncodingDecision {
     Unsupported(UnsupportedEncoding),
 }
 
-/// `bytes` の先頭バイト列とプロファイル設定（`profile`）から、`ENC-005` の
-/// 4段階で文字コードを判定します。
+/// `bytes` の先頭バイト列とプロファイル設定（`profile`）から、文字コードを
+/// 判定します（`ENC-005`、`ENC-006`）。
 ///
 /// # 引数
 ///
@@ -250,16 +358,40 @@ pub enum EncodingDecision {
 ///
 /// - `Ok(EncodingDecision::Decided(_))`: 文字コードが決定した
 /// - `Ok(EncodingDecision::Unsupported(_))`: UTF-16 の BOM を検出した
-///   （`ENC-006`）
+///   （`ENC-006`。**明示指定の有無によらず**この結果になります）
 /// - `Err(_)`: `profile.named` の名前を解釈できなかった
 ///
-/// 判定順序と明示指定・BOM の優先関係は、このモジュールの doc コメントおよび
-/// クレートルートの doc コメントを参照してください。
+/// 判定順序と明示指定・BOM の優先関係は、クレートルートの doc コメント
+/// （「判定順序」節）を参照してください。
 pub fn detect_encoding(
     bytes: &[u8],
     profile: &ProfileEncodingSetting,
 ) -> Result<EncodingDecision, InvalidEncodingNameError> {
     let detected_bom = bom::detect(bytes);
+
+    // UTF-16 の BOM だけは明示指定より前に判定する（`ENC-006`、Issue #38）。
+    // 明示指定を先に見ると、UTF-16 のファイルが「明示された文字コードで読めた」
+    // ことになり、未対応通知（`EncodingDecision::Unsupported`）へ乗らないまま、
+    // 全面的に文字化けした本文が正常な内容として表示されてしまう。名前の解釈
+    // （`parse_named_encoding`）より前に返すのも同じ理由で、UTF-16 のファイルに
+    // 対しては「名前が不正」より「UTF-16 は未対応」のほうが実態に合う。
+    if let Some(detected) = detected_bom {
+        match detected.kind {
+            BomKind::Utf16Le => {
+                return Ok(EncodingDecision::Unsupported(UnsupportedEncoding {
+                    bom: Utf16BomKind::Le,
+                }))
+            }
+            BomKind::Utf16Be => {
+                return Ok(EncodingDecision::Unsupported(UnsupportedEncoding {
+                    bom: Utf16BomKind::Be,
+                }))
+            }
+            BomKind::Utf8 => {}
+        }
+    }
+    // ここから先へ到達する BOM は UTF-8 BOM だけなので、長さだけを持ち回る。
+    let utf8_bom_len = detected_bom.map(|detected| detected.len);
 
     if profile.is_explicit() {
         let (encoding, kind) = if let Some(name) = profile.named.as_deref() {
@@ -280,26 +412,18 @@ pub fn detect_encoding(
         return Ok(EncodingDecision::Decided(build_explicit_decision(
             encoding,
             kind,
-            detected_bom,
+            utf8_bom_len,
         )));
     }
 
-    // ここから auto 判定（明示指定なし）。BOM → UTF-8 妥当性確認 → 環境 ANSI。
-    if let Some(detected) = detected_bom {
-        return Ok(match detected.kind {
-            BomKind::Utf8 => EncodingDecision::Decided(DecidedEncoding {
-                encoding: SelectedEncoding::Utf8,
-                route: DetectionRoute::Utf8Bom,
-                bom_len: detected.len,
-                warnings: Vec::new(),
-            }),
-            BomKind::Utf16Le => EncodingDecision::Unsupported(UnsupportedEncoding {
-                bom: Utf16BomKind::Le,
-            }),
-            BomKind::Utf16Be => EncodingDecision::Unsupported(UnsupportedEncoding {
-                bom: Utf16BomKind::Be,
-            }),
-        });
+    // ここから auto 判定（明示指定なし）。UTF-8 BOM → UTF-8 妥当性確認 → 環境 ANSI。
+    if let Some(bom_len) = utf8_bom_len {
+        return Ok(EncodingDecision::Decided(DecidedEncoding {
+            encoding: SelectedEncoding::Utf8,
+            route: DetectionRoute::Utf8Bom,
+            bom_len,
+            warnings: Vec::new(),
+        }));
     }
 
     if is_valid_utf8_prefix(bytes) {
@@ -320,19 +444,30 @@ pub fn detect_encoding(
 }
 
 /// 明示指定（`named` または `ansi_codepage`）が使われる場合の [`DecidedEncoding`]
-/// を組み立てます。BOM が検出されていて、かつそれが明示指定と一致しない場合は
-/// 警告を追加し、BOM を除去しません（暗黙の切り替えを避ける。doc コメント
-/// 「明示指定と BOM が矛盾する場合の設計判断」を参照）。
+/// を組み立てます。
+///
+/// `utf8_bom_len` は、検出した UTF-8 BOM のバイト数（BOM なしは `None`）です。
+/// UTF-16 の BOM は [`detect_encoding`] が先に [`EncodingDecision::Unsupported`]
+/// として返すため、ここへは届きません（Issue #38）。
+///
+/// UTF-8 BOM があるのに UTF-8 以外が明示指定されている場合は、警告を追加した
+/// うえで BOM を除去しません。明示指定されたコードページから見れば先頭3バイトも
+/// 本文の一部であり、黙って捨てると「元バイトを破棄しない」（`ENC-005` の
+/// 末尾の規定）に反するためです（クレートルートの doc コメント「明示指定と
+/// UTF-8 BOM が矛盾する場合の設計判断」を参照）。
 fn build_explicit_decision(
     encoding: SelectedEncoding,
     kind: ProfileSpecifiedKind,
-    detected_bom: Option<bom::DetectedBom>,
+    utf8_bom_len: Option<usize>,
 ) -> DecidedEncoding {
     let mut warnings = Vec::new();
-    let bom_len = match detected_bom {
-        Some(detected) if bom_matches(detected.kind, encoding) => detected.len,
-        Some(detected) => {
-            warnings.push(EncodingWarning::bom_conflict(detected.kind, encoding));
+    let bom_len = match utf8_bom_len {
+        // UTF-8 BOM と明示指定 `utf-8` の組だけが「整合」。
+        // `SelectedEncoding::Windows(_)` は BOM を持つ概念自体がないため、
+        // UTF-8 BOM があれば常に矛盾として扱う。
+        Some(len) if encoding == SelectedEncoding::Utf8 => len,
+        Some(_) => {
+            warnings.push(EncodingWarning::utf8_bom_conflict(encoding));
             0
         }
         None => 0,
@@ -343,15 +478,6 @@ fn build_explicit_decision(
         bom_len,
         warnings,
     }
-}
-
-/// 検出した BOM の種類が、選択された文字コードと整合するか。
-///
-/// UTF-8 BOM と `SelectedEncoding::Utf8` の組だけが「整合」です。
-/// `SelectedEncoding::Windows(_)` は BOM を持つ概念自体がないため、どんな BOM
-/// を検出してもここでは「矛盾」として扱います。
-fn bom_matches(bom: BomKind, encoding: SelectedEncoding) -> bool {
-    matches!((bom, encoding), (BomKind::Utf8, SelectedEncoding::Utf8))
 }
 
 /// `bytes` の先頭 [`UTF8_AUTO_DETECT_PREFIX_BYTES`] バイト（`bytes` がそれより
@@ -576,5 +702,154 @@ mod tests {
         let bytes = b"abc";
         let result = detect_encoding(bytes, &ProfileEncodingSetting::named("shift_jis"));
         assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // UTF-16 BOM の優先（ENC-006、Issue #38）。
+    // ---------------------------------------------------------------
+
+    // 受け入れ条件（`ENC-006`）: UTF-16 の BOM は、明示指定（encoding 名前指定・
+    // ansi_codepage）があっても未対応通知（Unsupported）になる。明示指定を先に
+    // 見ていた頃は、全面的に文字化けした本文が正常な内容として表示されていた。
+    #[test]
+    fn utf16_bom_is_unsupported_even_with_explicit_profile_setting() {
+        let le = [0xFF, 0xFE, 0x41, 0x00];
+        let be = [0xFE, 0xFF, 0x00, 0x41];
+        let explicit_settings = [
+            ProfileEncodingSetting::ansi_codepage(932),
+            ProfileEncodingSetting::named("windows-1252"),
+            ProfileEncodingSetting::named("utf-8"),
+        ];
+        for profile in &explicit_settings {
+            assert_eq!(
+                detect_encoding(&le, profile).unwrap(),
+                EncodingDecision::Unsupported(UnsupportedEncoding {
+                    bom: Utf16BomKind::Le
+                }),
+                "明示指定 {profile:?} でも UTF-16 LE は未対応のはず"
+            );
+            assert_eq!(
+                detect_encoding(&be, profile).unwrap(),
+                EncodingDecision::Unsupported(UnsupportedEncoding {
+                    bom: Utf16BomKind::Be
+                }),
+                "明示指定 {profile:?} でも UTF-16 BE は未対応のはず"
+            );
+        }
+    }
+
+    // 受け入れ条件（`ENC-006`）: 解釈できない encoding 名と UTF-16 BOM が重なった
+    // 場合、利用者にとって実態に近い「UTF-16 は未対応」を返す（名前の解釈エラー
+    // では、ファイルが UTF-16 であることが伝わらない）。
+    #[test]
+    fn utf16_bom_is_reported_before_invalid_encoding_name() {
+        let le = [0xFF, 0xFE, 0x41, 0x00];
+        assert_eq!(
+            detect_encoding(&le, &ProfileEncodingSetting::named("shift_jis")).unwrap(),
+            EncodingDecision::Unsupported(UnsupportedEncoding {
+                bom: Utf16BomKind::Le
+            })
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 極小の入力（Issue #38）。
+    // ---------------------------------------------------------------
+
+    // 受け入れ条件（`ENC-005`）: 0バイトのファイルは、判定でパニックせず UTF-8
+    // （BOM なし妥当）として扱う。空バイト列は妥当な UTF-8 であり、環境 ANSI へ
+    // 倒す理由がない。
+    #[test]
+    fn empty_input_is_decided_as_bomless_utf8() {
+        let decision = detect_encoding(&[], &ProfileEncodingSetting::auto()).unwrap();
+        let EncodingDecision::Decided(decided) = decision else {
+            panic!("Decided を期待しました");
+        };
+        assert_eq!(decided.encoding, SelectedEncoding::Utf8);
+        assert_eq!(decided.route, DetectionRoute::Utf8ValidatedNoBom);
+        assert_eq!(decided.bom_len, 0);
+    }
+
+    // 受け入れ条件（`ENC-003`、`ENC-005`）: UTF-8 BOM の途中までしかない2バイト
+    // （`EF BB`。BOM を書き終える前に切れたファイル）は BOM として扱わない。
+    // 3バイト目が無い以上 BOM とは断定できないため、BOM 除去（bom_len）は 0 に
+    // する。判定は「末尾で途切れたマルチバイト文字は妥当扱い」（is_valid_utf8_
+    // prefix）により UTF-8 になり、実際のデコードで置換文字と不正位置が報告される。
+    #[test]
+    fn truncated_utf8_bom_is_not_treated_as_a_bom() {
+        let decision = detect_encoding(&[0xEF, 0xBB], &ProfileEncodingSetting::auto()).unwrap();
+        let EncodingDecision::Decided(decided) = decision else {
+            panic!("Decided を期待しました");
+        };
+        assert_eq!(decided.bom_len, 0, "BOM として除去してはいけない");
+        assert_eq!(decided.encoding, SelectedEncoding::Utf8);
+        assert_eq!(decided.route, DetectionRoute::Utf8ValidatedNoBom);
+    }
+
+    // 受け入れ条件（`ENC-005`）: UTF-8 BOM だけで本文が無いファイルも判定できる。
+    #[test]
+    fn utf8_bom_only_input_is_decided_as_utf8_with_bom() {
+        let decision =
+            detect_encoding(&[0xEF, 0xBB, 0xBF], &ProfileEncodingSetting::auto()).unwrap();
+        let EncodingDecision::Decided(decided) = decision else {
+            panic!("Decided を期待しました");
+        };
+        assert_eq!(decided.route, DetectionRoute::Utf8Bom);
+        assert_eq!(decided.bom_len, 3);
+    }
+
+    // ---------------------------------------------------------------
+    // コードページの分類（CFG-016、ENC-006、Issue #38）。
+    // ---------------------------------------------------------------
+
+    // 受け入れ条件（`ENC-006`）: UTF-16 のコードページ番号は、厳密モードの可否
+    // ではなく「未対応」として分類する（利用者に示す理由を実態に合わせる）。
+    #[test]
+    fn utf16_codepages_are_rejected_as_unsupported() {
+        for codepage in [1200, 1201] {
+            assert_eq!(
+                codepage_rejection(codepage),
+                Some(CodepageRejection::Utf16),
+                "コードページ {codepage}"
+            );
+        }
+        assert!(codepage_rejection(1200)
+            .expect("Utf16 のはず")
+            .to_string()
+            .contains("ENC-006"));
+    }
+
+    // 受け入れ条件（`CFG-016`）: 厳密モード（MB_ERR_INVALID_CHARS）を受け付けない
+    // コードページは、理由付きで拒否する。
+    #[test]
+    fn codepages_without_strict_mode_are_rejected() {
+        for codepage in [42, 50220, 50225, 50229, 52936, 57002, 57011, 65000] {
+            assert!(
+                !codepage_supports_strict_validation(codepage),
+                "コードページ {codepage} は厳密モード非対応のはず"
+            );
+            assert_eq!(
+                codepage_rejection(codepage),
+                Some(CodepageRejection::NoStrictValidation),
+                "コードページ {codepage}"
+            );
+        }
+    }
+
+    // 受け入れ条件（`ENC-001`、`ENC-007`）: 実運用で使う ANSI コードページと
+    // UTF-8（65001）は拒否しない。
+    #[test]
+    fn ordinary_codepages_are_not_rejected() {
+        for codepage in [932, 936, 949, 950, 1250, 1252, 20127, 54936, 65001] {
+            assert!(
+                codepage_supports_strict_validation(codepage),
+                "コードページ {codepage} は厳密モード対応のはず"
+            );
+            assert_eq!(
+                codepage_rejection(codepage),
+                None,
+                "コードページ {codepage}"
+            );
+        }
     }
 }

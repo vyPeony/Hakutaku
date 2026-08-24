@@ -12,27 +12,36 @@
 //! 接続、不正バイトの元データ保持は本クレートの対象外であり、いずれも P05-6
 //! （読み込み経路の実装）が行います。「後続課題」節も参照してください。
 //!
-//! # `ENC-005` の4段階判定
+//! # 判定順序（`ENC-005`、`ENC-006`）
 //!
 //! [`detect_encoding`] は次の順で文字コードを決定します。
 //!
-//! 1. **明示指定の確認。** プロファイルの `encoding`（[`ProfileEncodingSetting::named`]）
+//! 1. **UTF-16 の BOM。** 先頭が `FF FE`／`FE FF` なら、**明示指定の有無に
+//!    かかわらず** [`EncodingDecision::Unsupported`] を返します（`ENC-006`）。
+//! 2. **明示指定の確認。** プロファイルの `encoding`（[`ProfileEncodingSetting::named`]）
 //!    または `ansi_codepage`（[`ProfileEncodingSetting::ansi_codepage`]）のいずれかが
-//!    指定されていれば、その指定を最優先で使用します。
-//! 2. **UTF-8 BOM。** 明示指定がない場合、先頭が UTF-8 BOM（`EF BB BF`）なら UTF-8
+//!    指定されていれば、その指定を使用します。
+//! 3. **UTF-8 BOM。** 明示指定がない場合、先頭が UTF-8 BOM（`EF BB BF`）なら UTF-8
 //!    とみなします。
-//! 3. **BOM なし UTF-8 の妥当性確認。** 先頭 [`UTF8_AUTO_DETECT_PREFIX_BYTES`]
+//! 4. **BOM なし UTF-8 の妥当性確認。** 先頭 [`UTF8_AUTO_DETECT_PREFIX_BYTES`]
 //!    バイトが妥当な UTF-8 なら UTF-8 とみなします。
-//! 4. **環境の Windows ANSI コードページ。** 上記のいずれにも該当しない場合、
+//! 5. **環境の Windows ANSI コードページ。** 上記のいずれにも該当しない場合、
 //!    実行環境の既定 ANSI コードページ（`GetACP`）を使用します。
 //!
-//! ## 明示指定と BOM が矛盾する場合の設計判断（暫定設計、4.3）
+//! ## なぜ UTF-16 の BOM だけ明示指定より前なのか（Issue #38）
 //!
-//! 要件の字面（`ENC-005`）だけを読むと「プロファイルの `ansi_codepage`」は
-//! UTF-8 BOM／BOM なし UTF-8 妥当性確認より**後**の段階に見えますが、本実装は
-//! 「明示指定（`encoding` 名前指定または `ansi_codepage`）があれば、BOM の
-//! 有無に関わらず常に明示指定を優先する」という `tasks/phase-05-log-parsing-core.md`
-//! の暫定設計（4.3）を採用しています。BOM と明示指定が矛盾する場合
+//! UTF-16 は `ENC-006` により初期リリースの対応対象外であり、Hakutaku には
+//! UTF-16 をデコードする経路そのものがありません。明示指定を先に見ると、UTF-16
+//! のファイルが「明示された文字コードで読めた」ことになり、`ENC-006` の未対応
+//! 通知へ乗らないまま、全面的に文字化けした本文が正常な内容として表示されて
+//! しまいます。誤った内容を正常な内容として見せないことを優先し、UTF-16 の BOM
+//! の判定だけを明示指定より前に置いています。
+//!
+//! ## 明示指定と UTF-8 BOM が矛盾する場合の設計判断（暫定設計、4.3）
+//!
+//! 明示指定（`encoding` 名前指定または `ansi_codepage`）があれば、UTF-8 BOM の
+//! 有無に関わらず明示指定を優先します（`ENC-005` の「明示指定は自動判定より
+//! 優先します」）。UTF-8 BOM があるのに UTF-8 以外が明示指定されている場合
 //! （例: UTF-8 BOM があるのに `ansi_codepage: 932` が指定されている）は、
 //! [`EncodingDecision`] に矛盾の警告（[`EncodingWarning`]）を含めつつ、
 //! **暗黙に別のエンコーディングへ切り替えません**。警告を診断ログへ実際に
@@ -49,10 +58,14 @@
 //!
 //! # 対応対象外: UTF-16
 //!
-//! UTF-16 LE/BE の BOM（`FF FE` / `FE FF`）を検出した場合、明示指定がなければ
-//! [`EncodingDecision::Unsupported`] を返します（`ENC-006`）。明示指定がある
-//! 場合は、他の BOM 矛盾と同様に警告を返しつつ明示指定を使用します（上記の
-//! 「明示指定と BOM が矛盾する場合の設計判断」と同じ扱い）。
+//! UTF-16 LE/BE の BOM（`FF FE` / `FE FF`）を検出した場合、明示指定の有無に
+//! かかわらず [`EncodingDecision::Unsupported`] を返します（`ENC-006`。理由は
+//! 上の「なぜ UTF-16 の BOM だけ明示指定より前なのか」を参照）。
+//!
+//! BOM のない UTF-16 は検出できません。設定でコードページ 1200／1201 を指定する
+//! 経路も塞いでおり、[`codepage_rejection`] が理由（[`CodepageRejection::Utf16`]）
+//! を返します。設定の起動時検証（`hakutaku_config`）がこれを使って `CFG-016` の
+//! 一括提示へ合流させます。
 //!
 //! # デコードと不正バイトの扱い
 //!
@@ -103,7 +116,8 @@ mod decode;
 mod win32;
 
 pub use decision::{
-    detect_encoding, DecidedEncoding, DetectionRoute, EncodingDecision, EncodingWarning,
+    codepage_rejection, codepage_supports_strict_validation, detect_encoding, parse_named_encoding,
+    CodepageRejection, DecidedEncoding, DetectionRoute, EncodingDecision, EncodingWarning,
     EncodingWarningKind, InvalidEncodingNameError, ProfileEncodingSetting, ProfileSpecifiedKind,
     SelectedEncoding, UnsupportedEncoding, Utf16BomKind, UTF8_AUTO_DETECT_PREFIX_BYTES,
 };
@@ -155,6 +169,11 @@ pub const RESPONSIBILITY: &str = "形式判定";
 /// 起動時に一括提示する（`CFG-016`、Issue #39）ため、設定の検証
 /// （`hakutaku_config::load_config_with_codepage_check`）へこの判定を注入します。
 /// 設定クレートは Win32 に依存しないので、判定を持つ本クレートが提供します。
+///
+/// **存在することと、Hakutaku が文字コードとして使えることは別です。** 実行環境に
+/// 存在していても使えないコードページ（UTF-16、厳密な判定ができないコードページ）
+/// は [`codepage_rejection`] が理由を返します。起動時検証は両方を確認します
+/// （Issue #38）。
 #[cfg(windows)]
 #[must_use]
 pub fn codepage_available(codepage: u32) -> bool {

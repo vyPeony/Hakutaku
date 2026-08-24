@@ -52,8 +52,14 @@ pub struct DecodeOutcome {
 /// [`decode`] の失敗です。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
-    /// 指定されたコードページが実行環境に存在しない
-    /// （`GetCPInfoExW` での検証、または変換失敗）。
+    /// 指定されたコードページでバイト列を変換できなかった。
+    ///
+    /// 実行環境にそのコードページが存在しない（`GetCPInfoExW` が失敗する）場合
+    /// のほか、存在はしても `MultiByteToWideChar` が変換を受け付けない場合
+    /// （UTF-16 のコードページ 1200／1201 など）もここに含まれます。後者は
+    /// 設定の起動時検証（`CFG-016`、[`crate::codepage_rejection`]）が先に弾く
+    /// ため通常は到達しませんが、到達した場合に「存在しません」と実態の異なる
+    /// 理由を示さないよう、両方を含む文言にしています（Issue #38）。
     UnknownCodepage(u32),
 }
 
@@ -61,7 +67,11 @@ impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeError::UnknownCodepage(codepage) => {
-                write!(f, "コードページ {codepage} は実行環境に存在しません")
+                write!(
+                    f,
+                    "コードページ {codepage} でデコードできません（実行環境に存在しないか、\
+                     文字コードの変換に使用できないコードページです）"
+                )
             }
         }
     }
@@ -87,14 +97,28 @@ pub(crate) struct RawDecodeResult {
 /// しません**（呼び出し側が引き続き `bytes` を保持できる設計。実際に元バイト
 /// 列を保持し続けるバッファの設計は P05-6 の対象です）。
 ///
-/// # 不正位置の特定粒度
+/// # 入力長の上限（`i32::MAX` バイト = 2 GiB 未満）
+///
+/// [`SelectedEncoding::Windows`] の経路では、`bytes` の長さが [`i32::MAX`] を
+/// 超えるとパニックします。`MultiByteToWideChar` がバイト数を `i32` で受け取り、
+/// `windows` クレートの束縛がその変換に失敗した時点でパニックするためです。
+/// 呼び出し側はこの上限を守ってください（読み込み経路はチャンク単位で
+/// デコードするため、実際にはこの長さに到達しません）。
+/// [`SelectedEncoding::Utf8`] の経路にはこの上限はありません（Issue #38）。
+///
+/// # 不正位置の特定粒度（経路によって異なります）
 ///
 /// - [`SelectedEncoding::Utf8`]: `str::from_utf8` の判定に基づく、バイト単位の
-///   正確な位置です。
+///   正確な位置です。不正区間ごとに1件報告します。
 /// - [`SelectedEncoding::Windows`]: `MultiByteToWideChar` を使った、
 ///   `WINDOWS_CODEPAGE_SCAN_CHUNK_BYTES`（Windows 専用モジュール
-///   `crate::win32` で定義）バイト単位の近似です。詳細は同定数の doc コメント
-///   を参照してください。
+///   `crate::win32` で定義。4096 バイト）単位の近似です。報告される値は常に
+///   4096 の倍数であり、1チャンク内に不正バイトが何個あっても1件だけです。
+///
+/// **この粒度の差は解消していません。** [`DecodeOutcome::invalid_positions`] を
+/// 利用者へ表示する呼び出し側は、Windows コードページ経路の値をバイト単位の
+/// 正確な位置として扱わないでください（Issue #38 で明文化）。粒度が異なる理由と
+/// 既知のずれは `WINDOWS_CODEPAGE_SCAN_CHUNK_BYTES` の doc コメントにあります。
 pub fn decode(bytes: &[u8], decided: &DecidedEncoding) -> Result<DecodeOutcome, DecodeError> {
     let bom_len = decided.bom_len.min(bytes.len());
     let content = &bytes[bom_len..];

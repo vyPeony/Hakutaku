@@ -241,10 +241,18 @@ pub struct LogProfileConfig {
     /// 決める必要がないからである。
     pub priority: i64,
     /// 文字コード指定（`CFG-008`）。既定は自動判定。
-    pub encoding: EncodingSetting,
-    /// 明示的な Windows ANSI コードページ識別子（`CFG-008`）。
     ///
-    /// 未指定（`None`）の場合のみ、実行環境の Windows ANSI コードページを使用する。
+    /// [`EncodingSetting::Named`] と [`Self::ansi_codepage`] は同時に指定できない
+    /// （起動時検証エラー。Issue #38）。
+    pub encoding: EncodingSetting,
+    /// 明示的な Windows ANSI コードページ識別子（`CFG-008`、`ENC-007`）。
+    ///
+    /// 未指定（`None`）で、かつ [`Self::encoding`] も明示指定でない場合にだけ、
+    /// 実行環境の Windows ANSI コードページを使用する（`ENC-005`）。
+    ///
+    /// 起動時検証を通過した値は、Hakutaku が文字コードとして選べる番号である
+    /// （UTF-16 のコードページ 1200／1201 と、厳密な判定ができないコードページは
+    /// 起動時に弾かれる。`ENC-006`、Issue #38）。
     pub ansi_codepage: Option<u32>,
     /// 日時書式指定（`CFG-008`）。既定は自動判定。
     ///
@@ -259,10 +267,17 @@ pub enum EncodingSetting {
     /// 自動判定（既定）。
     #[default]
     Auto,
-    /// 明示された文字コード名（例: `shift_jis`、`utf-8`）。
+    /// 明示された文字コード名（例: `utf-8`、`windows-932`）。
     ///
-    /// 文字コード名の妥当性検証（実際に解釈可能かどうか）は消費側（P05）が行う。
-    /// P03 は非空の文字列であることのみを検証する。
+    /// 受理する名前は `utf-8` と `windows-<コードページ番号>` だけである
+    /// （`shift_jis` のような別名は受理しない）。判定は形式判定層の
+    /// `hakutaku_format_detection::parse_named_encoding` を唯一の実装とし、
+    /// [`crate::load_config`] の起動時検証がその関数をそのまま呼んで
+    /// `CFG-016` の一括提示へ合流させる（Issue #38）。したがって、この
+    /// バリアントへ入る文字列は必ず解釈可能な名前である。
+    ///
+    /// `ansi_codepage` との同時指定は起動時検証エラーになる（両方書くと
+    /// `encoding` だけが使われ、`ansi_codepage` が黙って無視されるため）。
     Named(String),
 }
 
