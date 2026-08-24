@@ -6,7 +6,8 @@ windows = ["main"]
 # SEC-012: Capability は必要最小限に限定し、フロントエンドへ任意パスの
 # ファイルシステムアクセス権を与えない。読み取りは Rust コマンド経由に限定する。
 #
-# permissions を空にしています（従来の ["core:default"] から変更）。根拠:
+# `core:default` を一括では使わず、フロントエンドが実際に呼び出すコマンドごとの
+# 最小権限だけを列挙しています（従来の ["core:default"] から変更）。根拠:
 #
 # 1. `core:default` は tauri-2.11.5/build.rs の PLUGINS 一覧（16〜370行目）と
 #    define_default_permission_set（449〜485行目）が生成するもので、
@@ -15,26 +16,26 @@ windows = ["main"]
 #    です。fs／shell／http 系のコマンドは含まれておらず、これ自体は SEC-012 に
 #    違反していません（パス文字列の解決 core:path はファイル内容へアクセスしない）。
 #
-# 2. ただし現在の `src/index.html` と `src/styles.css` には <script> が一切なく、
-#    `invoke()` を呼び出すフロントエンドコードが存在しません。Tauri が自動注入する
-#    ランタイムスクリプト（tauri-2.11.5/scripts/core.js、ipc-protocol.js）も、
+# 2. ただし、ウィンドウの表示・ネイティブタイトルバーの最小化／閉じる操作・
+#    IPC エンドポイント自体の登録（tauri-2.11.5/src/manager/webview.rs
+#    280〜286行目）は、Capability の許可状態と無関係に行われます。Tauri が自動注入
+#    するランタイムスクリプト（tauri-2.11.5/scripts/core.js、ipc-protocol.js）も、
 #    ページ読み込み時に自発的にコマンドを呼び出す処理はありません
 #    （core.js は window.__TAURI_INTERNALS__ に invoke 等の関数を定義するだけ）。
-#    ウィンドウの表示・ネイティブタイトルバーの最小化／閉じる操作・IPC エンドポイント
-#    自体の登録（tauri-2.11.5/src/manager/webview.rs 280〜286行目）は Capability の
-#    許可状態と無関係に行われます。
+#    つまり `core:*` の許可は、メインウィンドウを表示するためには必要ありません。
 #
-# 3. したがって「Hakutaku のメインウィンドウ表示に本当に必要な」コマンドは
-#    現時点でゼロです。permissions = [] は
-#    tauri-utils-2.9.3/src/acl/resolved.rs 265行目付近の解決処理
-#    （`for permission_entry in &capability.permissions` で空なら何もしない）と
-#    src-tauri/gen/schemas/desktop-schema.json の permissions フィールド定義
-#    （type: array, uniqueItems: true。minItems 等の下限制約は無い）の両方で
-#    スキーマ上・実装上妥当です。
+# 3. 現在のフロントエンド（`src/main.js` ほかのスクリプト）は invoke() で
+#    アプリ自身のコマンドを呼び出します。下の permissions は、そのコマンド1つに
+#    つき1つずつ定義した専用の許可（src-tauri/permissions/ 配下の各 toml。
+#    プレフィックス無し = アプリ自身のコマンド）だけで構成し、`core:*` の許可は
+#    含めていません。個数を本コメントへ書き写すと追加のたびに陳腐化するため、
+#    現在の許可一覧は下の permissions そのものを参照してください。
 #
-# 後続フェーズへの引き継ぎ: フロントエンドに invoke() を伴う JS を追加する時点で、
-# 必要になった時点の最小権限（例: `core:app:allow-version` のような個別許可）だけを
+# 変更時の方針: フロントエンドが新しいコマンドを呼ぶようになった時点で、その
+# コマンド専用の最小権限（例: `core:app:allow-version` のような個別許可）だけを
 # 都度追加してください。`core:default` を一括で復元しないこと。
+#
+# 以下は、各コマンドの許可を追加した経緯の記録です（追加順）。
 #
 # P03-2 で `src/main.js` から `get_config_status` を呼び出すため、
 # 上記の方針どおり、そのコマンド専用の最小権限だけを追加する。定義は
