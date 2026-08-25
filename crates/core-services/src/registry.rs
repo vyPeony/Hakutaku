@@ -215,7 +215,9 @@ pub struct SourceSummary {
 struct SourceRecord {
     display_set_id: u32,
     path: PathBuf,
-    label: String,
+    /// 来歴ラベル。表示集合の [`SourceInfo`] へそのまま渡すため `Arc<str>` で
+    /// 持ちます（複製の理由は [`SourceInfo::label`] の doc コメント参照）。
+    label: Arc<str>,
     snapshot: FileSnapshot,
     reservation: SourceReservation,
     status: SourceStatus,
@@ -544,6 +546,8 @@ impl DisplaySetRegistry {
     ) -> Result<DisplaySetHandle, hakutaku_memory_accounting::ReservationRejected> {
         let source_id = self.next_source_id;
         let display_set_id = self.next_display_set_id;
+        // 以後、この1つの確保をソース記録・表示集合・各応答項目で共有する。
+        let label: Arc<str> = Arc::from(label);
 
         // 先に容量を確保してから追記する。順序が重要で、逆にすると
         // 最初のバッチ分だけが倍々成長の起点になってしまい、事前確保の意味が
@@ -561,7 +565,7 @@ impl DisplaySetRegistry {
 
         let sources_info = vec![SourceInfo {
             source_id,
-            label: label.clone(),
+            label: Arc::clone(&label),
         }];
         let mut texts = HashMap::new();
         texts.insert(source_id, text);
@@ -615,7 +619,7 @@ impl DisplaySetRegistry {
             .map(|(source_id, record)| SourceSummary {
                 source_id: *source_id,
                 display_set_id: record.display_set_id,
-                label: record.label.clone(),
+                label: record.label.to_string(),
                 status: record.status.clone(),
                 size_bytes: record.snapshot.snapshot_end,
                 has_unconfirmed_trailing_line: record.has_unconfirmed_trailing_line,
@@ -801,7 +805,7 @@ impl DisplaySetRegistry {
         record.status = SourceStatus::Changed(kind);
         record.update_pending = false;
         let display_set_id = record.display_set_id;
-        let label = record.label.clone();
+        let label = Arc::clone(&record.label);
         self.decoded_cache.invalidate_source(source_id);
 
         if let Some(display_set) = self.display_sets.get_mut(&display_set_id) {
@@ -866,7 +870,7 @@ impl DisplaySetRegistry {
         let record = self.sources.get(&source_id)?;
         Some(SourceReloadContext {
             path: record.path.clone(),
-            label: record.label.clone(),
+            label: record.label.to_string(),
             old_snapshot: record.snapshot,
             old_reservation: record.reservation,
         })
@@ -946,12 +950,23 @@ impl DisplaySetRegistry {
     ///
     /// 索引の伸長分のメモリ予約が拒否された場合 `Err` を返します。未登録の
     /// `source_id` の場合 `Ok(None)` を返します。
+    ///
+    /// `datetime_format`・`selected_encoding` は、復元のための再解析で確定した
+    /// 値です。復元は表示集合を丸ごと作り直す（＝再解析を伴う）ため、これらを
+    /// 反映しないと、**索引は新しいのにオンデマンド読み出しの再現条件だけが
+    /// 古いまま**という食い違いが残ります（本文のデコードは
+    /// [`Self::hydrate_source_group`] が `SourceRecord::selected_encoding` を、
+    /// `timestamp_display` の再構成は `SourceRecord::datetime_format` を使う
+    /// ため）。同じ理由で [`Self::commit_reload`] も反映しており、両者を対称に
+    /// 保ちます（Issue #51 項目1）。
     pub(crate) fn commit_restore(
         &mut self,
         source_id: u32,
         pending_items: &[PendingItem],
         new_snapshot: FileSnapshot,
         has_unconfirmed_trailing_line: bool,
+        datetime_format: Option<LogDateTimeFormat>,
+        selected_encoding: SelectedEncoding,
     ) -> Result<Option<RebuildOutcome>, hakutaku_memory_accounting::ReservationRejected> {
         let Some(record) = self.sources.get(&source_id) else {
             return Ok(None);
@@ -983,6 +998,8 @@ impl DisplaySetRegistry {
         record.status = SourceStatus::Loaded;
         record.resident_committed_bytes = resident_committed_bytes;
         record.has_unconfirmed_trailing_line = has_unconfirmed_trailing_line;
+        record.datetime_format = datetime_format;
+        record.selected_encoding = selected_encoding;
 
         // P09-1: 統合表示集合が有効なら、復元後の内容へ追従させる。
         self.sync_merged_view();
@@ -1009,6 +1026,28 @@ impl DisplaySetRegistry {
     }
 
     /// ソースの整合性を再確認します（`LOG-023`）。
+    ///
+    /// # この関数が変えられる状態と、変えられない状態
+    ///
+    /// 再確認が判定するのは「元ファイルが登録時と同じか」だけです。したがって
+    /// この関数が解除できるのは、**再確認そのものの失敗として記録した状態**
+    /// （[`SourceStatus::SharingViolation`]（`LOG-027`）・
+    /// [`SourceStatus::Error`]（`ERR-001`）。いずれも索引は無効化せず、一時的な
+    /// 事象の可能性があるものとして表示を維持しています）だけです。ロックが
+    /// 外れた後の再試行が [`SourceStatus::Loaded`] へ戻る経路がこれです。
+    ///
+    /// 一方 [`SourceStatus::CancelledPartial`]（キャンセルにより索引が途中まで
+    /// しか無い）と [`SourceStatus::Evicted`] は、**読み込み結果そのものの
+    /// 状態**であり、ファイルが変化していないことを確かめても解消しません。
+    /// ここで機械的に `Loaded` へ戻すと、途中までの索引が「読み込み済み」と
+    /// して扱われ、利用者にも呼び出し側にも全件読み込み済みと区別できなく
+    /// なります（Issue #51 項目2）。そのため、これらの状態は変更せずそのまま
+    /// 返します。全件を読み直す経路は、部分読み込みなら再登録
+    /// （`src-tauri` の `retry_target`）、退避復元なら
+    /// [`crate::loader::restore_evicted_source`] です。
+    ///
+    /// [`SourceStatus::Changed`]（`LOG-023` で無効化済み）は、再確認そのものを
+    /// 行わずそのまま返します（close するまで再利用しません）。
     ///
     /// 未登録の `source_id` の場合 `None` を返します。
     pub fn refresh_source(&mut self, source_id: u32) -> Option<SourceStatus> {
@@ -1048,7 +1087,16 @@ impl DisplaySetRegistry {
                     .sources
                     .get_mut(&source_id)
                     .expect("直前の get で存在確認済み");
-                record.status = SourceStatus::Loaded;
+                // 変更は検知されなかった。ここで解除してよいのは「再確認の
+                // 失敗」として記録した状態だけで、読み込み結果そのものの状態
+                // （`CancelledPartial`・`Evicted`）は変更しない（この関数の
+                // doc コメント「この関数が変えられる状態と、変えられない状態」）。
+                if matches!(
+                    record.status,
+                    SourceStatus::SharingViolation | SourceStatus::Error(_)
+                ) {
+                    record.status = SourceStatus::Loaded;
+                }
             }
         }
 
@@ -1327,11 +1375,14 @@ impl DisplaySetRegistry {
                 .take(effective_max_items as usize)
             {
                 // 参照先が消えている場合（通常は起こらない防御的経路。
-                // sync_merged_view が状態変更のたびに再構築するため）は
-                // その項目を静かに読み飛ばす。
-                let Some(index_ref) = self.index_ref_for_merged_item(*item_id) else {
-                    continue;
-                };
+                // sync_merged_view が状態変更のたびに再構築するため）でも、
+                // 読み飛ばさず既定値の1件を返す（[`orphan_merged_index_ref`]）。
+                // 読み飛ばすと応答件数が要求より少なくなり、返らなかった項目を
+                // 呼び出し側が要求し続ける限り `start` が進まない
+                // （`ERR-001`「失敗しても全体を止めない」。Issue #51 項目3）。
+                let index_ref = self
+                    .index_ref_for_merged_item(*item_id)
+                    .unwrap_or_else(|| orphan_merged_index_ref(*item_id));
                 let item_bytes = index_ref.raw_byte_len as usize;
                 if !refs.is_empty()
                     && raw_bytes_total.saturating_add(item_bytes) > MAX_RESPONSE_RAW_BYTES
@@ -1360,7 +1411,7 @@ impl DisplaySetRegistry {
     /// 統合表示集合の1項目（`ItemId`）を、その項目が属する単独ソースの
     /// `DisplaySet` から [`IndexItemRef`] へ変換します。参照先のソース・
     /// 表示集合が既に存在しない場合は `None`（防御的経路。呼び出し側は
-    /// その項目を読み飛ばします）。
+    /// [`orphan_merged_index_ref`] の既定値へ差し替えて、応答の件数を保ちます）。
     fn index_ref_for_merged_item(&self, item_id: ItemId) -> Option<IndexItemRef> {
         let record = self.sources.get(&item_id.source_id)?;
         let owning = self.display_sets.get(&record.display_set_id)?;
@@ -1376,6 +1427,14 @@ impl DisplaySetRegistry {
 
     /// [`Self::fetch_range`] が索引レベルの応答から得た項目群の本文を、
     /// ソースごとにまとめてオンデマンドで読み出します（P08-5）。
+    ///
+    /// 戻り値の件数と順序は、必ず `items` と同じです。
+    /// [`Self::hydrate_source_group`] が要求より少ない件数を返した場合
+    /// （例: デコード済みチャンクキャッシュのヒット位置以降に、要求した件数
+    /// ぶんの本文が残っていない）も、埋まらなかった位置を既定値（空の本文）で
+    /// 補います。ここで不変条件の破れをパニックにすると、範囲取得1回の失敗で
+    /// アプリ全体が落ちてしまい、`ERR-001`（1件の失敗で全体を止めない）に
+    /// 反するためです（Issue #51 項目4）。
     fn hydrate_items(&mut self, items: Vec<IndexItemRef>) -> Vec<ItemDto> {
         let mut by_source: HashMap<u32, Vec<usize>> = HashMap::new();
         for (index, item) in items.iter().enumerate() {
@@ -1391,9 +1450,19 @@ impl DisplaySetRegistry {
             }
         }
 
+        // 埋まらなかった位置は、本文を読み出せなかった項目と同じ扱いにする
+        // （[`Self::fallback_group`] と同じく `COPY-005` のために数え上げる。
+        // 空の本文がコピー結果へ黙って混ざらないようにするため）。
+        let missing = results.iter().filter(|dto| dto.is_none()).count();
+        if missing > 0 {
+            self.hydrate_fallback_items =
+                self.hydrate_fallback_items.saturating_add(missing as u64);
+        }
+
         results
             .into_iter()
-            .map(|dto| dto.expect("すべての添字を埋めたはず"))
+            .zip(items.iter())
+            .map(|(dto, item)| dto.unwrap_or_else(|| item_dto_fallback(item)))
             .collect()
     }
 
@@ -1690,6 +1759,32 @@ fn item_dto_fallback(item: &IndexItemRef) -> ItemDto {
     item_dto_from_text(item, Arc::from(""), None)
 }
 
+/// 統合表示集合（P09-1）の参照列が指す項目を、参加ソース側で解決できなかった
+/// ときに使う既定の [`IndexItemRef`] です（[`DisplaySetRegistry::
+/// index_ref_for_merged_item`] が `None` を返した場合）。
+///
+/// 値は [`DisplaySet::to_index_ref`] が参照先のエントリを見つけられなかった
+/// ときと同じ既定値（来歴なし・日時なし・生バイト範囲は長さ0）に揃えます。
+/// 長さ0にすることで、本文の読み出しは空文字列になり、応答の転送上限判定
+/// （[`MAX_RESPONSE_RAW_BYTES`]）にも影響しません。
+///
+/// **読み飛ばさずに1件返すことが目的です。** 読み飛ばすと応答の件数が要求より
+/// 少なくなり、返らなかった項目を呼び出し側が要求し続ける限り `start` が
+/// 進みません（`ERR-001`。[`DisplaySetRegistry::fetch_merged_range`] 参照）。
+fn orphan_merged_index_ref(item_id: ItemId) -> IndexItemRef {
+    IndexItemRef {
+        item_id,
+        source_id: item_id.source_id,
+        source_label: Arc::from(""),
+        source_line_number: 0,
+        confirmed: true,
+        continuation_count: 0,
+        has_timestamp: false,
+        raw_offset: 0,
+        raw_byte_len: 0,
+    }
+}
+
 /// 継続行の内部区切り文字を `\n` へ正規化し、共有本文（`Arc<str>`）にします。
 ///
 /// 継続行の内部区切り文字は生バイトのまま `\r\n` を含み得ます。索引化前
@@ -1738,7 +1833,9 @@ fn item_dto_from_text(
         item_id: item.item_id,
         timestamp_display,
         raw_text,
-        source_label: item.source_label.clone(),
+        // 索引レベルの応答が持つ共有ラベルを、複製せずそのまま運ぶ
+        // （`crate::item::SourceInfo::label`）。
+        source_label: Arc::clone(&item.source_label),
         source_line_number: item.source_line_number,
         confirmed: item.confirmed,
         continuation_count: item.continuation_count,
@@ -1854,7 +1951,7 @@ mod tests {
                 },
             )
             .expect("成功するはず");
-        assert_eq!(response_a.items[0].source_label, "a.log");
+        assert_eq!(&*response_a.items[0].source_label, "a.log");
         assert_eq!(&*response_a.items[0].raw_text, "a content");
     }
 
@@ -2099,6 +2196,201 @@ mod tests {
         );
     }
 
+    // --- オンデマンド読み出し中の変更検知（`LOG-023`、Issue #51 項目14） ---
+    //
+    // `LOG-023` の変更検知は、明示的な `refresh_source` よりも
+    // 「範囲取得のたびにファイルを開き直す」オンデマンド読み出し経路
+    // （`hydrate_source_group` のスナップショット照合）で起きる方が頻度が高い。
+    // 削除の検知は上のキャッシュ関連テストが副次的に押さえているが、
+    // スナップショット照合の2条件（識別子の変化＝置換、`snapshot_end` の縮小）
+    // はこれまで直接の試験が無かったため、ここで固定する。
+
+    // 受け入れ条件: オンデマンド読み出し時に元ファイルの縮小を検知すると、
+    // その項目群は既定値（空の本文）で返り、ソースは `Changed(Shrunk)` になって
+    // 表示集合の世代が進む。同じ応答・以後の取得で**他のソースは影響を受けない**
+    // （`ERR-001`「アプリ全体は継続動作する」）。
+    #[test]
+    fn fetch_range_detects_shrink_during_on_demand_read_and_keeps_other_sources_readable() {
+        let mut registry = DisplaySetRegistry::new();
+        let budget = crate::budget::SourceBudget::new();
+        let (shrinking, shrinking_file) =
+            insert_multiline_file(&mut registry, &budget, "shrink.log", &CONTAINMENT_LINES);
+        let (stable, _stable_file) = insert_multiline_file(
+            &mut registry,
+            &budget,
+            "stable.log",
+            &[(1, "kept", Some(1000))],
+        );
+
+        // 一度も取得しないままファイルを切り詰める（デコード済みチャンク
+        // キャッシュに載っていない＝必ず開き直す状態を作るため）。
+        {
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&shrinking_file.path)
+                .expect("書き込み用に開けるはず");
+            writer.set_len(3).expect("切り詰めできるはず");
+        }
+
+        let before_fallbacks = registry.hydrate_fallback_items();
+        let response = registry
+            .fetch_range(
+                shrinking.display_set_id,
+                RangeRequest {
+                    start: 0,
+                    max_items: 10,
+                    expected_generation: shrinking.generation,
+                },
+            )
+            .expect("応答そのものは失敗させないはず（ERR-001）");
+        assert_eq!(
+            response.items.len(),
+            CONTAINMENT_LINES.len(),
+            "検知しても要求した件数はそのまま返すはず"
+        );
+        assert!(
+            response.items.iter().all(|item| item.raw_text.is_empty()),
+            "読み出せなかった項目は既定値（空の本文）になるはず"
+        );
+        assert_eq!(
+            registry.hydrate_fallback_items() - before_fallbacks,
+            CONTAINMENT_LINES.len() as u64,
+            "既定値で返した件数は COPY-005 のために数え上げられるはず"
+        );
+        assert_eq!(
+            registry.source_status(shrinking.source_id),
+            Some(SourceStatus::Changed(ChangeKind::Shrunk)),
+            "スナップショット照合で縮小を検知するはず（LOG-023）"
+        );
+
+        // 索引は無効化され、世代が進んでいる（同じ世代の再要求は拒否される）。
+        let stale = registry.fetch_range(
+            shrinking.display_set_id,
+            RangeRequest {
+                start: 0,
+                max_items: 10,
+                expected_generation: shrinking.generation,
+            },
+        );
+        assert!(matches!(
+            stale,
+            Err(FetchRangeError::GenerationMismatch { .. })
+        ));
+
+        // 他のソースは影響を受けない。
+        assert_eq!(
+            registry.source_status(stable.source_id),
+            Some(SourceStatus::Loaded)
+        );
+        assert_eq!(
+            fetch_texts(&mut registry, &stable, 0, 10),
+            vec!["kept"],
+            "変更を検知していないソースは通常どおり本文が読めるはず"
+        );
+    }
+
+    // 受け入れ条件: オンデマンド読み出し時に元ファイルの置換（ファイル識別子の
+    // 変化）を検知すると、`Changed(Replaced)` になり本文は既定値になる。
+    //
+    // 識別子の食い違いは、登録時に記録したスナップショットを意図的にずらして
+    // 作る。実ファイルを削除して同名で作り直す方法では、識別子が変わるかどうかが
+    // ファイルシステムの実装（MFT レコードの再利用）に左右され、ここで固定したい
+    // 「照合が食い違ったときの扱い」を決定的に再現できないため。
+    #[test]
+    fn fetch_range_detects_replacement_by_file_identity_during_on_demand_read() {
+        let mut registry = DisplaySetRegistry::new();
+        let budget = crate::budget::SourceBudget::new();
+        let file = TempFile::create("replace-identity", b"content");
+
+        let (opened, snapshot) =
+            hakutaku_data_source::open_and_snapshot(&file.path).expect("開けるはず");
+        drop(opened);
+        let reservation = budget
+            .reserve(snapshot.snapshot_end)
+            .expect("テストの上限は十分大きいはず");
+
+        let mut recorded = snapshot;
+        recorded.identity.file_index ^= 1;
+
+        let handle = registry
+            .insert_source(
+                file.path.clone(),
+                "replaced.log".to_string(),
+                &[pending(1, 0, "content")],
+                recorded,
+                reservation,
+                false,
+                None,
+                SelectedEncoding::Utf8,
+                CapacityEstimate::Exact(1),
+            )
+            .expect("索引予約は十分な予算内のはず");
+
+        let before_fallbacks = registry.hydrate_fallback_items();
+        let response = registry
+            .fetch_range(
+                handle.display_set_id,
+                RangeRequest {
+                    start: 0,
+                    max_items: 10,
+                    expected_generation: handle.generation,
+                },
+            )
+            .expect("応答そのものは失敗させないはず（ERR-001）");
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(&*response.items[0].raw_text, "");
+        assert_eq!(registry.hydrate_fallback_items() - before_fallbacks, 1);
+        assert_eq!(
+            registry.source_status(handle.source_id),
+            Some(SourceStatus::Changed(ChangeKind::Replaced)),
+            "識別子が変わっていれば置換として扱うはず（LOG-023）"
+        );
+    }
+
+    // 受け入れ条件（Issue #51 項目4）: 本文を読み出せない項目が混ざっても、
+    // 応答の件数と順序は要求どおりに保たれ、読み出せなかった位置だけが既定値
+    // （空の本文）になる。`hydrate_items` は不変条件の破れをパニックにせず、
+    // この既定値へ縮退する（範囲取得1回の失敗でアプリ全体を落とさない。
+    // `ERR-001`）。
+    #[test]
+    fn hydrate_items_preserves_count_and_order_when_some_items_cannot_be_read() {
+        let mut registry = DisplaySetRegistry::new();
+        let budget = crate::budget::SourceBudget::new();
+        let file = TempFile::create("hydrate-order", b"real content");
+        let handle = insert_from_file(&mut registry, &budget, &file.path, "a.log", "real content");
+
+        let known = registry
+            .index_ref_for_merged_item(crate::item::ItemId {
+                source_id: handle.source_id,
+                seq: 0,
+            })
+            .expect("登録済みの項目は解決できるはず");
+        // 未登録ソースの項目（本文を読み出す手立てが無い）を前後に挟む。
+        let unknown_first = orphan_merged_index_ref(crate::item::ItemId {
+            source_id: 900,
+            seq: 0,
+        });
+        let unknown_last = orphan_merged_index_ref(crate::item::ItemId {
+            source_id: 901,
+            seq: 0,
+        });
+
+        let before_fallbacks = registry.hydrate_fallback_items();
+        let dtos = registry.hydrate_items(vec![unknown_first, known, unknown_last]);
+
+        assert_eq!(dtos.len(), 3, "件数は入力と同じはず");
+        assert_eq!(dtos[0].item_id.source_id, 900, "順序は入力と同じはず");
+        assert_eq!(&*dtos[1].raw_text, "real content");
+        assert_eq!(dtos[2].item_id.source_id, 901);
+        assert_eq!(&*dtos[0].raw_text, "");
+        assert_eq!(&*dtos[2].raw_text, "");
+        assert_eq!(
+            registry.hydrate_fallback_items() - before_fallbacks,
+            2,
+            "既定値で返した2件が COPY-005 のために数え上げられるはず"
+        );
+    }
+
     // 受け入れ条件: 再構築で世代が進んだあとの範囲取得は、前の世代の
     // デコード済みチャンクを再利用しない（包含判定で照合が広がる
     // ぶん、世代を跨いだ再利用が起きないことを明示的に固定する）。
@@ -2114,7 +2406,7 @@ mod tests {
 
         let sources = vec![SourceInfo {
             source_id: handle.source_id,
-            label: "a.log".to_string(),
+            label: Arc::from("a.log"),
         }];
         let mut text = IndexedText::new();
         let items = crate::item::build_items_from_pending(
@@ -2378,6 +2670,151 @@ mod tests {
         );
     }
 
+    // 受け入れ条件（Issue #51 項目2）: キャンセルによる部分読み込み
+    // （`CancelledPartial`）は、整合性の再確認が通っても `Loaded` へ戻らない。
+    // 再確認が確かめるのは「元ファイルが登録時と同じか」だけであり、索引が
+    // 途中までしか無いことは解消しないため。ここで戻すと、途中までの索引が
+    // 全件読み込み済みと区別できなくなる。
+    #[test]
+    fn refresh_source_keeps_cancelled_partial_even_when_the_file_is_unchanged() {
+        use std::io::Write;
+
+        let mut registry = DisplaySetRegistry::new();
+        let budget = crate::budget::SourceBudget::new();
+        let file = TempFile::create("refresh-cancelled-partial", b"hello");
+        let handle = insert_from_file(&mut registry, &budget, &file.path, "a.log", "hello");
+
+        registry
+            .mark_cancelled_partial(handle.source_id)
+            .expect("登録済みのはず");
+
+        assert_eq!(
+            registry.refresh_source(handle.source_id),
+            Some(SourceStatus::CancelledPartial),
+            "変化なし（Unchanged）でも部分読み込みは解消しないはず"
+        );
+
+        // 追記（Appended）も「変更を検知しない」同じ分岐へ入るが結論は同じ。
+        {
+            let mut writer = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file.path)
+                .expect("追記用に開けるはず");
+            writer.write_all(b" world").expect("追記できるはず");
+        }
+        assert_eq!(
+            registry.refresh_source(handle.source_id),
+            Some(SourceStatus::CancelledPartial),
+            "追記されても部分読み込みは解消しないはず"
+        );
+
+        // 変更を検知した場合は、従来どおり `LOG-023` の無効化が優先される。
+        std::fs::remove_file(&file.path).expect("削除できるはず");
+        assert_eq!(
+            registry.refresh_source(handle.source_id),
+            Some(SourceStatus::Changed(ChangeKind::Deleted)),
+            "変更検知は部分読み込み状態より優先されるはず（LOG-023）"
+        );
+    }
+
+    // 受け入れ条件（Issue #51 項目1）: `commit_restore` は、復元のための再解析で
+    // 確定した日時書式・文字コードをソース記録へ反映する（`commit_reload` と
+    // 対称）。反映しないと索引だけが新しくなり、オンデマンド読み出しの再現条件
+    // （本文のデコードと `timestamp_display` の再構成）が復元前のまま残る。
+    #[test]
+    fn commit_restore_applies_the_reparsed_datetime_format_and_encoding() {
+        let mut registry = DisplaySetRegistry::new();
+        let budget = crate::budget::SourceBudget::new();
+        // 末尾の 0x82 は Windows-1252 では U+201A、UTF-8 としては不正バイト
+        // （U+FFFD へ置換）になる。どちらの文字コードで読み直したかが本文で
+        // 判別できるため、記録の反映を外形から確認できる。
+        let contents = b"2026/07/28 15:12:23.456 ok\x82";
+        let file = TempFile::create("commit-restore-carry", contents);
+
+        let (opened, snapshot) =
+            hakutaku_data_source::open_and_snapshot(&file.path).expect("開けるはず");
+        drop(opened);
+        let reservation = budget
+            .reserve(snapshot.snapshot_end)
+            .expect("テストの上限は十分大きいはず");
+
+        // 日時付きの1項目として登録する（日時書式は未確定・文字コードは UTF-8）。
+        let item = PendingItem {
+            raw_offset: 0,
+            raw_byte_len: u32::try_from(contents.len()).unwrap(),
+            comparison_key_millis: Some(0),
+            source_line_number: 1,
+            continuation_count: 0,
+            unconfirmed: false,
+        };
+        let handle = registry
+            .insert_source(
+                file.path.clone(),
+                "restore.log".to_string(),
+                std::slice::from_ref(&item),
+                snapshot,
+                reservation,
+                false,
+                None,
+                SelectedEncoding::Utf8,
+                CapacityEstimate::Exact(1),
+            )
+            .expect("索引予約は十分な予算内のはず");
+
+        let before = registry
+            .fetch_range(
+                handle.display_set_id,
+                RangeRequest {
+                    start: 0,
+                    max_items: 10,
+                    expected_generation: handle.generation,
+                },
+            )
+            .expect("成功するはず");
+        assert!(
+            before.items[0].timestamp_display.is_none(),
+            "登録時は日時書式が未確定なので再構成されないはず"
+        );
+        assert!(
+            before.items[0].raw_text.contains('\u{FFFD}'),
+            "UTF-8 として読むと 0x82 は不正バイトになるはず: {}",
+            before.items[0].raw_text
+        );
+
+        let outcome = registry
+            .commit_restore(
+                handle.source_id,
+                std::slice::from_ref(&item),
+                snapshot,
+                false,
+                Some(LogDateTimeFormat::LogDt001),
+                SelectedEncoding::Windows(1252),
+            )
+            .expect("索引予約は十分な予算内のはず")
+            .expect("登録済みのはず");
+
+        let after = registry
+            .fetch_range(
+                handle.display_set_id,
+                RangeRequest {
+                    start: 0,
+                    max_items: 10,
+                    expected_generation: outcome.generation,
+                },
+            )
+            .expect("成功するはず");
+        assert_eq!(
+            after.items[0].timestamp_display.as_deref(),
+            Some("2026-07-28T15:12:23.456"),
+            "復元で確定した日時書式が反映されるはず"
+        );
+        assert!(
+            !after.items[0].raw_text.contains('\u{FFFD}'),
+            "復元で確定した文字コードで読み直されるはず: {}",
+            after.items[0].raw_text
+        );
+    }
+
     // 受け入れ条件: レジストリ経由の再構築で世代が進み、範囲取得の世代不一致
     // 判定に反映される。
     #[test]
@@ -2390,7 +2827,7 @@ mod tests {
 
         let sources = vec![SourceInfo {
             source_id: handle.source_id,
-            label: "a.log".to_string(),
+            label: Arc::from("a.log"),
         }];
         let mut text = IndexedText::new();
         let items = crate::item::build_items_from_pending(
@@ -2615,7 +3052,7 @@ mod tests {
                 seq: 0,
             },
             source_id: 999,
-            source_label: String::new(),
+            source_label: Arc::from(""),
             source_line_number: 0,
             confirmed: true,
             continuation_count: 0,
@@ -2734,7 +3171,7 @@ mod tests {
         let labels: Vec<&str> = response
             .items
             .iter()
-            .map(|item| item.source_label.as_str())
+            .map(|item| &*item.source_label)
             .collect();
         assert_eq!(labels, vec!["a.log", "a.log", "b.log", "a.log"]);
     }
@@ -2872,7 +3309,7 @@ mod tests {
         // shrink.log 側は LOG-023 により項目が空になるため、stable.log の
         // 1件だけが残る。
         assert_eq!(fresh.items.len(), 1);
-        assert_eq!(fresh.items[0].source_label, "stable.log");
+        assert_eq!(&*fresh.items[0].source_label, "stable.log");
     }
 
     // 受け入れ条件: ソースを閉じると、統合表示集合の対象から除外され世代が
@@ -2911,7 +3348,7 @@ mod tests {
             )
             .expect("close 後の新しい世代では成功するはず");
         assert_eq!(response.items.len(), 1);
-        assert_eq!(response.items[0].source_label, "b.log");
+        assert_eq!(&*response.items[0].source_label, "b.log");
     }
 
     // 受け入れ条件: 対象ファイルの追加を再読み込みなしで行える。新しいソースを
@@ -2998,6 +3435,81 @@ mod tests {
             .enable_merged_view()
             .expect("ソースが無くてもエラーにはならないはず");
         assert_eq!(merged.total_items, 0);
+    }
+
+    // 受け入れ条件（Issue #51 項目3）: 統合表示集合の参照列に、解決できない項目
+    // （参加ソースがもう無い）が含まれていても読み飛ばさず、既定値の1件として
+    // 返す。読み飛ばすと応答の件数が要求より少なくなり、返らなかった項目を
+    // 要求し続ける呼び出し側が同じ `start` で足踏みする（`ERR-001`）。
+    //
+    // 参照列は `sync_merged_view` が状態変更のたびに作り直すため、この状況は
+    // 実行時には起こらない防御的経路である。ここでは参照列へ未登録の `ItemId`
+    // を直接差し込んで再現する。
+    #[test]
+    fn fetch_merged_range_returns_a_fallback_item_for_an_unresolvable_reference() {
+        let mut registry = DisplaySetRegistry::new();
+        let budget = crate::budget::SourceBudget::new();
+
+        let (_handle_a, _file_a) =
+            insert_multiline_file(&mut registry, &budget, "a.log", &[(1, "A-1", Some(1000))]);
+        let (_handle_b, _file_b) =
+            insert_multiline_file(&mut registry, &budget, "b.log", &[(1, "B-1", Some(2000))]);
+
+        let merged = registry.enable_merged_view().expect("成功するはず");
+        assert_eq!(merged.total_items, 2);
+
+        // 参照列の中ほど（前後どちらの端でもない位置）へ差し込み、前後の項目が
+        // ずれないことも同時に見る。
+        registry
+            .merged_view
+            .as_mut()
+            .expect("統合表示は ON のはず")
+            .order
+            .insert(
+                1,
+                ItemId {
+                    source_id: 999,
+                    seq: 0,
+                },
+            );
+
+        let before_fallbacks = registry.hydrate_fallback_items();
+        let response = registry
+            .fetch_range(
+                merged.display_set_id,
+                RangeRequest {
+                    start: 0,
+                    max_items: 10,
+                    expected_generation: merged.generation,
+                },
+            )
+            .expect("応答そのものは失敗させないはず");
+
+        assert_eq!(
+            response.total_items, 3,
+            "参照列の件数がそのまま総件数になる"
+        );
+        assert_eq!(
+            response.items.len(),
+            3,
+            "解決できない項目も1件として返し、応答の件数を保つはず"
+        );
+        let texts: Vec<&str> = response.items.iter().map(|item| &*item.raw_text).collect();
+        assert_eq!(
+            texts,
+            vec!["A-1", "", "B-1"],
+            "前後の項目は取り違えられないはず"
+        );
+        assert_eq!(
+            &*response.items[1].source_label, "",
+            "解決できない項目の来歴は既定値になる"
+        );
+        assert!(!response.truncated, "全件返しているので打ち切りではない");
+        assert_eq!(
+            registry.hydrate_fallback_items() - before_fallbacks,
+            1,
+            "既定値で返した1件が COPY-005 のために数え上げられるはず"
+        );
     }
 
     // --- メモリ予約（`PERF-008`・`PERF-010`、Issue #32） ---

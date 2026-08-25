@@ -89,10 +89,16 @@ pub const RESIDENT_BYTES_PER_ITEM: usize =
 ///
 /// `label` はフロントエンドへ表示するためのラベルであり、絶対パスそのものでは
 /// ありません（`SEC-012`: フロントエンドへ任意パスの操作権を与えない）。
+///
+/// `Arc<str>` なのは、本文（`crate::display_set::ItemDto::raw_text`）と同じ
+/// 理由です。ラベルは範囲取得の応答1件ごとに複製される値であり、1回の応答で
+/// 最大 [`crate::display_set::MAX_ITEMS_PER_RESPONSE`] 件ぶんの
+/// 確保が積み上がります。同じソースの項目はすべて同じラベルを指すため、
+/// 参照カウントの増加だけで済ませます（Issue #51 項目11）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceInfo {
     pub source_id: u32,
-    pub label: String,
+    pub label: std::sync::Arc<str>,
 }
 
 /// 継続行の結合まで終えた、ID割り当て**前**の論理項目1件です

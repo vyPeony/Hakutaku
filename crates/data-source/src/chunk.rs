@@ -111,9 +111,10 @@ pub const PATH_VERIFY_CHUNK_INTERVAL: u64 = 8;
 
 /// チャンク境界での整合性再確認（`LOG-023`）を担う内部状態です。
 ///
-/// モジュール doc コメントの「整合性再確認の2層構成」を実装し、
-/// [`read_snapshotted_bytes_chunked`] と [`stream_snapshotted_bytes_chunked`]
-/// が共有します（同じ判定と同じ周期を二か所で実装し直さないため）。
+/// モジュール doc コメントの「整合性再確認の2層構成」を実装します。使い手は
+/// チャンク読み込みループを持つ [`stream_snapshotted_bytes_chunked`] だけです
+/// （[`read_snapshotted_bytes_chunked`] はそこへ委譲するため、同じ判定と同じ
+/// 周期がプロセス全体で1系統に保たれます）。
 struct ChunkVerifier<'a> {
     path: &'a Path,
     snapshot: &'a FileSnapshot,
@@ -365,7 +366,8 @@ impl From<ReadFileError> for ChunkReadError {
     }
 }
 
-/// `request.snapshot.snapshot_end` を上限に、チャンク単位で逐次読み込みます。
+/// `request.snapshot.snapshot_end` を上限に、チャンク単位で逐次読み込み、
+/// 読み込んだ生バイト列を1つの `Vec<u8>` へ蓄積して返します。
 ///
 /// 各チャンクを読む**前**に整合性を再確認します（`LOG-023`）。変更を検知した
 /// 場合は [`ChunkReadError::ChangeDetected`] を返し、それ以上読み進めません。
@@ -379,85 +381,40 @@ impl From<ReadFileError> for ChunkReadError {
 /// `PERF-010` の予約は、[`crate::read_snapshotted_bytes`] と同じく
 /// `snapshot_end` 全量を読み込み開始前に一括で予約し、完了時点（キャンセル・
 /// 先読み停止による途中終了を含む）で実際に読んだ量へ振り替えます。
+///
+/// # [`stream_snapshotted_bytes_chunked`] との関係
+///
+/// **チャンク読み込みループそのものは持たず、
+/// [`stream_snapshotted_bytes_chunked`] へ委譲します。** この関数が追加するのは
+/// 「全量の予約（`PERF-010`）」と「チャンクの蓄積」の2点だけです。
+///
+/// ループを二重に持たない理由は、そこに載っている不変条件——整合性再確認の
+/// 周期（縮小は毎チャンク／置換・削除は周期的）、読み切った直後の最終確認、
+/// キャンセル・先読み停止では最終確認を行わないこと（モジュール doc コメントの
+/// 「不変条件」）——を1か所でだけ保守するためです。2系統に分かれていると、
+/// 片方だけを直したときに検知の抜けが生まれます（Issue #51 項目10）。
 pub fn read_snapshotted_bytes_chunked(
     request: ChunkedReadRequest<'_>,
     mut on_chunk: impl FnMut(&[u8], u64, u64),
 ) -> Result<ChunkReadOutcome, ChunkReadError> {
-    let ChunkedReadRequest {
-        mut file,
-        path,
-        snapshot,
-        budget,
-        chunk_bytes,
-        throttle,
-        eager_bytes,
-        is_cancelled,
-    } = request;
+    // `request` を委譲先へ渡す前に、予約に必要な値だけを取り出す（どちらも
+    // `Copy` なので `request` はそのまま渡せる）。
+    let snapshot_end = request.snapshot.snapshot_end;
+    let budget = request.budget;
 
-    let snapshot_end = snapshot.snapshot_end;
-    let chunk_bytes = chunk_bytes.max(1);
-
+    // `PERF-010`: 蓄積用バッファの確保「前」に全量を予約する。拒否されたら
+    // 1バイトも読まずに戻る（委譲先は蓄積しないため予約を行わない。両者の
+    // 違いはこの予約と蓄積だけ）。
     let reserve_amount = usize::try_from(snapshot_end).unwrap_or(usize::MAX);
     let token = budget
         .reserve(reserve_amount)
         .map_err(ReadFileError::ReservationRejected)?;
 
     let mut buffer = Vec::with_capacity(reserve_amount);
-    let mut offset: u64 = 0;
-    let mut cancelled = false;
-    let mut prefetch_stopped = false;
-    let mut first_chunk = true;
-    let mut verifier = ChunkVerifier::new(path, snapshot);
-
-    while offset < snapshot_end {
-        // 4. 抑制: 同時実行数の許可（Semaphore 相当）。
-        let _permit = throttle.acquire();
-
-        // 4. 抑制: I/O 発行間隔（初回は待機しない）。
-        if !first_chunk && !throttle.io_interval().is_zero() {
-            std::thread::sleep(throttle.io_interval());
-        }
-        first_chunk = false;
-
-        // 2. キャンセルの確認（チャンク境界ごと）。
-        if is_cancelled() {
-            cancelled = true;
-            break;
-        }
-
-        // 5. 先読み抑制: 要求済み範囲（eager_bytes）を超える分は、
-        //    prefetch_paused() の間は発行しない（要求済み範囲は継続する）。
-        if offset >= eager_bytes && budget.prefetch_paused() {
-            prefetch_stopped = true;
-            break;
-        }
-
-        // 1. 整合性の再確認（各チャンクの読み込み前。LOG-023）。縮小は毎回、
-        //    置換・削除は周期的に確認する（モジュール doc コメントの
-        //    「整合性再確認の2層構成」）。
-        verifier.before_chunk(&file)?;
-
-        let remaining = snapshot_end - offset;
-        let this_chunk_len = remaining.min(chunk_bytes);
-        let mut chunk_buffer = vec![0u8; usize::try_from(this_chunk_len).unwrap_or(usize::MAX)];
-        file.read_exact(&mut chunk_buffer)
-            .map_err(|error| ReadFileError::Io {
-                reason: format!("ファイルを読み込めません（{error}）"),
-            })?;
-
-        buffer.extend_from_slice(&chunk_buffer);
-        offset += this_chunk_len;
-        on_chunk(&chunk_buffer, offset, snapshot_end);
-    }
-
-    // 読み切った場合だけ最終確認を行う（モジュール doc コメントの「不変条件」）。
-    // キャンセル・先読み停止による途中終了で確認しないのは、それらを整合性の
-    // エラーへ変えないためである（呼び出し側は結果を未完了として扱う）。
-    // 空ファイル（snapshot_end が 0）はループ本体を一度も通らないため、読んだ
-    // ものがない読み込みのためにファイルを開き直すことはしない。
-    if !cancelled && !prefetch_stopped && offset > 0 {
-        verifier.after_last_chunk()?;
-    }
+    let summary = stream_snapshotted_bytes_chunked(request, |chunk, bytes_read, total_bytes| {
+        buffer.extend_from_slice(chunk);
+        on_chunk(chunk, bytes_read, total_bytes);
+    })?;
 
     // 実確保（バッファの容量）を予約から実確保へ振り替える（ADR-0003）。
     let actual_bytes = buffer.capacity();
@@ -465,12 +422,12 @@ pub fn read_snapshotted_bytes_chunked(
     let _ = token.mark_allocated(reserved_bytes);
 
     Ok(ChunkReadOutcome {
-        file_size_bytes: snapshot_end,
+        file_size_bytes: summary.file_size_bytes,
         reserved_bytes,
         bytes: buffer,
-        bytes_read: offset,
-        cancelled,
-        prefetch_stopped,
+        bytes_read: summary.bytes_read,
+        cancelled: summary.cancelled,
+        prefetch_stopped: summary.prefetch_stopped,
     })
 }
 
@@ -512,12 +469,12 @@ pub struct ChunkReadSummary {
     pub read_elapsed: Duration,
 }
 
-/// [`read_snapshotted_bytes_chunked`] と同じチャンク読み込みループ（整合性の
-/// 再確認・キャンセル・抑制・先読み停止）を行いますが、**読み込んだ生バイト列を
-/// 蓄積しません**。各チャンクは `on_chunk` へ一時的に渡されるだけで、この関数の
-/// 呼び出しが終わるまで生バイト列全体を `Vec<u8>` として保持することはありません
-/// （P08-5「本文の全量保持をやめ、索引 + オンデマンド読み出しへ
-/// 移行する」）。
+/// チャンク読み込みループ（整合性の再確認・キャンセル・抑制・先読み停止）の
+/// **唯一の実装**です（[`read_snapshotted_bytes_chunked`] もここへ委譲します）。
+/// この関数は**読み込んだ生バイト列を蓄積しません**。各チャンクは `on_chunk` へ
+/// 一時的に渡されるだけで、この関数の呼び出しが終わるまで生バイト列全体を
+/// `Vec<u8>` として保持することはありません（P08-5「本文の全量保持をやめ、
+/// 索引 + オンデマンド読み出しへ移行する」）。
 ///
 /// この理由により、`PERF-010` の「読み込みバッファの確保前に予約する」対象が
 /// なくなるため（保持するバッファ自体が存在しない）、`request.budget` へは
@@ -595,8 +552,11 @@ pub fn stream_snapshotted_bytes_chunked(
         on_chunk(&chunk_buffer[..this_chunk_len_usize], offset, snapshot_end);
     }
 
-    // 読み切った場合だけ最終確認を行う（[`read_snapshotted_bytes_chunked`] と
-    // 同じ条件。モジュール doc コメントの「不変条件」）。
+    // 読み切った場合だけ最終確認を行う（モジュール doc コメントの「不変条件」）。
+    // キャンセル・先読み停止による途中終了で確認しないのは、それらを整合性の
+    // エラーへ変えないためである（呼び出し側は結果を未完了として扱う）。
+    // 空ファイル（snapshot_end が 0）はループ本体を一度も通らないため、読んだ
+    // ものがない読み込みのためにファイルを開き直すことはしない。
     if !cancelled && !prefetch_stopped && offset > 0 {
         verifier.after_last_chunk()?;
     }
