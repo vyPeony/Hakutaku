@@ -169,8 +169,45 @@
 //
 // 素の矢印キー・PageUp／PageDown・修飾キー無しの Home／End は従来どおり
 // ブラウザ既定のスクロールに任せる（`handleViewportKeydown` の doc コメント）。
-// フォーカスの可視化・ARIA・Tab 順序は Issue #50 の担当範囲であり、ここでは
-// 扱わない（選択の可動端は `.log-row--selected` のハイライトでのみ見える）。
+//
+// # アクセシビリティ（Issue #50）
+//
+// ## 支援技術への表現
+//
+// ビューポートは `role="grid"`（`src/index.html`）で、総行数を
+// `aria-rowcount` として持つ。行 DOM は可視範囲ぶんしか存在しないため、各行に
+// 絶対行番号 `aria-rowindex`（1始まり）を付けて位置を伝え、選択状態は
+// `aria-selected` で伝える（仮想化されたグリッドの標準的な表現。
+// `buildRowElement`）。総行数は読み込みの進行で伸びるため、`aria-rowcount` は
+// ツールバーの行数表示と同じ場所（`updateTotalItemsLabel`）で更新する。
+//
+// ## 再描画をまたぐフォーカスの保持
+//
+// 行 DOM はスクロールのたびに全て作り直される（`renderRows`）。作り直しの前に
+// フォーカスがその中にあると、要素ごと消えた時点でフォーカスは `<body>` へ
+// 落ち、キーボードだけで操作している利用者は現在地を失う（継続行バッジまで
+// Tab で進み、そこでスクロールが起きるだけで再現する）。そこで、作り直しの
+// **直前**に「どの行の・どの種類の要素にフォーカスがあったか」だけを控え
+// （`rememberFocusWithinRows`）、作り直した後に同じ行・同じ種類の要素が
+// あればそこへ戻す（`restoreFocusWithinRows`）。描画範囲の外へ出てしまい
+// 戻す先が無い場合は、`<body>` へ落とさずビューポートへ戻す。
+//
+// 控えるのは行インデックスと種別だけで、要素への参照は持たない（消える要素へ
+// の参照を残さないため。PERF-012 の「DOM に行データを保持しない」とも整合する）。
+//
+// ## 詳細パネルのフォーカスと Esc
+//
+// 継続行バッジで開いた詳細パネルへは、開いた直後にフォーカスを移す（開いた
+// 内容を読むのが目的の操作であり、フォーカスが元の位置に残ると、キーボードだけ
+// では開いた先へたどり着けない）。閉じたときは開く操作をしたバッジへ戻す
+// （`state.detailPanelReturnRowIndex`）。バッジが描画範囲の外へ出ていれば
+// ビューポートへ戻す。
+//
+// `Esc` は2つの用途を持つ（`handleViewportKeydown`）。**詳細パネルが開いて
+// いる間はパネルを閉じる操作を優先**し、選択解除（Issue #49）は行わない。
+// 順序を逆にすると、パネルを開いたまま選択もしている状態で Esc を押したとき、
+// 見えている変化（パネルが閉じる）が起きないまま選択だけが消え、利用者には
+// キーが効かなかったように見える。
 //
 // ## 新しい単一購読（PERF-012: 行ごとのイベントリスナーを追加しない設計の継続）
 //
@@ -555,6 +592,17 @@ const state = {
    * @type {ReturnType<typeof setTimeout> | null}
    */
   copyTimeoutTimerId: null,
+  /**
+   * 詳細パネルを閉じたときにフォーカスを戻す先の行（Issue #50）。パネルを
+   * 開いた継続行バッジの行インデックスで、パネルが閉じている間は `null`。
+   *
+   * 要素そのものではなく行インデックスを持つのは、パネルを開いている最中にも
+   * 行 DOM が作り直され得る（スクロール、チャンクの到着）ためである。要素への
+   * 参照を残すと、既に文書から外れた要素へフォーカスを当てようとして無反応に
+   * なる（フォーカスは `<body>` に残る）。
+   * @type {number | null}
+   */
+  detailPanelReturnRowIndex: null,
 };
 
 /** @type {{
@@ -662,6 +710,10 @@ export function initLogView(retentionLimits) {
   elements.jumpInput.addEventListener("keydown", handleJumpInputKeydown);
   elements.jumpInput.addEventListener("input", handleJumpInputInput);
   elements.detailPanelCloseButton.addEventListener("click", hideDetailPanel);
+  // 詳細パネルの Esc（Issue #50）。パネルを開くとフォーカスはパネルへ移るため、
+  // ビューポートの keydown（`handleViewportKeydown`）には届かない。パネル自身にも
+  // 1つだけ購読を置く（行数に比例しないため PERF-012 の累積源にならない）。
+  elements.detailPanel.addEventListener("keydown", handleDetailPanelKeydown);
 
   renderVisibleRows();
 }
@@ -787,9 +839,18 @@ export function showEmptyState() {
   scheduleRender();
 }
 
-/** ツールバーの総行数表示を現在の `state.totalItems` へ更新する。 */
+/**
+ * 総行数の表示を現在の `state.totalItems` へ更新する。
+ *
+ * 更新先は2つある。目で読むツールバーの行数表示と、支援技術が読む
+ * ビューポート（`role="grid"`）の `aria-rowcount`（Issue #50）。両方をここで
+ * 同時に更新するのは、片方だけを更新する経路ができると、行一覧の総数が画面と
+ * 支援技術とで食い違うためである（総行数は表示集合の切り替えだけでなく、
+ * 読み込みの進行——`syncTotalItemsFromResponse`——でも変わる）。
+ */
 function updateTotalItemsLabel() {
   elements.totalItemsLabel.textContent = `${state.totalItems.toLocaleString("ja-JP")} 行`;
+  elements.viewport.setAttribute("aria-rowcount", String(state.totalItems));
 }
 
 /**
@@ -1403,11 +1464,17 @@ function lookupItem(rowIndex) {
  * `textContent = ""` だけで安全に行える。使い回しによる状態の取り違えも
  * 起きない）。
  *
+ * キーボードフォーカスだけは、この作り直しをまたいで引き継ぐ（Issue #50。
+ * モジュール冒頭のコメント「再描画をまたぐフォーカスの保持」参照）。控えるのは
+ * **破棄する前**でなければならない（破棄した時点で `document.activeElement` は
+ * `<body>` になり、どこにあったかを知る手掛かりが消える）。
+ *
  * @param {import("./virtual_scroll.js").VisibleRange} visibleRange
  */
 function renderRows(visibleRange) {
   const { rows, topSpacer, bottomSpacer } = elements;
 
+  const focusMemo = rememberFocusWithinRows();
   const previousRowCount = rows.children.length;
   rows.textContent = "";
   retentionStats.recordRowNodesRemoved(previousRowCount);
@@ -1424,6 +1491,7 @@ function renderRows(visibleRange) {
   }
   rows.appendChild(fragment);
   retentionStats.recordRowNodesCreated(createdCount);
+  restoreFocusWithinRows(focusMemo);
 
   const { topHeightPx, bottomHeightPx } = computeSpacerHeightsForScroll({
     startIndex: visibleRange.startIndex,
@@ -1433,6 +1501,91 @@ function renderRows(visibleRange) {
   });
   topSpacer.style.height = `${topHeightPx}px`;
   bottomSpacer.style.height = `${bottomHeightPx}px`;
+}
+
+/**
+ * 行 DOM の中でフォーカスを受け取れる要素のセレクタ（Issue #50）。現時点では
+ * 継続行バッジ（`<button>`）だけ。
+ *
+ * 1つでも配列で持つのは、行の中へフォーカス可能な要素を足したときに、控える側
+ * （`rememberFocusWithinRows`）と戻す側（`restoreFocusWithinRows`）の対応を
+ * この1箇所の変更だけで保てるようにするため。片方だけに足すと、控えた種別を
+ * 戻せずに毎回ビューポートへ落ちる（気付きにくい退行になる）。
+ *
+ * ここに挙げる要素は、控えた行インデックスと組み合わせて復元先を引けるよう、
+ * `data-row-index` を持っていること（`buildRowElement`）。
+ */
+const FOCUSABLE_ROW_ELEMENT_SELECTORS = [".log-row__badge--continuation"];
+
+/**
+ * @typedef {Object} RowFocusMemo 行 DOM を作り直す直前のフォーカス位置
+ * （Issue #50）。要素への参照は持たない（作り直しで消える要素を掴んだままに
+ * しないため。モジュール冒頭のコメント「再描画をまたぐフォーカスの保持」参照）。
+ * @property {number} rowIndex フォーカスがあった行（表示集合内のインデックス）。
+ * @property {string | null} selector 復元先を引くためのセレクタ。行の中では
+ *   あるがどの種別にも当たらない場合は `null`（＝復元先を特定できないため、
+ *   ビューポートへ戻す）。
+ */
+
+/**
+ * フォーカスが行 DOM の中にあれば、その位置を控える（Issue #50）。
+ *
+ * `renderRows` が `rows.textContent = ""` を実行する**前**に呼ぶこと。実行後は
+ * `document.activeElement` が `<body>` になり、位置を知る手掛かりが無くなる。
+ *
+ * @returns {RowFocusMemo | null} フォーカスが行 DOM の外（別のペイン、
+ *   ビューポート自身、ジャンプ入力欄など）にある場合は `null`。この場合は
+ *   再描画がフォーカスに触れてはならない（利用者が別の場所で操作している）。
+ */
+function rememberFocusWithinRows() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !elements.rows.contains(active)) {
+    return null;
+  }
+
+  for (const selector of FOCUSABLE_ROW_ELEMENT_SELECTORS) {
+    const element = active.closest(selector);
+    if (element === null) {
+      continue;
+    }
+    const rowIndex = parseRowIndex(element) ?? parseRowIndex(element.closest(".log-row"));
+    if (rowIndex !== null) {
+      return { rowIndex, selector };
+    }
+  }
+
+  const rowIndex = parseRowIndex(active.closest(".log-row"));
+  return rowIndex === null ? null : { rowIndex, selector: null };
+}
+
+/**
+ * `rememberFocusWithinRows` が控えた位置へフォーカスを戻す（Issue #50）。
+ *
+ * 同じ行・同じ種別の要素が今回も描画されていればそこへ戻す。スクロールで
+ * その行が描画範囲の外へ出た場合は戻す先が無いが、**そのまま `<body>` へ
+ * 落とさず**ビューポートへ移す（ビューポートは `tabindex="0"` でフォーカス
+ * 可能であり、そこからスクロール・選択・Tab の続きをそのまま行える）。
+ *
+ * `preventScroll: true` は必須である。既定の `focus()` は対象が見える位置まで
+ * スクロールを起こすため、仮想スクロールでは「描画 → フォーカス復元 →
+ * 勝手なスクロール → 再描画」が連鎖し、スクロール位置が利用者の操作と無関係に
+ * 動く（`.log-viewport` の `overflow-anchor: none` と同じ趣旨の予防）。
+ *
+ * @param {RowFocusMemo | null} memo
+ */
+function restoreFocusWithinRows(memo) {
+  if (memo === null) {
+    return;
+  }
+  const restored =
+    memo.selector === null
+      ? null
+      : elements.rows.querySelector(`${memo.selector}[data-row-index="${memo.rowIndex}"]`);
+  if (restored instanceof HTMLElement) {
+    restored.focus({ preventScroll: true });
+    return;
+  }
+  elements.viewport.focus({ preventScroll: true });
 }
 
 /**
@@ -1461,6 +1614,22 @@ function renderRows(visibleRange) {
  * 変更はコピー結果には一切影響しない（Issue #85 以降のコピーは常に原文
  * そのまま）。
  *
+ * # 支援技術への表現（Issue #50）
+ *
+ * ビューポートの `role="grid"`（`src/index.html`）に対応する行として、
+ * `role="row"`・`aria-rowindex`（1始まりの絶対行番号）・`aria-selected` を
+ * 付ける。仮想スクロールのため行 DOM は可視範囲ぶんしか無く、DOM 上の並び順
+ * だけでは「全体の何行目か」を表せないため、`aria-rowindex` が位置を伝える
+ * 唯一の手掛かりになる。
+ *
+ * 行の中身は `role="gridcell"` を1つ置き、その中へ既存の列（行番号・読み込み元
+ * ラベル・バッジ・本文）をまとめる。列ごとに `gridcell` を分けないのは、列の
+ * 有無が行ごとに変わる（読み込み元ラベルは統合表示のときだけ、バッジは該当行
+ * だけ）ためで、分けると同じ列位置が行ごとに違う内容を指すことになり、
+ * `aria-colindex` を正しく振れない。この要素は `display: contents`
+ * （`src/styles.css` の `.log-row__cell`）でボックスを生成しないため、
+ * 見た目と既存のレイアウト（flex の列指定・`column-gap`）は変わらない。
+ *
  * @param {number} rowIndex
  * @returns {HTMLDivElement}
  */
@@ -1472,6 +1641,9 @@ function buildRowElement(rowIndex) {
   // 表示外の行でも rowIndex 自体は確定しているため、item が未取得
   // （プレースホルダー表示）でも選択できる。
   row.dataset.rowIndex = String(rowIndex);
+  row.setAttribute("role", "row");
+  // aria-rowindex は1始まり（`data-row-index` は0始まりの内部インデックス）。
+  row.setAttribute("aria-rowindex", String(rowIndex + 1));
 
   const item = lookupItem(rowIndex);
 
@@ -1487,15 +1659,26 @@ function buildRowElement(rowIndex) {
     // 橙系とは別系統の色）。
     row.classList.add("log-row--unconfirmed");
   }
-  if (isRowSelected(state.selection, rowIndex)) {
+  const selected = isRowSelected(state.selection, rowIndex);
+  if (selected) {
     // P10（COPY-001）: 選択中の行をハイライトする。
     row.classList.add("log-row--selected");
   }
+  // 選択は色（`.log-row--selected`）だけでは支援技術に伝わらない（Issue #50）。
+  // 選択の有無に関わらず属性を置き、状態が「無い」ことも伝える。
+  row.setAttribute("aria-selected", String(selected));
+
+  // 以降の列は、行の唯一のセル（role="gridcell"）の中へ入れる。`row` へ直接
+  // 追加すると、role="row" が要求する構造（中身はセル）を満たさなくなる。
+  const cell = document.createElement("span");
+  cell.className = "log-row__cell";
+  cell.setAttribute("role", "gridcell");
+  row.appendChild(cell);
 
   const lineNumber = document.createElement("span");
   lineNumber.className = "log-row__lineno";
   lineNumber.textContent = item ? String(item.source_line_number) : "";
-  row.appendChild(lineNumber);
+  cell.appendChild(lineNumber);
 
   if (state.isMerged) {
     // P09-1（LOG-007）: 統合表示では、どのファイル由来かを行ごとに識別
@@ -1504,7 +1687,7 @@ function buildRowElement(rowIndex) {
     const source = document.createElement("span");
     source.className = "log-row__source";
     source.textContent = item ? item.source_label : "";
-    row.appendChild(source);
+    cell.appendChild(source);
   }
 
   if (item && !item.confirmed) {
@@ -1517,7 +1700,7 @@ function buildRowElement(rowIndex) {
     unconfirmedBadge.textContent = "未確定";
     unconfirmedBadge.title =
       "ログファイルへの書き込みが完了していない可能性がある末尾の行です（LOG-026）。解析エラーではありません。";
-    row.appendChild(unconfirmedBadge);
+    cell.appendChild(unconfirmedBadge);
   }
 
   if (item && item.continuation_count > 0) {
@@ -1530,7 +1713,7 @@ function buildRowElement(rowIndex) {
     // クリック委譲（handleRowsClick）が行を特定するための添字。行データそのもの
     // （item への参照）は持たせない（PERF-012: DOM に行データを保持しない）。
     continuationBadge.dataset.rowIndex = String(rowIndex);
-    row.appendChild(continuationBadge);
+    cell.appendChild(continuationBadge);
   }
 
   const text = document.createElement("span");
@@ -1549,7 +1732,7 @@ function buildRowElement(rowIndex) {
   } else {
     text.textContent = item.raw_text;
   }
-  row.appendChild(text);
+  cell.appendChild(text);
 
   return row;
 }
@@ -1585,7 +1768,7 @@ function handleRowsClick(event) {
     // 必ずキャッシュに残っているはず）。
     return;
   }
-  showDetailPanel(item);
+  showDetailPanel(item, rowIndex);
 }
 
 /**
@@ -1871,13 +2054,26 @@ function computeDragAutoScrollStepPx(pointerClientY) {
   return direction * magnitude;
 }
 
+/** 詳細パネルが開いているか（Issue #50。`Esc` の優先順位の判定に使う）。 */
+function isDetailPanelOpen() {
+  return elements !== null && !elements.detailPanel.hidden;
+}
+
 /**
  * 継続行を含む項目の全文（改行を保持）を下部の詳細パネルへ表示する
  * （`LOG-014`）。
  *
+ * 開いた直後にパネルへフォーカスを移す（Issue #50）。パネルを開く操作は
+ * 「開いた内容を読む」ためのものであり、フォーカスがバッジに残ったままだと、
+ * キーボードだけで操作している利用者はパネルの本文へたどり着けない
+ * （行一覧の中を Tab で進んでもパネルは行一覧の外にある）。閉じたときに
+ * バッジへ戻せるよう、開いた行を控える。
+ *
  * @param {LogItemDto} item
+ * @param {number} rowIndex 開く操作をした継続行バッジの行。閉じたときの
+ *   フォーカスの戻し先に使う。
  */
-function showDetailPanel(item) {
+function showDetailPanel(item, rowIndex) {
   const { detailPanel, detailPanelTitle, detailPanelBody } = elements;
   const totalLines = item.continuation_count + 1;
   detailPanelTitle.textContent =
@@ -1889,13 +2085,67 @@ function showDetailPanel(item) {
   // pre-wrap（styles.css）で改行を保ったまま表示する。
   detailPanelBody.textContent = item.raw_text;
   detailPanel.hidden = false;
+  state.detailPanelReturnRowIndex = rowIndex;
+  // hidden を外した**後**でなければフォーカスは移らない（非表示の要素は
+  // フォーカスを受け取れない）。preventScroll は、パネルが開いたときに
+  // 行一覧側のスクロール位置が動かないようにするため。
+  detailPanel.focus({ preventScroll: true });
 }
 
-/** 詳細パネルを閉じ、内容を空にする。 */
+/**
+ * 詳細パネルを閉じ、内容を空にする。
+ *
+ * 閉じたときにパネルの中へフォーカスが残っていた場合は、開く操作をした継続行
+ * バッジへ戻す（Issue #50）。バッジが描画範囲の外へ出ている（閉じるまでの間に
+ * スクロールした）場合はビューポートへ戻す。どちらの場合も `<body>` へ落とさ
+ * ないことが要点で、落とすとキーボード操作の現在地が失われる。
+ *
+ * パネルの外にフォーカスがある場合は動かさない。表示集合の切り替え
+ * （`activateDisplaySet`）・空表示（`showEmptyState`）からも呼ばれるため、
+ * 利用者が左ペインなど別の場所を操作している最中にフォーカスを奪わない。
+ */
 function hideDetailPanel() {
-  elements.detailPanel.hidden = true;
+  const { detailPanel } = elements;
+  const hadFocusInside = detailPanel.contains(document.activeElement);
+  const returnRowIndex = state.detailPanelReturnRowIndex;
+
+  detailPanel.hidden = true;
   elements.detailPanelTitle.textContent = "";
   elements.detailPanelBody.textContent = "";
+  state.detailPanelReturnRowIndex = null;
+
+  if (!hadFocusInside) {
+    return;
+  }
+  const badge =
+    returnRowIndex === null
+      ? null
+      : elements.rows.querySelector(
+          `.log-row__badge--continuation[data-row-index="${returnRowIndex}"]`,
+        );
+  if (badge instanceof HTMLElement) {
+    badge.focus({ preventScroll: true });
+    return;
+  }
+  elements.viewport.focus({ preventScroll: true });
+}
+
+/**
+ * 詳細パネル上の `Esc`（Issue #50）。パネルを開くとフォーカスはパネルへ移り、
+ * ビューポートの `keydown`（`handleViewportKeydown`）には届かなくなるため、
+ * パネル自身にも同じ操作を用意する。
+ *
+ * 修飾キーを伴う `Esc` は対象にしない（`handleViewportKeydown` の選択解除と
+ * 同じ扱い。将来の別の割り当てと衝突させない）。
+ *
+ * @param {KeyboardEvent} event
+ */
+function handleDetailPanelKeydown(event) {
+  if (event.key !== "Escape" || event.ctrlKey || event.altKey || event.shiftKey) {
+    return;
+  }
+  event.preventDefault();
+  hideDetailPanel();
 }
 
 /**
@@ -1988,6 +2238,10 @@ function handleJumpInputInput() {
  *     組み合わせだけを扱い、Ctrl や Alt を伴う場合は対象外にする（将来の
  *     別の割り当てと衝突させない）
  *
+ * Issue #50 で、`Esc` に**詳細パネルを閉じる**用途が加わった。パネルが開いて
+ * いる間はそちらを優先し、選択解除（Issue #49）へは進まない（順序依存。
+ * モジュール冒頭のコメント「詳細パネルのフォーカスと Esc」参照）。
+ *
  * scrollHeight クランプ対応との関係: Ctrl+Home（`scrollTop = 0`）
  * と Ctrl+End（`scrollTop = viewport.scrollHeight`。ブラウザが実際の最大値へ
  * 自動的にクランプする）は、`computeVisibleRangeForScroll` の比例写像でも
@@ -1999,6 +2253,12 @@ function handleJumpInputInput() {
  */
 function handleViewportKeydown(event) {
   if (event.key === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+    // Issue #50: 詳細パネルが開いていれば、閉じる操作が選択解除より優先する。
+    if (isDetailPanelOpen()) {
+      event.preventDefault();
+      hideDetailPanel();
+      return;
+    }
     handleClearSelectionRequest(event);
     return;
   }
@@ -2051,6 +2311,9 @@ function handleSelectAllRequest() {
  * 選択が空のときは既定動作を止めない。Esc はモーダルダイアログを閉じる操作
  * （`src/error_panel.js` の <dialog> ネイティブの挙動）などにも使われるため、
  * 「選択解除として実際に働いたとき」だけ `preventDefault` する。
+ *
+ * 詳細パネルが開いている間はここへ到達しない（Issue #50。呼び出し元の
+ * `handleViewportKeydown` がパネルを閉じる操作を優先する）。
  *
  * 余白のクリックによる解除は用意しない（ドラッグ選択の開始・終了と紛らわしく、
  * 意図しない解除が起きやすいため。Issue #49 の裁定）。

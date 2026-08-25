@@ -124,6 +124,12 @@ const LIST_TARGETS_FAILURE_LIMIT = 5;
  */
 const MERGED_VIEW_TEMPORARILY_DISABLED = true;
 
+/**
+ * `role="tabpanel"`（ビュー領域）の DOM ID（Issue #50）。タブの
+ * `aria-controls` と、パネル側の `aria-labelledby` の両方から参照する。
+ */
+const VIEW_PANEL_ID = "view-area";
+
 /** モジュール内部状態。 */
 const state = {
   /** @type {string[]} `get_config_status` の `data_source_names`（CFG-003／PROD-006）。 */
@@ -494,6 +500,9 @@ export function initShell({ retentionLimits, dataSourceNames }) {
       document.getElementById("open-file-button")
     ),
     tabBar: document.getElementById("tab-bar"),
+    // Issue #50: role="tabpanel"（src/index.html）。どのタブの内容かを示す
+    // aria-labelledby を renderTabBar が切り替えのたびに張り替える。
+    viewArea: document.getElementById(VIEW_PANEL_ID),
     mergedViewToggle: /** @type {HTMLButtonElement} */ (
       document.getElementById("merged-view-toggle")
     ),
@@ -1803,8 +1812,16 @@ function buildReparseSelect(id, labelText, defaultOptionText, options, container
 /**
  * 上部のタブバーを再描画する（`LOG-015`。分割表示は作らない）。統合表示
  * （P09-1）ON の間は、ファイル別タブの代わりに単一の疑似タブを表示する。
+ *
+ * タブ要素は毎回すべて作り直すため、キーボードフォーカスがタブバーの中に
+ * あった場合はここで引き継ぐ（Issue #50）。引き継がないと、タブを Enter で
+ * 選んだ瞬間にフォーカスが `<body>` へ落ち、続けて ←／→ でタブを移れなく
+ * なる（キーボードだけの操作が1回で行き止まりになる）。
  */
 function renderTabBar() {
+  // 作り直す**前**に控える（作り直した後は activeElement が `<body>` になる）。
+  const focusedTabElementId = readFocusedTabElementId();
+
   elements.tabBar.textContent = "";
   const fragment = document.createDocumentFragment();
   if (state.mergedViewEnabled) {
@@ -1815,18 +1832,195 @@ function renderTabBar() {
     }
   }
   elements.tabBar.appendChild(fragment);
+
+  normalizeTabBarTabIndex();
+  updateViewPanelLabelling();
+  restoreTabBarFocus(focusedTabElementId);
+}
+
+/**
+ * タブ要素の DOM ID を組み立てる（Issue #50）。ID が要るのは、パネル側の
+ * `aria-labelledby` からタブを指すためと、再描画をまたいで「どのタブに
+ * フォーカスがあったか」を照合するため。
+ *
+ * @param {number | "merged"} targetId 統合表示の疑似タブは対象 ID を持たない
+ *   ため `"merged"` を使う。
+ */
+function tabElementId(targetId) {
+  return `tab-${targetId}`;
+}
+
+/** 現在描画されているタブ要素（`role="tab"`）を左から順に返す。 */
+function readTabElements() {
+  return /** @type {HTMLElement[]} */ (
+    Array.from(elements.tabBar.querySelectorAll('[role="tab"]'))
+  );
+}
+
+/**
+ * フォーカスがタブバーの中にあれば、そのタブ要素の DOM ID を返す（Issue #50）。
+ * タブの中の「×」ボタンにあった場合も、そのタブの ID を返す（閉じたタブは
+ * 再描画後に存在しないため、後継のタブへ移す判断は `restoreTabBarFocus` が
+ * 行う）。
+ *
+ * @returns {string | null} タブバーの外（左ペイン、ログ表示領域など）にある
+ *   場合は `null`。その場合は再描画がフォーカスに触れてはならない。
+ */
+function readFocusedTabElementId() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !elements.tabBar.contains(active)) {
+    return null;
+  }
+  return active.closest('[role="tab"]')?.id ?? null;
+}
+
+/**
+ * roving tabindex（WAI-ARIA タブパターン。Issue #50）を1つのタブへ寄せる。
+ *
+ * タブリスト全体で Tab キーの停留点は常に1つだけにする（タブが10枚あっても
+ * Tab を10回押さずにログ表示領域へ進めるようにするため。`PERF-005` により
+ * 同時に開ける対象は10件まで）。タブの中の「×」ボタンも同じ扱いにしないと、
+ * 停留点が2倍に増えてしまう。
+ *
+ * @param {HTMLElement} target 停留点にするタブ要素。
+ * @param {HTMLElement[]} tabElements
+ */
+function setRovingTabIndex(target, tabElements) {
+  for (const element of tabElements) {
+    const isTarget = element === target;
+    element.tabIndex = isTarget ? 0 : -1;
+    const closeButton = element.querySelector(".tab__close");
+    if (closeButton instanceof HTMLElement) {
+      closeButton.tabIndex = isTarget ? 0 : -1;
+    }
+  }
+}
+
+/**
+ * タブバーが Tab キーで必ず到達できる状態にする（Issue #50）。
+ *
+ * 通常はアクティブなタブが停留点になる（`buildTabElement`）。アクティブな
+ * タブが1つも無い状態（一覧の再同期のずれで `activeTargetId` が取り残された
+ * 場合の防御）でも、先頭のタブを停留点にしてタブリストごと到達不能になるのを
+ * 防ぐ。
+ */
+function normalizeTabBarTabIndex() {
+  const tabElements = readTabElements();
+  if (tabElements.length === 0 || tabElements.some((element) => element.tabIndex === 0)) {
+    return;
+  }
+  setRovingTabIndex(tabElements[0], tabElements);
+}
+
+/**
+ * ビュー領域（`role="tabpanel"`）が、いまどのタブの内容かを示す
+ * `aria-labelledby` を張り替える（Issue #50）。タブが1枚も無いときは属性ごと
+ * 外す（存在しない ID を指したままにすると、パネルの名前が空のまま解決不能に
+ * なる）。
+ */
+function updateViewPanelLabelling() {
+  const activeTab = elements.tabBar.querySelector('[role="tab"][aria-selected="true"]');
+  if (activeTab === null) {
+    elements.viewArea.removeAttribute("aria-labelledby");
+    return;
+  }
+  elements.viewArea.setAttribute("aria-labelledby", activeTab.id);
+}
+
+/**
+ * 再描画の前にフォーカスがあったタブへ、フォーカスを戻す（Issue #50）。
+ *
+ * 同じタブが残っていればそこへ、無ければ（＝そのタブを閉じた）アクティブな
+ * タブへ移す。タブが1枚も無くなった場合は何もしない（戻す先が無いため。
+ * フォーカスは `<body>` に残るが、その状態ではタブリスト自体が存在しない）。
+ *
+ * @param {string | null} focusedTabElementId `readFocusedTabElementId` の結果。
+ */
+function restoreTabBarFocus(focusedTabElementId) {
+  if (focusedTabElementId === null) {
+    return;
+  }
+  const tabElements = readTabElements();
+  if (tabElements.length === 0) {
+    return;
+  }
+  const restored =
+    tabElements.find((element) => element.id === focusedTabElementId) ??
+    tabElements.find((element) => element.getAttribute("aria-selected") === "true") ??
+    tabElements[0];
+  setRovingTabIndex(restored, tabElements);
+  restored.focus();
+}
+
+/**
+ * タブ間のフォーカス移動（←／→／Home／End。WAI-ARIA タブパターン。
+ * Issue #50）。
+ *
+ * **フォーカスを移すだけで、タブは選択しない**（手動選択）。自動選択にすると、
+ * ←／→ を押すたびに表示集合の切り替え（`activateDisplaySet` によるキャッシュの
+ * 全破棄と再取得）が走る。目的のタブまで数回押しただけで、通り道のタブぶんの
+ * IPC と読み込みが無駄に発生するため、選択は `Enter`／`Space` の明示的な操作に
+ * 限る。
+ *
+ * @param {KeyboardEvent} event タブ要素で受けた `keydown`。
+ * @returns {boolean} このキーを扱ったか（呼び出し側は `true` なら以降の判定を
+ *   行わない）。
+ */
+function handleTabFocusNavigation(event) {
+  if (event.ctrlKey || event.altKey || event.shiftKey) {
+    // 将来の別の割り当て（Ctrl+Tab 等）と衝突させない。
+    return false;
+  }
+  const tabElements = readTabElements();
+  const current = /** @type {HTMLElement} */ (event.currentTarget);
+  const currentIndex = tabElements.indexOf(current);
+  if (currentIndex === -1) {
+    return false;
+  }
+
+  let nextIndex;
+  if (event.key === "ArrowRight") {
+    // 端で折り返す（タブパターンの既定の挙動。端で止まると、最後のタブから
+    // 先頭へ戻るのに押した回数ぶん戻す必要がある）。
+    nextIndex = (currentIndex + 1) % tabElements.length;
+  } else if (event.key === "ArrowLeft") {
+    nextIndex = (currentIndex - 1 + tabElements.length) % tabElements.length;
+  } else if (event.key === "Home") {
+    nextIndex = 0;
+  } else if (event.key === "End") {
+    nextIndex = tabElements.length - 1;
+  } else {
+    return false;
+  }
+
+  event.preventDefault();
+  setRovingTabIndex(tabElements[nextIndex], tabElements);
+  tabElements[nextIndex].focus();
+  return true;
 }
 
 /**
  * 統合表示 ON 時に表示する単一の疑似タブ（P09-1、`LOG-015`: 分割表示を
  * 作らないため、常に1つだけ表示する）。閉じるボタンは持たない（OFF にする
  * 操作はツールバーのトグルで行う）。
+ *
+ * Issue #50: 唯一のタブであってもフォーカス可能にする（`tabIndex = 0`）。
+ * 以前は `tabIndex` を付けていなかったため、統合表示 ON の間はタブリストごと
+ * キーボードから到達できず、タブが選択中であることを支援技術で確認する手段も
+ * 無かった。
  */
 function buildMergedTabElement() {
   const element = document.createElement("div");
   element.className = "tab tab--active tab--merged";
+  element.id = tabElementId("merged");
   element.setAttribute("role", "tab");
   element.setAttribute("aria-selected", "true");
+  element.setAttribute("aria-controls", VIEW_PANEL_ID);
+  element.tabIndex = 0;
+  // タブは1つしかないため ←／→ は自分自身へ戻るだけだが、ハンドラーは付ける
+  // （キーを押しても何も起きないのが「壊れている」のか「1つしかない」のか、
+  // 利用者には区別が付かない。既定のスクロール等が起きないことも揃う）。
+  element.addEventListener("keydown", handleTabFocusNavigation);
 
   const title = document.createElement("span");
   title.className = "tab__title";
@@ -1839,6 +2033,17 @@ function buildMergedTabElement() {
 /**
  * タブ1件分の DOM 要素を作る。
  *
+ * # キーボード操作（WAI-ARIA タブパターン。Issue #50）
+ *
+ * - `tabIndex` はアクティブなタブだけ `0`（roving tabindex。`setRovingTabIndex`）
+ * - ←／→／Home／End はフォーカスの移動だけ（`handleTabFocusNavigation`）
+ * - `Enter`／`Space` で選択（手動選択。移動と選択を分ける理由は
+ *   `handleTabFocusNavigation` の doc コメント参照）
+ * - `Delete` で閉じる。「×」ボタンは `role="tab"` の内側にあり、ARIA の規定に
+ *   より支援技術へは独立した部品として公開されない（`tab` ロールは子孫を
+ *   装飾扱いにする）。DOM 構造を変えずにキーボードから閉じる経路を確保する
+ *   ため、タブ自身のキー操作として用意する
+ *
  * @param {Tab} tab
  */
 function buildTabElement(tab) {
@@ -1846,14 +2051,24 @@ function buildTabElement(tab) {
 
   const element = document.createElement("div");
   element.className = `tab${isActive ? " tab--active" : ""}`;
+  element.id = tabElementId(tab.targetId);
   element.setAttribute("role", "tab");
   element.setAttribute("aria-selected", String(isActive));
-  element.tabIndex = 0;
+  element.setAttribute("aria-controls", VIEW_PANEL_ID);
+  element.tabIndex = isActive ? 0 : -1;
   element.addEventListener("click", () => activateExistingTab(tab.targetId));
   element.addEventListener("keydown", (event) => {
+    if (handleTabFocusNavigation(event)) {
+      return;
+    }
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       activateExistingTab(tab.targetId);
+      return;
+    }
+    if (event.key === "Delete") {
+      event.preventDefault();
+      handleTabClose(tab.targetId);
     }
   });
 
@@ -1867,6 +2082,8 @@ function buildTabElement(tab) {
   closeButton.className = "tab__close";
   closeButton.setAttribute("aria-label", `${tab.title} を閉じる`);
   closeButton.textContent = "×";
+  // roving tabindex の停留点をタブごとに2つへ増やさない（`setRovingTabIndex`）。
+  closeButton.tabIndex = isActive ? 0 : -1;
   closeButton.addEventListener("click", (event) => {
     event.stopPropagation();
     handleTabClose(tab.targetId);
