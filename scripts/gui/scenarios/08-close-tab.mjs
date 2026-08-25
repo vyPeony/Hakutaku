@@ -25,7 +25,7 @@ export async function run({ page, expect }) {
     return;
   }
 
-  // 左ペイン再設計: 行の状態は data-status-kind で読む。閉じる前は
+  // 左ペイン再設計（Issue #97）: 行の状態は data-status-kind で読む。閉じる前は
   // 読み込み済み（ready）で、タブを開いた対象として強調されている。
   const beforeRow = (await readTargetRows(page)).find((row) => row.name === target);
   expect.expectEqual("閉じる前の左ペインの状態が読み込み済み（ready）である", beforeRow?.kind, "ready");

@@ -38,7 +38,7 @@ export async function run({ page, expect }) {
   expect.expectEqual("開いたタブが選択状態になる", tab?.selected, true);
   expect.expectEqual("ファイル別タブには閉じるボタンがある", tab?.closable, true);
 
-  // 左ペイン再設計: 行の状態は data-status-kind で読む。読み込み完了で
+  // 左ペイン再設計（Issue #97）: 行の状態は data-status-kind で読む。読み込み完了で
   // ready になり、タブを開いた対象として強調（target-row--open）され、
   // アクティブなタブの行として current が付く。タブと左ペインが同じ実態を
   // 指していることの確認でもある。

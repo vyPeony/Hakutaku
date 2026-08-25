@@ -38,8 +38,9 @@ export async function run({ page, app, expect }) {
     targetRows.length,
     status?.data_source_names?.length ?? -1,
   );
-  // 左ペイン再設計により、行は「ファイル名＋必要時だけ右端の短い状態表示」の
-  // 1行表示になった（由来の印は表示しない）。状態は data-status-kind から読む。
+  // 左ペイン再設計（Issue #97）により、行は「ファイル名＋必要時だけ右端の
+  // 短い状態表示」の1行表示（由来の印は表示しない）。状態は data-status-kind
+  // から読む。
   expect.check(
     "起動直後はどの対象も未読み込み（not_opened）である",
     targetRows.length > 0 && targetRows.every((row) => row.kind === "not_opened"),

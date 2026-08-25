@@ -45,7 +45,7 @@
 //
 // このモジュールは「形式別ビューア」の実装の1つ（テキストログ向け）です。
 // 共通シェル（src/shell.js）はタブ切り替えのたびに、このモジュールが公開する
-// `logViewer`（`activate` / `showEmpty` の2関数だけの最小契約）を通じてだけ
+// `logViewer`（`FormatViewer` の最小契約）を通じてだけ
 // ビュー領域を操作します。表示集合の切り替えは、このモジュール内部の
 // 単一の `state` をタブ切り替えのたびに再初期化する方式です（複数タブ分の
 // 内部状態を同時に保持しません。保持上限はタブ間合計ではなく現在表示中の
@@ -54,7 +54,7 @@
 // 一切関与しません（`open_log_file` の呼び出しも shell.js が行います）。
 //
 // 将来 DICOM（P14）や SQLite 等の非テキスト形式のビューアを追加する場合も、
-// 同じ2関数（`activate` / `showEmpty`）を実装した別モジュールを用意すれば
+// 同じ契約（`FormatViewer`）を実装した別モジュールを用意すれば
 // 共通シェルへ差し込めます（`9.2` の責務分離のうち「ビュー」に対応する境界。
 // `docs/architecture/decisions/` へ ADR を起こすことを後続課題とします）。
 //
@@ -2740,15 +2740,52 @@ function formatCopyRejectionMessage(rejected) {
  */
 
 /**
+ * ビュー領域が非表示（display: none）にされる直前のスクロール位置の退避先
+ * （Issue #97 の左ペイン再設計）。display: none はスクロール可能ボックスを
+ * 破棄するため、ビューポートの scrollTop が 0 へ戻り、再表示しても復元
+ * されない。0 のままだと、次のタブ切り替え時に
+ * `rememberCurrentTabViewStateIfApplicable` が「先頭にいた」と誤って保存し、
+ * Issue #48 のタブごとの表示状態（スクロール位置）が破壊される。
+ *
+ * @type {number | null} `suspend` 済みで未 `resume` の間だけ非 null。
+ */
+let suspendedViewportScrollTop = null;
+
+/** ビュー領域を隠す直前に、現在のスクロール位置を退避する（`FormatViewer.suspend`）。 */
+function suspendViewport() {
+  suspendedViewportScrollTop = elements.viewport.scrollTop;
+}
+
+/**
+ * ビュー領域を再表示した直後に、退避したスクロール位置を書き戻す
+ * （`FormatViewer.resume`）。`suspend` されていなければ何もしない
+ * （隠していないビュー領域への呼び出しは無害）。
+ */
+function resumeViewport() {
+  if (suspendedViewportScrollTop === null) {
+    return;
+  }
+  elements.viewport.scrollTop = suspendedViewportScrollTop;
+  suspendedViewportScrollTop = null;
+}
+
+/**
  * @typedef {Object} FormatViewer 共通シェル（src/shell.js）が形式別ビューアを
  * 差し込むための最小契約（`9.2` の責務分離の「ビュー」に対応）。現時点では
  * このモジュール（テキストログビューア）が唯一の実装。
  * @property {(descriptor: DisplaySetDescriptor) => void} activate 指定した表示集合をビュー領域へ表示する。
  * @property {() => void} showEmpty ビュー領域を「何も選択されていない」状態にする。
+ * @property {() => void} suspend ビュー領域を非表示（display: none）にする直前に
+ *   呼ぶ。スクロール位置を退避する（Issue #97。`suspendedViewportScrollTop` の
+ *   doc コメント参照）。
+ * @property {() => void} resume ビュー領域を再表示した直後、`activate` を呼ぶ
+ *   より前に呼ぶ。退避したスクロール位置を書き戻す。
  */
 
 /** @type {FormatViewer} */
 export const logViewer = {
   activate: activateDisplaySet,
   showEmpty: showEmptyState,
+  suspend: suspendViewport,
+  resume: resumeViewport,
 };

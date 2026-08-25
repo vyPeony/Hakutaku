@@ -12,7 +12,7 @@
 //
 // このモジュールは形式に依存しない「共通シェル」であり、ログ表示の中身
 // （仮想スクロール等）を一切知らない。ビュー領域の操作は src/log_view.js が
-// 公開する `logViewer`（`activate` / `showEmpty` の2関数だけの契約）越しに
+// 公開する `logViewer`（`FormatViewer` の最小契約）越しに
 // だけ行う。将来 DICOM（P14）や SQLite 等の形式別ビューアを追加する場合、
 // このモジュールは対象の形式に応じて差し込むビュー実装を選ぶ小さな切り替えを
 // 持つだけで済む設計を意図している（現時点ではログビューア1種類のみのため
@@ -220,7 +220,7 @@ const state = {
   lastRows: [],
   /**
    * @type {"log" | "status"} 右ペインのビュー領域に何を表示しているか
-   * （左ペイン再設計）。`"log"` はタブの内容（`#view-area`。タブが無ければ
+   * （Issue #97 の左ペイン再設計）。`"log"` はタブの内容（`#view-area`。タブが無ければ
    * 空表示）、`"status"` は選択した対象の状態表示ペイン
    * （`#target-status-pane`。読み込み進捗・エラー詳細など、まだ本文を
    * 表示できない対象を選択している間だけ）。
@@ -385,8 +385,8 @@ function invokeListDatetimeFormats() {
 /**
  * 対象を明示的に再読み込みする（`LOG-028`、ADR-0007）。右ペインの
  * ツールバーに表示する「再読み込み」ボタン（`#view-reload-button`。
- * 左ペイン再設計で行内から移設）から、アクティブなタブの対象に対して
- * 呼ばれる（`renderViewToolbar` が Ready 状態のタブでだけ表示する）。
+ * 配置は Issue #97 の左ペイン再設計の裁定）から、アクティブなタブの対象に
+ * 対して呼ばれる（`renderViewToolbar` が Ready 状態のタブでだけ表示する）。
  *
  * `update_pending`（上限超過による前回の再読み込み拒否）が真かどうかに
  * かかわらず、いつでも呼び出せる。`update_pending` は「拒否された結果」を
@@ -424,7 +424,17 @@ async function handleReloadTargetClick(targetId) {
         totalItems,
       });
       await refreshTargets();
-      if (state.tabs.activeTargetId === targetId && !state.mergedViewEnabled) {
+      // `state.viewMode === "log"` の条件は、押下から応答までの間に状態表示
+      // ペインへ切り替わった競合への備え。hidden（display: none）のビュー
+      // ポートへ activate すると高さ 0 で可視範囲が空になり、hidden 中の
+      // scrollTop(0) を保存してしまう（`activateSessionTab` の不変条件と
+      // 同じ理由）。ペインから戻る経路（`activateExistingTab`）が更新済みの
+      // タブ内容で activate し直すため、ここで行う必要もない。
+      if (
+        state.tabs.activeTargetId === targetId &&
+        !state.mergedViewEnabled &&
+        state.viewMode === "log"
+      ) {
         const tab = state.tabs.tabs.find((candidate) => candidate.targetId === targetId);
         if (tab) {
           logViewer.activate({
@@ -548,7 +558,7 @@ export function initShell({ retentionLimits, dataSourceNames }) {
       document.getElementById("merged-view-toggle")
     ),
     // アクティブなタブの対象への操作と、選択した対象の状態表示ペイン
-    // （左ペイン再設計。src/index.html の #view-toolbar・#target-status-pane
+    // （Issue #97 の左ペイン再設計。src/index.html の #view-toolbar・#target-status-pane
     // のコメント参照）。
     viewReloadButton: /** @type {HTMLButtonElement} */ (
       document.getElementById("view-reload-button")
@@ -589,8 +599,8 @@ export function initShell({ retentionLimits, dataSourceNames }) {
 
   // 現時点ではビュー領域の実装はテキストログビューア（src/log_view.js）
   // 1種類のみのため、その初期化（DOM 要素の取得・スクロール購読）は
-  // ここで直接呼び出す。`logViewer`（activate / showEmpty の2関数）は
-  // タブ切り替えのたびに呼ぶ差し込み口の契約であり、1回限りの初期化は
+  // ここで直接呼び出す。`logViewer`（`FormatViewer` の契約）は
+  // タブ切り替えのたびに呼ぶ差し込み口であり、1回限りの初期化は
   // 契約に含めていない（形式ごとに必要な初期化パラメータが異なり得るため。
   // src/log_view.js のモジュール doc コメント参照）。
   initLogView(retentionLimits);
@@ -725,7 +735,7 @@ async function applyTargetsSnapshot() {
   notifyMergedViewStalenessIfTargetsChanged();
   processCompletedAutoActivations();
   renderTargetList();
-  // 右ペイン側の同期（左ペイン再設計）: アクティブなタブの状態に応じた
+  // 右ペイン側の同期（Issue #97 の左ペイン再設計）: アクティブなタブの状態に応じた
   // ツールバーの操作（再読み込み・再試行・選んで再解析）と、選択中の対象の
   // 状態表示ペイン（進捗・エラー詳細）を最新のスナップショットへ合わせる。
   renderViewExtras();
@@ -809,7 +819,7 @@ function handleListTargetsFailure() {
       stopPolling();
       showErrorBanner(
         "参照対象一覧の取得に繰り返し失敗したため、読み込み状況の自動更新を停止しました。" +
-          "「ファイルを開く」や一覧の「再試行」「再読み込み」などの操作を行うと再開します。",
+          "「ファイルを開く」や、対象を開く・再試行・再読み込みなどの操作を行うと再開します。",
       );
     }
     return;
@@ -875,14 +885,36 @@ function activateSessionTab(session) {
     totalItems: Number(status.total_items),
   };
   state.tabs = upsertTab(state.tabs, tab);
-  // タブの内容を表示するため、状態表示ペイン（左ペイン再設計）からは抜ける
-  // （読み込み進捗を見ていた対象が完了した場合、そのまま本文表示へ進む）。
+
+  // 別の対象の状態表示（エラーの5要素・読み込み進捗）を閲覧中は、
+  // バックグラウンドの完了で表示を奪わない（Issue #97 の左ペイン再設計。
+  // 新設計ではエラー詳細の表示場所がこのペインだけのため、読みかけの内容や
+  // 押そうとしていた「キャンセル」を黙って消さない）。タブの記録だけ更新し、
+  // 完了した対象自身を選択して見ていた場合だけ、そのまま本文表示へ進む。
+  // 選択中の行の鍵は、適用済みの最新スナップショットから引き直す
+  // （`state.lastRows` はこの時点でまだ前回描画のままであり得るため）。
+  if (state.viewMode === "status") {
+    const rows = buildTargetRows(state.dataSourceNames, state.sessionTargets);
+    const completedRow = findRowByTargetId(rows, session.target_id);
+    if (completedRow === null || completedRow.key !== state.selectedRowKey) {
+      renderTabBar();
+      renderTargetList();
+      renderViewExtras();
+      if (status.fell_back_to_raw_display) {
+        showRawDisplayFallbackNotice(tab.title);
+      }
+      return;
+    }
+  }
+
+  // タブの内容を表示するため、状態表示ペインからは抜ける（読み込み進捗を
+  // 見ていた対象が完了した場合、そのまま本文表示へ進む）。
   // `logViewer.activate` より前に #view-area の hidden を外す必要がある
   // （display: none のままだとビューポートの高さが 0 で描画され、可視範囲の
   // 計算が空になる）。
   exitStatusMode();
   // P09-1: 統合表示 ON の間は、ビュー領域を統合表示のまま維持する
-  // （LOG-015: 統合タブ1つだけを表示する）。タブの記録（state.tabs）は
+  // （`LOG-015`: 統合タブ1つだけを表示する）。タブの記録（state.tabs）は
   // 更新しておき、統合表示を OFF にした時点で正しく復元できるようにする。
   // 読み込みが完了した対象が統合結果へ入っていないことは、対象一覧の再取得
   // 側（`notifyMergedViewStalenessIfTargetsChanged`）が通知する（Issue #37）。
@@ -946,13 +978,14 @@ function stopPolling() {
 /** 「ファイルを開く」ボタンのクリックハンドラー（`PROD-016`／`LOG-020`）。 */
 async function handleOpenFileButtonClick() {
   elements.openFileButton.disabled = true;
+  const viewContext = captureViewContext();
   try {
     const response = await invokeOpenLogFile();
     if (response.kind === "cancelled") {
       // 利用者がダイアログをキャンセルした。正常応答なので何もしない。
       return;
     }
-    await applyLoadAttemptResponse(response);
+    await applyLoadAttemptResponse(response, viewContext);
   } catch (error) {
     console.error("open_log_file の呼び出しに失敗しました:", error);
     showErrorBanner("ログファイルを開く処理でエラーが発生しました。");
@@ -991,7 +1024,7 @@ async function handleMergedViewToggleClick() {
       const handle = await invokeEnableMergedView();
       state.mergedViewEnabled = true;
       // 統合表示はビュー領域（#view-area）へ表示するため、状態表示ペイン
-      // （左ペイン再設計）が開いていれば畳む。
+      // （Issue #97 の左ペイン再設計）が開いていれば畳む。
       if (state.viewMode === "status") {
         exitStatusMode();
       }
@@ -1015,7 +1048,7 @@ async function handleMergedViewToggleClick() {
     updateMergedViewToggleLabel();
     renderTabBar();
     // 統合表示の ON/OFF は左ペインの強調（--current）とツールバーの操作の
-    // 表示条件にも影響する（左ペイン再設計）。
+    // 表示条件にも影響する（Issue #97 の左ペイン再設計）。
     renderTargetList();
     renderViewExtras();
   }
@@ -1110,7 +1143,7 @@ function restoreActiveTabView() {
 }
 
 /**
- * 左ペインの行クリックハンドラー。行の状態に応じて分岐する（左ペイン再設計:
+ * 左ペインの行クリックハンドラー。行の状態に応じて分岐する（Issue #97 の左ペイン再設計:
  * 行は「選択」の入口に徹し、選択した対象を右ペインへ表示する）。
  *
  * - 読み込み済み・キャンセル済み（部分読み込み）: 対応するタブへ切り替える
@@ -1128,7 +1161,7 @@ async function handleTargetRowClick(row) {
   if (row.status.kind === "not_opened") {
     // 押した直後から右ペインで応答を示す（`applyLoadAttemptResponse` が
     // 読み込み開始後に選択を最新の行へ張り直す）。統合表示 ON の間は
-    // ビュー領域を統合表示のまま維持するため選択しない（LOG-015。開く操作
+    // ビュー領域を統合表示のまま維持するため選択しない（`LOG-015`。開く操作
     // 自体は従来どおり許可し、完了はタブの記録と Issue #37 の通知に載る）。
     if (!state.mergedViewEnabled) {
       selectStatusRow(row.key);
@@ -1138,7 +1171,7 @@ async function handleTargetRowClick(row) {
   }
   if (row.status.kind === "loading" || row.status.kind === "error") {
     if (state.mergedViewEnabled) {
-      // 統合表示 ON の間はビュー領域を置き換えない（LOG-015）。無反応に
+      // 統合表示 ON の間はビュー領域を置き換えない（`LOG-015`）。無反応に
       // 見せないため、抑止と解除手順を通知する（Issue #37 と同じ形。同じ文の
       // バナーは1枚へ集約される〔Issue #11〕ため、押すたびに増えない）。
       showInfoBanner(
@@ -1165,6 +1198,7 @@ async function handleOpenConfiguredRow(name) {
     return;
   }
   state.pendingKeys.add(pendingKey);
+  const viewContext = captureViewContext();
   try {
     const response = await invokeOpenConfigDataSource(name);
     if (response.kind === "already_open") {
@@ -1175,18 +1209,20 @@ async function handleOpenConfiguredRow(name) {
       activateExistingTab(/** @type {number} */ (response.target_id));
       return;
     }
-    await applyLoadAttemptResponse(response);
+    await applyLoadAttemptResponse(response, viewContext);
   } catch (error) {
     console.error("open_config_data_source の呼び出しに失敗しました:", error);
     showErrorBanner(`"${name}" を開く処理でエラーが発生しました。`);
-    // 行クリック時に先行して選択した状態表示ペイン（handleTargetRowClick）が
-    // 「読み込みを開始しています…」のまま残らないよう、ログ表示へ戻す
-    // （IPC 自体の失敗で、一覧には反映されない経路）。
-    if (state.viewMode === "status" && state.selectedRowKey === pendingKey) {
-      fallBackToLogView();
-    }
   } finally {
     state.pendingKeys.delete(pendingKey);
+  }
+  // 行クリック時に先行して選択した状態表示ペイン（handleTargetRowClick）が
+  // 「読み込みを開始しています…」のまま残らないよう、要求の終了後に一度だけ
+  // 描画し直す。行が未読み込みのまま（対象が登録されない失敗・IPC 自体の
+  // 失敗）なら、renderStatusPane の not_opened ガードがログ表示へ戻す
+  // （`state.pendingKeys` はこの時点で解除済み）。
+  if (state.viewMode === "status" && state.selectedRowKey === pendingKey) {
+    renderViewExtras();
   }
 }
 
@@ -1210,17 +1246,19 @@ async function handleRetryClick(targetId, manualProfile, manualDatetimeFormat) {
     return;
   }
   state.pendingKeys.add(pendingKey);
+  const viewContext = captureViewContext();
   try {
     const response = await invokeRetryTarget(targetId, manualProfile, manualDatetimeFormat);
     if (response.kind === "not_found" || response.kind === "already_loading") {
       // "not_found" は一覧から既に除去されていた場合、"already_loading" は
       // 既に読み込み中で再試行を受け付けられない場合（Issue #31）。どちらも
       // 他操作との競合であり、ERR-001 の考え方に従って静かに一覧を再同期する
-      // だけに留める（読み込み中の行にはキャンセルボタンが出ている）。
+      // だけに留める（読み込み中の行を選択すれば、右ペインで進捗の確認と
+      // キャンセルができる）。
       await refreshTargets();
       return;
     }
-    await applyLoadAttemptResponse(response);
+    await applyLoadAttemptResponse(response, viewContext);
   } catch (error) {
     console.error("retry_target の呼び出しに失敗しました:", error);
     showErrorBanner("対象の再試行でエラーが発生しました。");
@@ -1233,7 +1271,7 @@ async function handleRetryClick(targetId, manualProfile, manualDatetimeFormat) {
  * アクセス拒否エラー表示の「管理者として新しいウィンドウで開く」ボタンの
  * クリックハンドラー（`PRIV-002`〜`004`、P11-2）。誤用防止のため、アクセス
  * 拒否時（`row.status.accessDenied === true`）だけこのボタンが表示される
- * （`buildTrailingContent` 参照）。
+ * （`buildStatusPaneContent` 参照）。
  *
  * `launch_elevated` は新しい昇格済みプロセスを起動するだけで、現在の
  * プロセス（このウィンドウ）は開いたまま維持される（`PRIV-003`）。既存の
@@ -1282,6 +1320,29 @@ async function handleCancelClick(targetId) {
 }
 
 /**
+ * 右ペインに何を表示しているかの文脈（`applyLoadAttemptResponse` の再選択
+ * ガード用）。読み込み開始の要求を送る直前に控え、応答が届いた時点で変わって
+ * いれば——利用者がその間に別のタブや行へ切り替えた——進捗表示への自動切り
+ * 替えを行わない（Issue #97 の左ペイン再設計。利用者の明示的な選択を奪い
+ * 返さない）。
+ *
+ * @returns {{ viewMode: "log" | "status", selectedRowKey: string | null }}
+ */
+function captureViewContext() {
+  return { viewMode: state.viewMode, selectedRowKey: state.selectedRowKey };
+}
+
+/**
+ * @param {ReturnType<typeof captureViewContext>} context
+ * @returns {boolean}
+ */
+function viewContextUnchanged(context) {
+  return (
+    state.viewMode === context.viewMode && state.selectedRowKey === context.selectedRowKey
+  );
+}
+
+/**
  * `open_log_file` / `open_config_data_source` / `retry_target` はいずれも
  * `loading` / `failed` を共通の形（`target_id`・`error` 等）で返す
  * （P07-2 により非同期化。読み込みそのものが完了する前に応答するため、
@@ -1292,8 +1353,11 @@ async function handleCancelClick(targetId) {
  * 処理してからこの関数へ渡すこと**（Issue #31 で追加した2つを含む）。
  *
  * @param {{ kind: "loading" | "failed", [key: string]: unknown }} response
+ * @param {ReturnType<typeof captureViewContext>} viewContextAtRequest 要求を
+ *   送る直前の表示文脈（`captureViewContext`）。応答までの間に利用者が表示を
+ *   切り替えていた場合、進捗表示への自動切り替えを抑止する。
  */
-async function applyLoadAttemptResponse(response) {
+async function applyLoadAttemptResponse(response, viewContextAtRequest) {
   if (response.kind === "loading") {
     const targetId = /** @type {number} */ (response.target_id);
     // 完了・失敗をポーリングで検出したら、タブを開く／エラーを表示する
@@ -1302,11 +1366,13 @@ async function applyLoadAttemptResponse(response) {
     state.pendingErrorNotice.add(targetId);
     await refreshTargets();
     // 読み込みを開始した対象を選択し、右ペインの状態表示ペインで進捗を示す
-    // （左ペイン再設計）。再取得の間に完了してタブが開いた場合
-    // （`activateSessionTab` が `viewMode` を "log" へ戻している）と、統合
-    // 表示 ON の間（LOG-015）は選択しない。アドホックに開いた対象は
-    // この時点で初めて一覧に現れるため、選択はここで行うしかない。
-    if (!state.mergedViewEnabled) {
+    // （Issue #97 の左ペイン再設計）。次の場合は選択しない。
+    // - 統合表示 ON の間（`LOG-015`。ビュー領域を統合表示のまま維持する）
+    // - 再取得の間に完了してタブが開いた場合（行が ready になっている。
+    //   `activateSessionTab` が本文表示へ進めている）
+    // - 要求から応答までの間に利用者が別のタブ・行へ切り替えていた場合
+    //   （表示文脈が変わっている。明示的な選択を奪い返さない）
+    if (!state.mergedViewEnabled && viewContextUnchanged(viewContextAtRequest)) {
       const row = findRowByTargetId(state.lastRows, targetId);
       if (row && (row.status.kind === "loading" || row.status.kind === "error")) {
         selectStatusRow(row.key);
@@ -1350,7 +1416,7 @@ function activateExistingTab(targetId) {
         "ツールバーの「時系列統合」を押して OFF にすると、選んだ対象の表示へ戻れます。",
     );
   } else {
-    // タブの内容を表示するため、状態表示ペイン（左ペイン再設計）からは抜ける。
+    // タブの内容を表示するため、状態表示ペイン（Issue #97 の左ペイン再設計）からは抜ける。
     // hidden の解除は `logViewer.activate` より前に行う（`activateSessionTab`
     // の同趣旨のコメント参照）。
     exitStatusMode();
@@ -1363,7 +1429,7 @@ function activateExistingTab(targetId) {
   }
   renderTabBar();
   // アクティブなタブの変化を左ペインの強調表示と右ペインのツールバーへ
-  // 反映する（左ペイン再設計）。
+  // 反映する（Issue #97 の左ペイン再設計）。
   renderTargetList();
   renderViewExtras();
 }
@@ -1391,7 +1457,7 @@ async function handleTabClose(targetId) {
   }
   renderTabBar();
   // タブを閉じた対象の行から強調表示（target-row--open／--current）を外す
-  // （左ペイン再設計）。直後の refreshTargets でも再描画されるが、一覧の
+  // （Issue #97 の左ペイン再設計）。直後の refreshTargets でも再描画されるが、一覧の
   // 再取得を待たずに反映する。
   renderTargetList();
   renderViewExtras();
@@ -1521,7 +1587,7 @@ function formatLoadingProgress(progress) {
  *   `entry.row`（最新の行データ）を参照して分岐する（クロージャで固定の
  *   `row` を捕まえると、DOM 再利用時に古い行データのまま動作してしまう）。
  * @property {HTMLSpanElement} nameEl
- * @property {HTMLSpanElement} badgeEl 右端の短い状態表示（左ペイン再設計。
+ * @property {HTMLSpanElement} badgeEl 右端の短い状態表示（Issue #97 の左ペイン再設計。
  *   読み込み中の進捗率・エラーなど、注意が要る状態だけを短く示す。
  *   `shortStatusFor`）。
  * @property {TargetRow} row 直近の行データ。クリックハンドラーが参照する。
@@ -1531,7 +1597,7 @@ function formatLoadingProgress(progress) {
  * 左ペイン1行ぶんの DOM 要素を新規に作り、`row` の内容を反映する
  * （`renderTargetList` が初めて見る `key` に対して呼ぶ）。
  *
- * 行は「ファイル名＋右端の短い状態表示」だけの1行表示（左ペイン再設計。
+ * 行は「ファイル名＋右端の短い状態表示」だけの1行表示（Issue #97 の左ペイン再設計。
  * 画面内に収まる件数を優先する）。状態別の操作・詳細は行内には置かず、
  * 行クリック（`handleTargetRowClick`）で右ペインへ表示する。
  *
@@ -1584,7 +1650,7 @@ function createTargetRowEntry(row) {
  * 状態クラスに加えて、タブを開いている対象の強調（`target-row--open`）と、
  * 現在右ペインに表示中の対象の強調（`target-row--current`。ログ表示中は
  * アクティブなタブの行、状態表示ペイン表示中は選択した行）を付け外しする
- * （左ペイン再設計）。`data-status-kind` は GUI 自動検査
+ * （Issue #97 の左ペイン再設計）。`data-status-kind` は GUI 自動検査
  * （`scripts/check-gui.mjs`）が状態を読むための機械可読の属性。
  *
  * @param {TargetRowEntry} entry
@@ -1600,35 +1666,58 @@ function updateTargetRowElement(entry, row) {
       : !state.mergedViewEnabled &&
         row.targetId !== null &&
         state.tabs.activeTargetId === row.targetId;
-  entry.li.className =
-    `target-row target-row--${row.status.kind}` +
+
+  // 読み込み中は 500ms 間隔のポーリングのたびに全行が通るため、同値の
+  // 書き込みは避ける（同値でも属性変更・Text ノードの作り直しが起き、
+  // 支援技術のツリー再計算とホバー中のツールチップ表示を乱すため）。
+  // 状態の種別は、スタイルが参照する修飾クラス（--open／--current）とは
+  // 別に、機械可読の data-status-kind だけで表す（CSS に状態別の規則は
+  // 無く、GUI 自動検査〔scripts/check-gui.mjs〕がこの属性を読む）。
+  const className =
+    "target-row" +
     (hasOpenTab ? " target-row--open" : "") +
     (isCurrent ? " target-row--current" : "");
-  entry.li.dataset.statusKind = row.status.kind;
-  entry.nameEl.textContent = row.displayName;
+  if (entry.li.className !== className) {
+    entry.li.className = className;
+  }
+  if (entry.li.dataset.statusKind !== row.status.kind) {
+    entry.li.dataset.statusKind = row.status.kind;
+  }
+  if (entry.nameEl.textContent !== row.displayName) {
+    entry.nameEl.textContent = row.displayName;
+  }
 
   const badge = shortStatusFor(row.status);
-  entry.badgeEl.textContent = badge.text;
-  entry.badgeEl.className = badge.className
+  if (entry.badgeEl.textContent !== badge.text) {
+    entry.badgeEl.textContent = badge.text;
+  }
+  const badgeClassName = badge.className
     ? `target-row__badge ${badge.className}`
     : "target-row__badge";
+  if (entry.badgeEl.className !== badgeClassName) {
+    entry.badgeEl.className = badgeClassName;
+  }
 
   // 行の見た目からは落とした詳細（状態の全文・タブの有無）を、ツールチップと
   // 支援技術向けの名前で補う。
   const description = `${row.displayName}（${statusLabelFor(row.status)}${
     hasOpenTab ? "、タブを開いています" : ""
   }）`;
-  entry.main.title = description;
-  entry.main.setAttribute("aria-label", description);
+  if (entry.main.title !== description) {
+    entry.main.title = description;
+    entry.main.setAttribute("aria-label", description);
+  }
   if (isCurrent) {
-    entry.main.setAttribute("aria-current", "true");
+    if (entry.main.getAttribute("aria-current") !== "true") {
+      entry.main.setAttribute("aria-current", "true");
+    }
   } else {
     entry.main.removeAttribute("aria-current");
   }
 }
 
 /**
- * 右端の短い状態表示（左ペイン再設計）。注意が要る状態だけを短く示し、
+ * 右端の短い状態表示（Issue #97 の左ペイン再設計）。注意が要る状態だけを短く示し、
  * 通常時（未読み込み・読み込み済み）は何も出さない。全文は行のツールチップ
  * （`statusLabelFor`）と右ペインで確認できる。
  *
@@ -1680,12 +1769,18 @@ function shortStatusFor(status) {
  * 選択肢が反映されない。
  *
  * 両リストは起動直後に一度取得したら以後変わらない前提のため、削除は
- * 行わない（`state.datetimeFormats` の doc コメント参照）。
+ * 行わない（`state.datetimeFormats` の doc コメント参照）。同じ前提により、
+ * 件数が既に揃っていれば（既定の選択肢1件＋一覧の全件）走査せず戻る
+ * （読み込み中のポーリングのたびに呼ばれるため、追記済みの定常状態を
+ * 無料にする）。
  *
  * @param {HTMLSelectElement} select
  * @param {{ value: string, text: string }[]} options
  */
 function syncReparseSelectOptions(select, options) {
+  if (select.options.length === options.length + 1) {
+    return;
+  }
   const existingValues = new Set(Array.from(select.options, (option) => option.value));
   for (const option of options) {
     if (existingValues.has(option.value)) {
@@ -1696,6 +1791,30 @@ function syncReparseSelectOptions(select, options) {
     element.textContent = option.text;
     select.appendChild(element);
   }
+}
+
+/**
+ * 「選んで再解析」のプロファイル選択肢（初回構築と遅延同期の両方で使う。
+ * 2箇所で別々に組み立てると、表示文字列の変更が片側だけに入り得るため
+ * ここへ集約する）。
+ *
+ * @returns {{ value: string, text: string }[]}
+ */
+function reparseProfileOptions() {
+  return state.logProfileNames.map((name) => ({ value: name, text: name }));
+}
+
+/**
+ * 「選んで再解析」の日時書式選択肢。要件 ID だけでは何の書式か分からない
+ * ため、パターンを併記する（例: `LOG-DT-004`（YYYY/MM/DD HH:mm:ss:SS））。
+ *
+ * @returns {{ value: string, text: string }[]}
+ */
+function reparseDatetimeFormatOptions() {
+  return state.datetimeFormats.map((format) => ({
+    value: format.id,
+    text: `${format.id}（${format.pattern}）`,
+  }));
 }
 
 /**
@@ -1728,7 +1847,8 @@ function statusLabelFor(status) {
 /**
  * `LOG-022` の「選んで再解析」操作（P07-2）。生表示へ退避した対象
  * （`fell_back_to_raw_display`）がアクティブなタブのとき、右ペインの
- * ツールバー（`#view-reparse`。左ペイン再設計で行内から移設）に表示する。
+ * ツールバー（`#view-reparse`。配置は Issue #97 の左ペイン再設計の裁定）に
+ * 表示する。
  * 既定はどちらの選択も「自動」側（選択肢の先頭、という裁定）で、モーダルには
  * しない（常設のツールバー UI）。
  *
@@ -1757,7 +1877,7 @@ function buildReparseControl(container, targetId) {
     "view-reparse-profile",
     "プロファイル",
     "指定しない",
-    state.logProfileNames.map((name) => ({ value: name, text: name })),
+    reparseProfileOptions(),
     container,
   );
 
@@ -1765,12 +1885,7 @@ function buildReparseControl(container, targetId) {
     "view-reparse-datetime-format",
     "日時書式",
     "自動判定",
-    // 要件 ID だけでは何の書式か分からないため、パターンを併記する
-    // （例: LOG-DT-004（YYYY/MM/DD HH:mm:ss:SS））。
-    state.datetimeFormats.map((format) => ({
-      value: format.id,
-      text: `${format.id}（${format.pattern}）`,
-    })),
+    reparseDatetimeFormatOptions(),
     container,
   );
 
@@ -1844,13 +1959,18 @@ const RELOAD_TITLE_UPDATE_PENDING =
 
 /**
  * 左ペインの行を「選択」し、右ペインを状態表示ペインへ切り替える
- * （左ペイン再設計）。まだ本文を表示できない対象（未読み込み・読み込み中・
+ * （Issue #97 の左ペイン再設計）。まだ本文を表示できない対象（未読み込み・読み込み中・
  * エラー）を選んだときだけ使う。読み込み済みの対象は従来どおりタブで
  * 表示する（`activateExistingTab`）。
  *
  * @param {string} key 選択する行の `TargetRow.key`。
  */
 function selectStatusRow(key) {
+  if (state.viewMode === "status" && state.selectedRowKey === key) {
+    // 既に同じ行を表示中（同じ行の再クリック、読み込み開始応答後の張り直し
+    // など）。状態の変化は通常の描画経路が反映済みのため、再描画しない。
+    return;
+  }
   state.viewMode = "status";
   state.selectedRowKey = key;
   renderTargetList();
@@ -1870,7 +1990,14 @@ function exitStatusMode() {
   state.selectedRowKey = null;
   state.statusPane = { shape: null, targetId: null, els: null };
   elements.statusPane.hidden = true;
-  elements.viewArea.hidden = false;
+  if (elements.viewArea.hidden) {
+    elements.viewArea.hidden = false;
+    // 再表示の直後・`logViewer.activate` より前に、隠す前のスクロール位置を
+    // 書き戻す（`renderStatusPane` の `logViewer.suspend()` と対。display: none
+    // はスクロール可能ボックスを破棄して scrollTop を 0 へ戻すため、放置すると
+    // 次のタブ切り替え時に Issue #48 のタブごとの表示状態へ 0 が保存される）。
+    logViewer.resume();
+  }
 }
 
 /**
@@ -1887,7 +2014,7 @@ function fallBackToLogView() {
 }
 
 /**
- * 右ペイン側の付帯表示をまとめて同期する（左ペイン再設計）。対象一覧の
+ * 右ペイン側の付帯表示をまとめて同期する（Issue #97 の左ペイン再設計）。対象一覧の
  * 再取得・タブの切り替え・選択の変更のたびに呼ぶ。
  */
 function renderViewExtras() {
@@ -1897,7 +2024,7 @@ function renderViewExtras() {
 
 /**
  * ツールバー（`#view-toolbar`）の、アクティブなタブの対象への操作を同期する
- * （左ペイン再設計で行内ボタンから移設）。
+ * （配置は Issue #97 の左ペイン再設計の裁定）。
  *
  * - 「再読み込み」（`LOG-028`）: Ready 状態の対象のタブでだけ表示する
  *   （`reload_target` は Ready 以外を拒否する）。`update_pending` の間は
@@ -1916,18 +2043,20 @@ function renderViewToolbar() {
     : null;
   const kind = session ? session.status.kind : null;
 
+  // 読み込み中のポーリングのたびに呼ばれるため、同値の書き込みは避ける
+  // （同値でも属性変更はアクセシビリティツリーを汚し、ホバー中のネイティブ
+  // ツールチップの表示を乱し得る）。固定のツールチップは src/index.html の
+  // 静的な title 属性で持つ。
   const showReload = kind === "ready";
-  elements.viewReloadButton.hidden = !showReload;
+  setHidden(elements.viewReloadButton, !showReload);
   const updatePending = showReload && Boolean(session.status.update_pending);
-  elements.viewReloadButton.title = updatePending
-    ? RELOAD_TITLE_UPDATE_PENDING
-    : RELOAD_TITLE_DEFAULT;
-  elements.viewUpdatePending.hidden = !updatePending;
-  elements.viewUpdatePending.title = RELOAD_TITLE_UPDATE_PENDING;
+  const reloadTitle = updatePending ? RELOAD_TITLE_UPDATE_PENDING : RELOAD_TITLE_DEFAULT;
+  if (elements.viewReloadButton.title !== reloadTitle) {
+    elements.viewReloadButton.title = reloadTitle;
+  }
+  setHidden(elements.viewUpdatePending, !updatePending);
 
-  elements.viewRetryButton.hidden = kind !== "cancelled_partial";
-  elements.viewRetryButton.title =
-    "キャンセルで中断した対象を、最初から読み込み直します。";
+  setHidden(elements.viewRetryButton, kind !== "cancelled_partial");
 
   const fellBackToRawDisplay =
     (kind === "ready" || kind === "cancelled_partial") &&
@@ -1936,25 +2065,42 @@ function renderViewToolbar() {
 }
 
 /**
+ * `hidden` の同値書き込みを避ける（同値でも `setAttribute` は変更記録を積む
+ * ため、ポーリング経路の描画では差分があるときだけ触る）。
+ *
+ * @param {HTMLElement} element
+ * @param {boolean} hidden
+ */
+function setHidden(element, hidden) {
+  if (element.hidden !== hidden) {
+    element.hidden = hidden;
+  }
+}
+
+/**
  * 「選んで再解析」（`#view-reparse`）の表示・非表示と中身を同期する。
  * 対象が変わらない限り DOM を作り直さず（選びかけの値とフォーカスを保つ。
  * Issue #48 と同じ理由）、遅延取得された選択肢の追記だけを行う
  * （`syncReparseSelectOptions`）。
+ *
+ * 非表示にするときも中身は破棄しない。読み込み中の行を一瞥する・別のタブを
+ * 見るなどの一時的な切り替えで、適用前の選びかけの値が消えないようにする
+ * ため（同じ対象へ戻れば shape が一致し、そのまま使える）。別の対象の
+ * 生表示タブへ切り替えた場合だけ shape の不一致で作り直す。ハンドラーが
+ * 対象 ID をクロージャで固定しているのはこのためでもある（隠れている間は
+ * 押せず、再表示時は同じ対象か作り直しかのどちらかで、古い ID で作用する
+ * 経路が無い）。
  *
  * @param {number | null} targetId 表示する対象。`null` なら非表示。
  */
 function renderReparseControl(targetId) {
   const container = elements.viewReparse;
   if (targetId === null) {
-    container.hidden = true;
-    if (state.reparseShape !== null) {
-      container.textContent = "";
-      state.reparseShape = null;
-    }
+    setHidden(container, true);
     return;
   }
 
-  container.hidden = false;
+  setHidden(container, false);
   const shape = String(targetId);
   if (state.reparseShape !== shape) {
     container.textContent = "";
@@ -1966,25 +2112,16 @@ function renderReparseControl(targetId) {
   const profileSelect = document.getElementById("view-reparse-profile");
   const formatSelect = document.getElementById("view-reparse-datetime-format");
   if (profileSelect instanceof HTMLSelectElement) {
-    syncReparseSelectOptions(
-      profileSelect,
-      state.logProfileNames.map((name) => ({ value: name, text: name })),
-    );
+    syncReparseSelectOptions(profileSelect, reparseProfileOptions());
   }
   if (formatSelect instanceof HTMLSelectElement) {
-    syncReparseSelectOptions(
-      formatSelect,
-      state.datetimeFormats.map((format) => ({
-        value: format.id,
-        text: `${format.id}（${format.pattern}）`,
-      })),
-    );
+    syncReparseSelectOptions(formatSelect, reparseDatetimeFormatOptions());
   }
 }
 
 /**
  * 状態表示ペイン（`#target-status-pane`）を現在の選択と一覧スナップショットへ
- * 同期する（左ペイン再設計）。
+ * 同期する（Issue #97 の左ペイン再設計）。
  *
  * 読み込み中は 500ms 間隔のポーリングのたびに呼ばれるため、ペインの形状
  * （状態種別・対象・昇格ボタンの有無）が変わらない限り DOM を作り直さず、
@@ -1997,9 +2134,11 @@ function renderReparseControl(targetId) {
  */
 function renderStatusPane() {
   if (state.viewMode !== "status" || state.selectedRowKey === null) {
-    elements.statusPane.hidden = true;
-    elements.viewArea.hidden = false;
-    state.statusPane = { shape: null, targetId: null, els: null };
+    // 既に畳まれていれば DOM に触れない（通常のログ表示中は描画のたびに
+    // ここを通るため、同値の属性書き換えとオブジェクト割り当てを避ける）。
+    if (!elements.statusPane.hidden) {
+      exitStatusMode();
+    }
     return;
   }
 
@@ -2009,13 +2148,21 @@ function renderStatusPane() {
     fallBackToLogView();
     return;
   }
+  if (row.status.kind === "not_opened" && !state.pendingKeys.has(row.key)) {
+    // 開く要求が走っていない未読み込み行（開く前に失敗して対象が登録されな
+    // かった、または選択中に残っていたタブを閉じて未読み込みへ戻った）。
+    // 「読み込みを開始しています…」の虚偽表示を残さず、ログ表示へ戻す
+    // （要求中は `state.pendingKeys` に行の鍵が立っている）。
+    fallBackToLogView();
+    return;
+  }
   if (row.status.kind === "ready" || row.status.kind === "cancelled_partial") {
-    // 選択中に読み込みが完了していた。完了した対象はタブで表示する。
+    // 選択中に読み込みが完了していた。完了した対象はタブで表示する
+    // （状態表示ペインからの離脱は `activateSessionTab` が行う）。
     const session = state.sessionTargets.find(
       (candidate) => candidate.target_id === row.targetId,
     );
     if (session) {
-      exitStatusMode();
       activateSessionTab(session);
     } else {
       fallBackToLogView();
@@ -2023,8 +2170,15 @@ function renderStatusPane() {
     return;
   }
 
-  elements.viewArea.hidden = true;
-  elements.statusPane.hidden = false;
+  if (!elements.viewArea.hidden) {
+    // 隠す直前にスクロール位置を退避する（`exitStatusMode` の
+    // `logViewer.resume()` と対）。
+    logViewer.suspend();
+    elements.viewArea.hidden = true;
+  }
+  if (elements.statusPane.hidden) {
+    elements.statusPane.hidden = false;
+  }
 
   const accessDenied = row.status.kind === "error" && Boolean(row.status.accessDenied);
   const shape = `${row.status.kind}|${row.targetId}|${accessDenied}`;
@@ -2042,8 +2196,8 @@ function renderStatusPane() {
  * `renderStatusPane` 参照）。変わり得るテキストを持つ要素の参照を返し、
  * 以後の更新は `refreshStatusPaneContent` がテキストの差し替えだけで行う。
  *
- * - 未読み込み・読み込み中: 進捗の文と「キャンセル」（P07-2。キャンセルは
- *   対象 ID が確定している読み込み中だけ）
+ * - 未読み込み・読み込み中: 進捗の文と「キャンセル」（`cancel_load`。
+ *   キャンセルは対象 ID が確定している読み込み中だけ）
  * - エラー: `ERR-002` の5要素（対象・発生位置・理由・継続可否・次の操作と、
  *   採番があればエラーコード。`src/error_panel.js` のダイアログと同じ構成）、
  *   「再試行」（`LOG-027`）、アクセス拒否なら「管理者として新しいウィンドウで
@@ -2440,7 +2594,7 @@ function buildMergedTabElement() {
  * @param {Tab} tab
  */
 function buildTabElement(tab) {
-  // 状態表示ペイン（左ペイン再設計）の間は、どのタブの内容も表示していない
+  // 状態表示ペイン（Issue #97 の左ペイン再設計）の間は、どのタブの内容も表示していない
   // ため、選択中のタブを作らない（role="tabpanel" の #view-area は hidden。
   // aria-selected="true" のタブが隠れたパネルを指したままにしない）。
   const isActive = state.viewMode === "log" && state.tabs.activeTargetId === tab.targetId;

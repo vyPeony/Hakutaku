@@ -46,7 +46,7 @@
           src/targets.js の状態モデルを使って描画する）。
 
           行は「ファイル名＋必要時だけ右端の短い状態表示」の1行表示に絞り、
-          画面内に収まる件数を優先する（左ペイン再設計。状態別の操作
+          画面内に収まる件数を優先する（Issue #97 の左ペイン再設計。状態別の操作
           〔キャンセル・再試行・昇格・選んで再解析〕は右ペイン側
           〔#target-status-pane・#view-toolbar〕へ集約した）。タブを開いて
           いる対象の行は強調表示で区別する。
@@ -96,8 +96,8 @@
               時系列統合: OFF
             </button>
             <!--
-              アクティブなタブの対象への操作（左ペイン再設計で行内ボタンから
-              移設）。表示・非表示は src/shell.js の renderViewToolbar が
+              アクティブなタブの対象への操作（配置は Issue #97 の左ペイン
+              再設計の裁定）。表示・非表示は src/shell.js の renderViewToolbar が
               アクティブなタブの状態に応じて切り替える。
 
               - #view-reload-button: 明示的な再読み込み（LOG-028、ADR-0007）。
@@ -113,8 +113,21 @@
                 対象の切り替わり時に組み立てる。
             -->
             <button type="button" id="view-reload-button" hidden>再読み込み</button>
-            <span id="view-update-pending" class="view-update-pending" hidden>更新未反映</span>
-            <button type="button" id="view-retry-button" hidden>再試行</button>
+            <span
+              id="view-update-pending"
+              class="view-update-pending"
+              title="前回の再読み込みは上限超過のため反映されませんでした。他の対象を閉じてから再試行してください。"
+              hidden
+              >更新未反映</span
+            >
+            <button
+              type="button"
+              id="view-retry-button"
+              title="キャンセルで中断した対象を、最初から読み込み直します。"
+              hidden
+            >
+              再試行
+            </button>
             <div class="view-reparse" id="view-reparse" hidden></div>
           </div>
           <!--
@@ -250,8 +263,8 @@
             </div>
           </div>
           <!--
-            選択した対象の状態表示ペイン（左ペイン再設計）。左ペインの行から
-            外した状態別の表示・操作——読み込み進捗とキャンセル（P07-2）、
+            選択した対象の状態表示ペイン（Issue #97 の左ペイン再設計）。左ペインの
+            行から外した状態別の表示・操作——読み込み進捗とキャンセル、
             エラーの5要素と再試行（LOG-027、ERR-002）、アクセス拒否時の昇格
             （PRIV-002）——を、行クリックで選択した対象についてここに表示する。
             読み込み済みの対象はタブ（#view-area）で表示するため、このペインが
