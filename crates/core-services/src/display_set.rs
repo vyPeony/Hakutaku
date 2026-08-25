@@ -83,7 +83,13 @@ pub struct ItemDto {
     /// ときと同じように扱えます（JSON へ直列化した結果も変わりません）。
     pub raw_text: Arc<str>,
     /// 読み込み元ラベル（来歴。`LOG-007` の下地）。
-    pub source_label: String,
+    ///
+    /// `raw_text` と同じ理由で `Arc<str>` です（`crate::item::SourceInfo::label`
+    /// の doc コメント参照）。同じソースの項目はすべて同じラベルを指すため、
+    /// 索引レベルの応答（[`IndexItemRef`]）からここまで参照カウントの増加だけで
+    /// 運びます。読み取りは `&str` へ自動的に参照外しされ、JSON へ直列化した
+    /// 結果も `String` だったときと変わりません。
+    pub source_label: Arc<str>,
     pub source_line_number: u64,
     /// 未確定行（書き込み途中の可能性がある末尾断片）ではないか（`LOG-026`）。
     /// 解析エラーとは区別する表示メタデータです（P08-1 追加）。
@@ -155,7 +161,9 @@ pub(crate) struct IndexRangeResponse {
 pub(crate) struct IndexItemRef {
     pub item_id: ItemId,
     pub source_id: u32,
-    pub source_label: String,
+    /// [`ItemDto::source_label`] へそのまま運ぶ来歴ラベル（`Arc<str>` の理由は
+    /// そちらの doc コメント参照）。
+    pub source_label: Arc<str>,
     pub source_line_number: u64,
     pub confirmed: bool,
     pub continuation_count: u32,
@@ -342,11 +350,13 @@ impl DisplaySet {
     /// 常に単独ソース側の `DisplaySet` を経由します）。
     pub(crate) fn to_index_ref(&self, item: &Item) -> IndexItemRef {
         let source_id = item.id.source_id;
+        // 同じソースの項目はすべて同じラベルを指すため、複製ではなく参照
+        // カウントの増加で済ませる（`crate::item::SourceInfo::label`）。
         let source_label = self
             .sources
             .get(&source_id)
-            .map(|source| source.label.clone())
-            .unwrap_or_default();
+            .map(|source| Arc::clone(&source.label))
+            .unwrap_or_else(|| Arc::from(""));
 
         let text = self.texts.get(&source_id);
         let entry = text.and_then(|text| text.entries().get(item.entry_index));
@@ -402,7 +412,7 @@ mod tests {
         (
             SourceInfo {
                 source_id,
-                label: label.to_string(),
+                label: Arc::from(label),
             },
             text,
             items,
@@ -483,11 +493,11 @@ mod tests {
         let sources = vec![
             SourceInfo {
                 source_id: 10,
-                label: "app.log".to_string(),
+                label: Arc::from("app.log"),
             },
             SourceInfo {
                 source_id: 20,
-                label: "worker.log".to_string(),
+                label: Arc::from("worker.log"),
             },
         ];
         let mut texts = HashMap::new();
@@ -537,9 +547,9 @@ mod tests {
         assert!(first.items[1].has_timestamp);
         assert_ne!(first.items[0].item_id, first.items[1].item_id);
 
-        assert_eq!(first.items[0].source_label, "app.log");
-        assert_eq!(first.items[1].source_label, "worker.log");
-        assert_eq!(first.items[2].source_label, "app.log");
+        assert_eq!(&*first.items[0].source_label, "app.log");
+        assert_eq!(&*first.items[1].source_label, "worker.log");
+        assert_eq!(&*first.items[2].source_label, "app.log");
     }
 
     // 受け入れ条件: 世代不一致の検出（再構築後に古い世代の要求がエラーになる）。
@@ -704,7 +714,7 @@ mod tests {
             .fetch_range_index(request)
             .expect("成功するはず");
 
-        assert_eq!(response.items[1].source_label, "");
+        assert_eq!(&*response.items[1].source_label, "");
         assert_eq!(response.items[1].raw_byte_len, 0);
         assert!(!response.items[1].has_timestamp, "既定はraw_display扱い");
         assert!(response.items[1].confirmed, "既定はconfirmed扱い");
@@ -739,7 +749,7 @@ mod tests {
         let display_set = DisplaySet::new(
             vec![SourceInfo {
                 source_id: 1,
-                label: "a.log".to_string(),
+                label: Arc::from("a.log"),
             }],
             items,
             texts,

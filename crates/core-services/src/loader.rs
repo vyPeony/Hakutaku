@@ -983,11 +983,17 @@ pub fn restore_evicted_source(
                     Err(error) => return Some(restore_fail(registry, source_id, &ctx, error)),
                 };
 
+            // 再解析で確定した日時書式・文字コードもソース記録へ反映する。
+            // 反映しないと、オンデマンド読み出し（本文のデコードと
+            // `timestamp_display` の再構成）だけが復元前の条件で動き続ける
+            // （`reload_appended` の `commit_reload` と対称。Issue #51 項目1）。
             let outcome = match registry.commit_restore(
                 source_id,
                 &streamed.pending_items,
                 new_snapshot,
                 streamed.has_unconfirmed_trailing_line,
+                streamed.datetime_format,
+                streamed.selected_encoding,
             ) {
                 Ok(Some(outcome)) => outcome,
                 Ok(None) => unreachable!("直前の reload_context で存在確認済み"),
@@ -3042,7 +3048,7 @@ mod tests {
             response.items[0].timestamp_display.as_deref(),
             Some("2026-07-28T15:12:23.456")
         );
-        assert_eq!(response.items[0].source_label, "test.log");
+        assert_eq!(&*response.items[0].source_label, "test.log");
         assert_eq!(
             &*response.items[0].raw_text,
             "2026/07/28 15:12:23.456 起動しました\n書式に一致しない行"
@@ -4804,6 +4810,55 @@ mod tests {
             );
         }
     }
+
+    // 受け入れ条件（`ERR-001`、`LOG-026`。Issue #51 項目15）: 0バイトのファイルを
+    // 公開 API からそのまま読み込める。項目0件の表示集合として登録され、末尾
+    // 断片が無いので未確定行にもならず、範囲取得も空の応答として成功する
+    // （空ファイルを異常系にしない）。
+    #[test]
+    fn register_source_reads_a_zero_byte_file_as_an_empty_display_set() {
+        let mut registry = DisplaySetRegistry::new();
+        let budget = crate::budget::SourceBudget::new();
+        let file = TempFile::create_text("zero-byte", "");
+
+        let (handle, summary) = register_source(
+            &mut registry,
+            &budget,
+            &file.path,
+            "empty.log".to_string(),
+            &[],
+        )
+        .expect("0バイトのファイルも読み込めるはず");
+
+        assert_eq!(summary.file_size_bytes, 0);
+        assert_eq!(summary.line_count, 0);
+        assert_eq!(handle.total_items, 0, "項目は0件になるはず");
+        assert_eq!(handle.generation, 1);
+        assert!(
+            !summary.has_unconfirmed_trailing_line,
+            "末尾断片が無いので未確定行にはならないはず（LOG-026）"
+        );
+        assert_eq!(
+            registry.source_status(handle.source_id),
+            Some(crate::registry::SourceStatus::Loaded),
+            "エラー扱いにせず、読み込み済みとして登録されるはず"
+        );
+
+        let response = registry
+            .fetch_range(
+                handle.display_set_id,
+                crate::display_set::RangeRequest {
+                    start: 0,
+                    max_items: 10,
+                    expected_generation: handle.generation,
+                },
+            )
+            .expect("空の表示集合でも範囲取得は成功するはず");
+        assert!(response.items.is_empty());
+        assert_eq!(response.total_items, 0);
+        assert_eq!(response.start, 0);
+        assert!(!response.truncated);
+    }
 }
 
 #[cfg(test)]
@@ -5007,6 +5062,105 @@ mod control_tests {
             assert_eq!(
                 &*response.items[29].raw_text,
                 "2026/07/28 15:12:29.000 起動メッセージ29\n継続行A-29\n継続行B-29"
+            );
+        }
+    }
+
+    // 受け入れ条件（Issue #51 項目15）: `\r\n` の2バイトがチャンク境界で
+    // 分かれても（`\r` が前のチャンクの最終バイト、`\n` が次のチャンクの先頭
+    // バイトになっても）、項目の切れ目・本文・行番号が1チャンク読み込みと
+    // 一致する。
+    //
+    // `DecodeCursor` は「最後に現れた `\n` まで」を確定範囲とし、行分割
+    // （`hakutaku_data_source::split_raw_lines_into`）は `\n` の直前が `\r` の
+    // ときだけ行末から `\r` を取り除く。`\r` だけを含むチャンクではまだ行が
+    // 確定せず、次のチャンクの `\n` が来たときに `carry` の中で2バイトが再び
+    // 隣り合う——という前提が崩れていないことを、実際に分かれる `chunk_bytes`
+    // で確かめる。
+    #[test]
+    fn crlf_split_across_a_chunk_boundary_matches_a_single_chunk_load() {
+        let mut contents = String::new();
+        for i in 0..3 {
+            contents.push_str(&format!(
+                "2026/07/28 15:12:{:02}.000 起動メッセージ{i}\r\n継続行-{i}\r\n",
+                i % 60
+            ));
+        }
+
+        // `\r\n` がちょうど境界で分かれる chunk_bytes を、内容から機械的に
+        // 求める（チャンク境界は `chunk_bytes` の倍数のオフセットに来るため、
+        // `\r` の位置 + 1 がその倍数になるものが該当する）。定数で埋め込むと、
+        // 本文を1文字直しただけで「境界を跨がない」テストへ静かに変質する。
+        let bytes = contents.as_bytes();
+        let splitting: Vec<u64> = (1..=bytes.len() as u64)
+            .filter(|chunk_bytes| {
+                bytes.windows(2).enumerate().any(|(index, pair)| {
+                    pair == b"\r\n" && (index as u64 + 1).is_multiple_of(*chunk_bytes)
+                })
+            })
+            .collect();
+        assert!(
+            !splitting.is_empty(),
+            "CRLF が境界で分かれる chunk_bytes が1つも無い（テストの前提が崩れている）"
+        );
+
+        // 比較の基準は、全体が1チャンクに収まる読み込み。
+        let expected = vec![
+            "2026/07/28 15:12:00.000 起動メッセージ0\n継続行-0",
+            "2026/07/28 15:12:01.000 起動メッセージ1\n継続行-1",
+            "2026/07/28 15:12:02.000 起動メッセージ2\n継続行-2",
+        ];
+
+        for chunk_bytes in splitting {
+            let file = TempFile::create_text(&format!("crlf-split-{chunk_bytes}"), &contents);
+            let mut registry = DisplaySetRegistry::new();
+            let budget = crate::budget::SourceBudget::new();
+
+            let outcome = register_source_with_control(
+                &mut registry,
+                &budget,
+                &file.path,
+                "crlf.log".to_string(),
+                &[],
+                &control_with_chunk_bytes(chunk_bytes),
+            )
+            .expect("読み込みは成功するはず");
+
+            assert_eq!(outcome.outcome, TaskOutcome::Completed);
+            assert_eq!(
+                outcome.handle.total_items, 3,
+                "chunk_bytes={chunk_bytes} で項目数が一致しない"
+            );
+            assert!(
+                !outcome.summary.has_unconfirmed_trailing_line,
+                "chunk_bytes={chunk_bytes}: 末尾は CRLF で終わるので未確定行は生じない"
+            );
+
+            let response = registry
+                .fetch_range(
+                    outcome.handle.display_set_id,
+                    crate::display_set::RangeRequest {
+                        start: 0,
+                        max_items: 100,
+                        expected_generation: outcome.handle.generation,
+                    },
+                )
+                .expect("範囲取得は成功するはず");
+
+            let texts: Vec<&str> = response.items.iter().map(|item| &*item.raw_text).collect();
+            assert_eq!(
+                texts, expected,
+                "chunk_bytes={chunk_bytes} で本文（`\\r\\n` は `\\n` へ正規化）が一致しない"
+            );
+            let line_numbers: Vec<u64> = response
+                .items
+                .iter()
+                .map(|item| item.source_line_number)
+                .collect();
+            assert_eq!(
+                line_numbers,
+                vec![1, 3, 5],
+                "chunk_bytes={chunk_bytes} で行番号が一致しない"
             );
         }
     }

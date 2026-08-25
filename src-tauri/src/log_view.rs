@@ -414,7 +414,10 @@ pub struct LogItemDto {
     /// IPC 直前まで複製しません。
     #[serde(serialize_with = "serialize_shared_str")]
     pub raw_text: Arc<str>,
-    pub source_label: String,
+    /// 読み込み元ラベル。`raw_text` と同じく `hakutaku_core::ItemDto` の共有
+    /// 文字列をそのまま受け取り、IPC 直前まで複製しません。
+    #[serde(serialize_with = "serialize_shared_str")]
+    pub source_label: Arc<str>,
     pub source_line_number: u64,
     /// 未確定行（書き込み途中の可能性がある末尾断片）ではないか（`LOG-026`）。
     /// 解析エラーとは区別する表示メタデータです。
@@ -717,7 +720,7 @@ mod tests {
             },
             timestamp_display: Some("2026-07-28T15:12:23.456".to_string()),
             raw_text: std::sync::Arc::from("本文"),
-            source_label: "a.log".to_string(),
+            source_label: std::sync::Arc::from("a.log"),
             source_line_number: 42,
             confirmed: false,
             continuation_count: 2,
@@ -733,7 +736,7 @@ mod tests {
             Some("2026-07-28T15:12:23.456")
         );
         assert_eq!(&*converted.raw_text, "本文");
-        assert_eq!(converted.source_label, "a.log");
+        assert_eq!(&*converted.source_label, "a.log");
         assert_eq!(converted.source_line_number, 42);
         assert!(!converted.confirmed);
         assert_eq!(converted.continuation_count, 2);
