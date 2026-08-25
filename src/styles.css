@@ -884,6 +884,21 @@ body {
   font-family: "Consolas", "Yu Gothic UI", monospace;
 }
 
+/*
+ * 同一理由でまとめた通知の「対象」欄（Issue #49。src/error_panel.js の
+ * buildTargetsRow）。対象が2件以上のときだけ現れる。フォントは
+ * .status-dialog__description（<dd>）から継承するため指定しない。
+ */
+.status-dialog__targets {
+  margin: 0;
+  padding-left: 20px;
+  list-style: disc;
+}
+
+.status-dialog__targets li {
+  margin: 2px 0;
+}
+
 /* 「閉じる」ボタンの行。ボタン自体は他の操作ボタンと同じ既定の見た目にする。
  * 内容が長く .status-dialog 内部がスクロールする場合でも「閉じる」が常に
  * 見えるよう、ダイアログの下端へ張り付ける。 */

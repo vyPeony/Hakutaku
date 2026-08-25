@@ -26,8 +26,13 @@
 // P07-1 以降、起動直後のログ表示ビューの初期化は共通シェル
 // （src/shell.js）へ委譲する。src/main.js はここまでの起動処理（設定状態の
 // 取得とバナー表示、計測モードの起動判定）だけを担当する。
+//
+// 併せて、どこにも捕まらなかった例外・Promise の拒否の受け皿（window の
+// error / unhandledrejection）をここで登録する（Issue #49。
+// `reportUnexpectedError`）。フロントエンド全体で1組あれば足りるものであり、
+// アプリの入口であるこのモジュールが持つのが自然なため。
 
-import { showInfoBanner, showWarningBanner } from "./banner.js";
+import { showErrorBanner, showInfoBanner, showWarningBanner } from "./banner.js";
 import { initShell } from "./shell.js";
 import { runMeasurement } from "./measurement.js";
 import { enableWindowPublication } from "./retention_stats.js";
@@ -184,5 +189,71 @@ async function bootstrap() {
     });
   }
 }
+
+/**
+ * 未処理の例外・未処理の Promise 拒否から、利用者へ見せる理由の文を作る
+ * （Issue #49）。
+ *
+ * 実値（パス・エラーコード）は隠さない（`ERR-002` は `DIAG-003`／`DIAG-004`
+ * により実値の表示を制限しないと定めている）。理由が読み取れない値だった場合
+ * でも「何か起きた」ことは伝える必要があるため、必ず何らかの文字列を返す。
+ *
+ * @param {unknown} value 例外・拒否理由。
+ * @returns {string}
+ */
+function describeUnexpectedError(value) {
+  if (value instanceof Error) {
+    return value.message || value.name;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value !== null && typeof value === "object") {
+    // Tauri コマンドの失敗は `{ kind, reason }` のようなプレーンオブジェクトで
+    // 届く。JSON 化できない値（循環参照など）もあり得るため、失敗したら
+    // 既定の文字列化へ落とす。
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+/**
+ * どこにも捕まらなかったエラーを、既存のエラーバナー経路で通知する
+ * （Issue #49）。
+ *
+ * これが無いと、フロントエンドのバグや想定外の IPC 失敗は開発者ツールの
+ * コンソールにしか出ず、利用者からは「操作しても何も起きない」としか見えない。
+ *
+ * バナーの表示自体が失敗した場合は、コンソールへ記録するだけで再通知しない。
+ * ここで例外を投げ直すと、その例外がまた `error` イベントとしてこの関数へ
+ * 戻り、無限ループになるため（順序依存の防御）。
+ *
+ * @param {unknown} value
+ */
+function reportUnexpectedError(value) {
+  const reason = describeUnexpectedError(value);
+  console.error("未処理のエラー:", value);
+  try {
+    showErrorBanner(`予期しないエラーが発生しました（${reason}）。`);
+  } catch (bannerError) {
+    console.error("予期しないエラーの通知表示に失敗しました:", bannerError);
+  }
+}
+
+// 受け皿は起動処理（bootstrap）より前に登録する（順序依存。起動処理そのものの
+// 中で起きた未処理の拒否も拾えるようにするため）。
+window.addEventListener("error", (event) => {
+  // `error` イベントは、資産の読み込み失敗（<script>／<img> など）でも発火し、
+  // その場合 `event.error` は無い。文面が「undefined」だけにならないよう、
+  // メッセージ側へ落とす。
+  reportUnexpectedError(event.error ?? event.message);
+});
+window.addEventListener("unhandledrejection", (event) => {
+  reportUnexpectedError(event.reason);
+});
 
 bootstrap();

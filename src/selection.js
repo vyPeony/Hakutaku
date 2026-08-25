@@ -4,7 +4,19 @@
 // クリックで単一行、Shift+クリックでアンカーからの範囲、Ctrl+クリックで行単位の
 // 追加・除外（飛び飛びの選択）、ドラッグで開始行から現在行までの範囲、Ctrl+A で
 // 全行を選ぶ（いずれも表示集合全体のインデックスであり、DOM にも本文にも
-// 触れない）。
+// 触れない）。Shift+↓／Shift+↑ による1行ずつの拡張・縮小（Issue #49）は
+// [`extendSelectionByStep`] が担う。
+//
+// # 可動端（フォーカス行）をこのモジュールで保持しない理由（Issue #49）
+//
+// キーボードでの拡張・縮小は「アンカーは固定したまま、反対側の端（可動端）を
+// 1行動かす」操作であり、可動端がどこかを知る必要がある。この可動端は
+// [`SelectionState`] には含めず、[`extendSelectionByStep`] の引数として
+// 呼び出し側（`src/log_view.js`）から渡す。`SelectionState` へ足すと、既存の
+// すべての操作（クリック、ドラッグ、Ctrl+A、クランプ、復元）が可動端の更新
+// 責任を負い、更新漏れが「選択は正しいのにキーボードだけ挙動が飛ぶ」という
+// 分かりにくい退行になる。可動端は選択の内容（＝コピーされる行）を左右せず、
+// 次のキー操作の起点でしかないため、選択モデルの不変条件からは切り離す。
 //
 // # 範囲の集合にした理由（Issue #85）
 //
@@ -123,6 +135,55 @@ export function extendSelectionTo(state, rowIndex) {
   return {
     anchorIndex: state.anchorIndex,
     ranges: [rangeBetween(state.anchorIndex, rowIndex)],
+  };
+}
+
+/**
+ * インデックスを表示集合の範囲 `[0, lastIndex]` へ丸める（`extendSelectionByStep`
+ * の防御。呼び出し側が保持している可動端は、表示集合が縮んだ後も古い値のまま
+ * 残り得る）。
+ *
+ * @param {number} index
+ * @param {number} lastIndex
+ * @returns {number}
+ */
+function clampIndex(index, lastIndex) {
+  if (!Number.isFinite(index)) {
+    return 0;
+  }
+  return Math.min(Math.max(Math.trunc(index), 0), lastIndex);
+}
+
+/**
+ * キーボード（Shift+↓／Shift+↑）で選択範囲を1行ぶん拡張・縮小する
+ * （Issue #49）。
+ *
+ * アンカーは動かさず、可動端（`focusIndex`）だけを `delta` 行動かし、
+ * 「アンカー〜新しい可動端」の1範囲へ選択を**置き換える**（Shift+クリックと
+ * 同じ規則。[`extendSelectionTo`] 参照）。アンカーより手前へ可動端を動かせば
+ * 上方向の選択になり、アンカーへ向かって動かせば選択は縮む。
+ *
+ * 可動端が表示集合の端に達している場合は、その端に留まる（範囲外を選ばない）。
+ * 呼び出し側は返した `focusIndex` を次回の入力として保持する（可動端をこの
+ * モジュールで保持しない理由はモジュール冒頭のコメント参照）。
+ *
+ * @param {number} anchorIndex 固定端（直近の選択操作の基準行）。
+ * @param {number} focusIndex 現在の可動端。
+ * @param {number} delta 動かす向きと量（Shift+↓ は `1`、Shift+↑ は `-1`）。
+ * @param {number} totalItems 表示集合の総項目数。
+ * @returns {{ selection: SelectionState, focusIndex: number | null }}
+ *   `totalItems` が0以下なら選択なしと `focusIndex: null` を返す。
+ */
+export function extendSelectionByStep(anchorIndex, focusIndex, delta, totalItems) {
+  if (totalItems <= 0) {
+    return { selection: createSelectionState(), focusIndex: null };
+  }
+  const lastIndex = totalItems - 1;
+  const anchor = clampIndex(anchorIndex, lastIndex);
+  const nextFocus = clampIndex(clampIndex(focusIndex, lastIndex) + delta, lastIndex);
+  return {
+    selection: { anchorIndex: anchor, ranges: [rangeBetween(anchor, nextFocus)] },
+    focusIndex: nextFocus,
   };
 }
 

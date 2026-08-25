@@ -10,6 +10,8 @@
 //   5. `copy_selection` へ渡す範囲列（`toCopyRanges`）が Rust 側の受け入れ条件
 //      （`hakutaku_core::assemble_copy`: `start` 昇順・互いに素・`count` が
 //      1以上・表示集合の範囲内）を必ず満たすこと
+//   6. キーボード（Shift+↓／Shift+↑）による1行ずつの拡張・縮小
+//      （`extendSelectionByStep`。Issue #49）
 //
 // 選択は `src/log_view.js` の DOM 操作と `copy_selection` の呼び出しに挟まれた
 // 純粋な状態遷移であり、GUI 検査（`scripts/check-gui.mjs`。手動実行）でしか
@@ -34,6 +36,7 @@ import {
   clampSelectionToTotalItems,
   clearSelection,
   createSelectionState,
+  extendSelectionByStep,
   extendSelectionTo,
   getSelectedRowCount,
   isRowSelected,
@@ -282,6 +285,65 @@ function checkDragSelection() {
   const scattered = toggleRowSelection(toggleRowSelection(createSelectionState(), 0), 9);
   expectRanges("ドラッグ: ドラッグ前の選択は復活しない", updateDragSelection(4, 5), [[4, 2]]);
   expectEqual("ドラッグ: 前提（ドラッグ前は飛び飛び）", getSelectedRowCount(scattered), 2);
+}
+
+// ---------------------------------------------------------------------------
+// 3.5 キーボードでの拡張・縮小（Shift+↓ / Shift+↑。Issue #49）
+// ---------------------------------------------------------------------------
+//
+// 仕様（`extendSelectionByStep` の JSDoc）:
+//   アンカーは動かさず、可動端だけを delta 行動かして「アンカー〜新しい可動端」
+//   の1範囲へ置き換える。可動端は表示集合の端で留まる（範囲外を選ばない）。
+//   totalItems ≤ 0 なら選択なしと focusIndex: null。
+// 以下の期待値はこの規則を手で適用した結果である。
+
+function checkKeyboardStep() {
+  // アンカー5・可動端5から下へ1行。両端を含むので 5〜6 の2行。
+  const down = extendSelectionByStep(5, 5, 1, 100);
+  expectEqual("キーボード拡張: アンカーは動かない", down.selection.anchorIndex, 5);
+  expectRanges("キーボード拡張: 下へ1行で2行になる", down.selection, [[5, 2]]);
+  expectEqual("キーボード拡張: 可動端が1行下がる", down.focusIndex, 6);
+
+  // 続けて下へ。5〜7 の3行。
+  expectRanges("キーボード拡張: さらに下へ", extendSelectionByStep(5, 6, 1, 100).selection, [[5, 3]]);
+
+  // アンカーへ向かって戻すと縮む（5〜7 → 5〜6）。
+  const shrunk = extendSelectionByStep(5, 7, -1, 100);
+  expectRanges("キーボード縮小: アンカー側へ戻すと縮む", shrunk.selection, [[5, 2]]);
+  expectEqual("キーボード縮小: 可動端が1行上がる", shrunk.focusIndex, 6);
+
+  // アンカーを越えると反対向きの選択になる（アンカーは5のまま、4〜5）。
+  const flipped = extendSelectionByStep(5, 5, -1, 100);
+  expectRanges("キーボード拡張: アンカーを越えると上方向へ伸びる", flipped.selection, [[4, 2]]);
+  expectEqual("キーボード拡張: 反転してもアンカーは5のまま", flipped.selection.anchorIndex, 5);
+
+  // 表示集合の端では留まる（範囲外を選ばない）。
+  expectRanges("キーボード拡張: 先頭より上へは出ない", extendSelectionByStep(0, 0, -1, 10).selection, [
+    [0, 1],
+  ]);
+  expectEqual("キーボード拡張: 先頭で可動端が留まる", extendSelectionByStep(0, 0, -1, 10).focusIndex, 0);
+  expectRanges("キーボード拡張: 末尾より下へは出ない", extendSelectionByStep(9, 9, 1, 10).selection, [
+    [9, 1],
+  ]);
+
+  // 総行数0では選択なし（可動端も手放す）。
+  const none = extendSelectionByStep(3, 3, 1, 0);
+  expectRanges("キーボード拡張: 総行数0なら選択なし", none.selection, []);
+  expectEqual("キーボード拡張: 総行数0なら可動端も null", none.focusIndex, null);
+
+  // 表示集合が縮んだ後に古いアンカー・可動端が渡っても、範囲内へ丸める。
+  const clamped = extendSelectionByStep(50, 50, 1, 10);
+  expectRanges("キーボード拡張: 範囲外の起点は丸める", clamped.selection, [[9, 1]]);
+  expectEqual("キーボード拡張: 丸めた可動端も範囲内", clamped.focusIndex, 9);
+
+  // 長い範囲でも不変条件を満たす（1範囲のみ・count ≥ 1・昇順）。
+  const wide = extendSelectionByStep(0, 999, 1, 20_000_000);
+  expectRanges("キーボード拡張: 広い範囲でも1範囲", wide.selection, [[0, 1001]]);
+  check(
+    "キーボード拡張: 範囲の不変条件を保つ",
+    findRangeInvariantViolation(wide.selection.ranges) === null,
+    findRangeInvariantViolation(wide.selection.ranges),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +690,18 @@ function checkPremises() {
     source.includes("updateDragSelection(drag.startIndex, rowIndex)"),
     "ドラッグ選択が log_view.js 側で組み立てられている可能性があります",
   );
+  // Issue #49: キーボードでの拡張・縮小も選択モデルを通す（log_view.js 側で
+  // 範囲を組み立て直すと、上の検査が通ったまま実物の挙動だけが変わる）。
+  check(
+    "前提: log_view.js がキーボードでの拡張・縮小を選択モデルへ委ねる",
+    source.includes("extendSelectionByStep("),
+    "Shift+矢印の選択が log_view.js 側で組み立てられている可能性があります",
+  );
+  check(
+    "前提: log_view.js が Esc の選択解除を選択モデルへ委ねる",
+    source.includes("clearSelection()"),
+    "選択解除が log_view.js 側で組み立てられている可能性があります",
+  );
   // Issue #85 で廃止したコピー列 UI（`#log-copy-columns` 一式）が復活すると、
   // コピー内容が「常に原文そのまま」（ADR-0011）でなくなる。
   check(
@@ -651,6 +725,7 @@ function checkPremises() {
 checkBasicOperations();
 checkToggle();
 checkDragSelection();
+checkKeyboardStep();
 checkClamp();
 checkIsRowSelected();
 checkCopyRanges();
@@ -667,5 +742,5 @@ if (problems.length > 0) {
 }
 
 console.log(
-  `行選択モデル（正規化、トグルによる分割と結合、ドラッグ更新、クランプ、二分探索、コピー範囲の変換）を ${checkCount} 項目検査しました。問題はありません。`,
+  `行選択モデル（正規化、トグルによる分割と結合、ドラッグ更新、キーボードでの拡張と縮小、クランプ、二分探索、コピー範囲の変換）を ${checkCount} 項目検査しました。問題はありません。`,
 );
