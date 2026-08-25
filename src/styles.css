@@ -23,6 +23,29 @@
   --color-info-text: #1a3d7c;
   --color-info-accent: #b7d0f5;
 
+  /*
+   * 補助表示（由来のパス、未読み込み、行番号）の文字色（Issue #50）。
+   *
+   * 以前は #888 を各規則へ直接書いていたが、白（#fff）に対して 3.54:1、
+   * 選択行の地（#cfe3ff）に対しては 2.72:1 しかなく、WCAG 2.1 の AA
+   * （通常の文字は 4.5:1 以上）に届いていなかった。この値は、この文字色が
+   * 実際に載る全ての地色に対して AA を満たす: 白 6.39:1、左ペイン #fafafa
+   * 6.12:1、選択行 #cfe3ff 4.89:1、生表示行 #f7f5ef 5.86:1、
+   * 未確定行 #f3f3f6 5.77:1。
+   * 「本文より控えめ」という役割は保つ（本文は #222）。
+   */
+  --color-text-muted: #5f5f5f;
+
+  /*
+   * キーボードフォーカスの輪郭色（Issue #50）。フォーカスがどこにあるかを
+   * 常に目で追えるようにするための唯一の手掛かりであり、隣接する地色に対して
+   * 3:1 以上が要る。この値は白 6.39:1、選択行 #cfe3ff 4.89:1、
+   * タブの地色 #e4e4e4 5.02:1 で、いずれも満たす。ハイコントラストでは
+   * UA がシステム色へ強制するため、この値は使われない
+   * （末尾の forced-colors ブロックのコメント参照）。
+   */
+  --color-focus-ring: #0b57d0;
+
   /* 本文の基準文字サイズ。見出しやタブなど、既定の 1rem では本文より大きく
    * 見えてしまう箇所を本文相当へ揃えるために使う（Issue #9）。より小さい
    * 補助表示（0.8rem、0.75rem など）はこの基準とは別の値のままにする。 */
@@ -143,7 +166,7 @@ body {
 
 .target-row__origin {
   font-size: 0.75rem;
-  color: #888;
+  color: var(--color-text-muted);
 }
 
 .target-row__status {
@@ -151,7 +174,7 @@ body {
 }
 
 .target-row__status--not_opened {
-  color: #888;
+  color: var(--color-text-muted);
 }
 
 .target-row__status--loading {
@@ -541,6 +564,23 @@ body {
 }
 
 /*
+ * 行の内容をまとめる論理的なセル（Issue #50）。role="row" が支援技術へ
+ * 正しく伝わるには、その中身が1つ以上のセル（role="gridcell"）である必要が
+ * あるため、src/log_view.js の buildRowElement が行番号・読み込み元ラベル・
+ * バッジ・本文をこの要素で包む。
+ *
+ * `display: contents` によりボックスを生成させないのは、包んだ結果として
+ * 中身が `.log-row`（flex コンテナ）の直接のフレックスアイテムでなくなると、
+ * column-gap による列間の余白と各列の flex 指定（`.log-row__lineno` の
+ * `flex: none` など）が一斉に効かなくなるからである（`.target-row__trailing`
+ * と同じ手法）。列を実際の grid セルへ分割しない理由は buildRowElement の
+ * doc コメントを参照（列の有無が行ごとに変わるため）。
+ */
+.log-row__cell {
+  display: contents;
+}
+
+/*
  * 行番号列。`flex: none`（= `flex: 0 0 auto`）のため内容（桁数）に応じて
  * 伸びるが縮まない。7桁以上の行番号が混在する範囲（統合表示で顕著。
  * Issue #48）では、その行だけ後続列が右へわずかにずれ得るが、これは意図的な
@@ -554,7 +594,7 @@ body {
   flex: none;
   min-width: 6ch;
   text-align: right;
-  color: #888;
+  color: var(--color-text-muted);
 }
 
 /*
@@ -911,3 +951,81 @@ body {
   padding-top: 8px;
   background: inherit;
 }
+
+/*
+ * キーボードフォーカスの可視化（Issue #50）
+ *
+ * キーボードだけで操作する場合、いま自分がどこにいるかを示すのはこの輪郭
+ * だけである。ブラウザ既定の輪郭は、地色や角丸の組み合わせによっては
+ * 見分けにくいため、対象を絞って明示する。
+ *
+ * `:focus-visible` を使い `:focus` を使わないのは、マウスで押しただけの
+ * 要素（`#log-viewport` は行のクリックのたびにフォーカスを受け取る。
+ * src/log_view.js の handleRowsMouseDown）へ輪郭が出続けるのを避けるため。
+ *
+ * `outline-offset: -2px` は輪郭を要素の内側へ描く。`.log-row` は
+ * `overflow: hidden` の固定高（22px）であり、外側へ描くと継続行バッジの
+ * 輪郭が上下で切れて見えなくなる。
+ */
+.log-viewport:focus-visible,
+.log-detail-panel:focus-visible,
+.tab:focus-visible,
+.log-row__badge--continuation:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
+}
+
+/*
+ * ハイコントラスト（Windows のハイコントラストテーマ。Issue #50）
+ *
+ * このモードでは、UA が文字色・背景色・境界色をシステムの配色へ強制的に
+ * 置き換える。その結果、**背景色だけで表している状態は消える**。この画面で
+ * それに当たるのは選択行（`.log-row--selected` の淡い青）であり、何も
+ * しなければ選択の有無を目で区別できなくなる（選択とコピーが主要な操作で
+ * ある以上、これは機能の欠落に等しい）。
+ *
+ * 対処は、選択行に限って `forced-color-adjust: none` で強制を外し、
+ * システムの選択色（`Highlight` / `HighlightText`）で描き直す定石に従う。
+ * 独自のハイコントラスト用テーマは作らない（配色の二重管理になり、OS 側の
+ * テーマ変更に追随できなくなるため）。
+ *
+ * フォーカスの輪郭はここで色を指定しない。UA が強制する色は地色と必ず
+ * 区別が付くよう選ばれており、独自色を指定すると逆に見えなくなり得る。
+ */
+@media (forced-colors: active) {
+  .log-row--selected {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+  }
+
+  /* 各列は自前の文字色を持つため、選択行の中だけ選択色側へ揃える。 */
+  .log-row--selected .log-row__lineno,
+  .log-row--selected .log-row__source,
+  .log-row--selected .log-row__text {
+    color: HighlightText;
+  }
+
+  /*
+   * `forced-color-adjust` は継承する。バッジは選択行の中でも独立した
+   * 部品として見えている必要があるため、強制を効かせた状態へ戻す
+   * （戻さないと、淡い青系のバッジが選択色の上に重なって沈む）。
+   */
+  .log-row--selected .log-row__badge {
+    forced-color-adjust: auto;
+  }
+}
+
+/*
+ * ここで扱わないもの（Issue #50 の対象外。判断の根拠を残す）
+ *
+ * - `prefers-color-scheme`（ダークテーマ）: 上の `:root` が定める配色の
+ *   三つ組（背景・文字・差し色）を系統ごとに作り直すことになり、配色トーンの
+ *   全面変更に当たる。本 Issue はコントラスト不足の是正までを範囲とする。
+ * - OS の文字拡大（表示スケールの拡大）: 行高は `.log-row` の 22px 固定で、
+ *   src/log_view.js の `ROW_HEIGHT_PX` と一致していることが仮想スクロールの
+ *   前提になっている（両者がずれると可視範囲の計算そのものが狂う）。文字だけを
+ *   拡大すると行の中で本文が切れるため、行高と併せて可変にする設計変更が要る。
+ *
+ * どちらも docs/release-notes/0.1.0.md の「既知の制約」へ記載している。
+ */

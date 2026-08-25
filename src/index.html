@@ -90,6 +90,13 @@
               時系列統合: OFF
             </button>
           </div>
+          <!--
+            タブは WAI-ARIA のタブパターンに従う（Issue #50）。個々の
+            role="tab" 要素・roving tabindex（アクティブなタブだけ
+            tabIndex=0）・aria-controls・←/→ でのフォーカス移動は
+            src/shell.js の buildTabElement / buildMergedTabElement が
+            付与する（タブは動的に増減するため、静的には書けない）。
+          -->
           <div class="tab-bar" id="tab-bar" role="tablist" aria-label="開いているビュー"></div>
           <!--
             ビュー領域 = 「形式別ビューアの差し込み口」（src/log_view.js の
@@ -98,8 +105,14 @@
             唯一の実装。将来 DICOM（P14）等を追加する場合もこの領域の中へ
             差し込む想定で、共通シェル側の構造（app-body・tab-bar 等）は
             形式に依存しない。
+
+            role="tabpanel"（Issue #50）: 上の role="tablist" と対になる
+            パネル。どのタブの内容かを示す aria-labelledby は、アクティブな
+            タブの id を src/shell.js が動的に設定する。tabindex は付けない
+            （内部にフォーカス可能な要素——ジャンプ入力欄・#log-viewport——が
+            あるため、パネル自体をタブ順へ入れる必要がない）。
           -->
-          <div class="view-area" id="view-area">
+          <div class="view-area" id="view-area" role="tabpanel">
             <div class="log-toolbar" id="log-toolbar">
               <span class="log-toolbar__label" id="log-source-label"></span>
               <span class="log-toolbar__count" id="log-total-items"></span>
@@ -148,16 +161,29 @@
               選択はインデックス範囲の集合だけを保持し（PERF-012）、ブラウザ
               既定のテキスト選択（P04-4 の最小コピー）は置き換えた
               （src/styles.css の .log-rows 参照）。
+
+              支援技術への表現（Issue #50）: この要素を role="grid" とし、
+              総行数を aria-rowcount で示す（値は src/log_view.js の
+              updateTotalItemsLabel が表示集合の切り替え・読み込みの進行に
+              合わせて更新する）。行は仮想スクロールのため可視範囲ぶんしか
+              存在しないので、各行に絶対行番号 aria-rowindex（1始まり）を
+              付けて位置を伝える（仮想化されたグリッドの標準的な表現）。
+              複数行を同時に選べるため aria-multiselectable="true" を付け、
+              行ごとの選択状態は aria-selected で伝える。上下のスペーサは
+              高さを表現するためだけの空要素なので aria-hidden で除く。
             -->
             <div
               class="log-viewport"
               id="log-viewport"
               tabindex="0"
-              aria-label="ログ本文の表示領域（クリックまたはドラッグで行を選択、Shift+クリックで範囲選択、Ctrl+クリックで行の追加と除外、Ctrl+A で全選択、Ctrl+C で原文をコピー、キーボードでスクロールできます）"
+              role="grid"
+              aria-multiselectable="true"
+              aria-rowcount="0"
+              aria-label="ログ本文の表示領域（クリックまたはドラッグで行を選択、Shift+クリックで範囲選択、Shift+↑／Shift+↓ でキーボード選択、Ctrl+クリックで行の追加と除外、Ctrl+A で全選択、Ctrl+C で原文をコピー、Esc で選択解除、キーボードでスクロールできます）"
             >
-              <div class="log-spacer" id="log-spacer-top"></div>
-              <div class="log-rows" id="log-rows"></div>
-              <div class="log-spacer" id="log-spacer-bottom"></div>
+              <div class="log-spacer" id="log-spacer-top" aria-hidden="true"></div>
+              <div class="log-rows" id="log-rows" role="rowgroup"></div>
+              <div class="log-spacer" id="log-spacer-bottom" aria-hidden="true"></div>
             </div>
             <!--
               継続行の詳細パネル（P08-2、LOG-014）。折りたたみ方式（一律1行高。
@@ -165,8 +191,23 @@
               継続行を、改行を保ったまま確認するための領域。既定は非表示
               （hidden 属性）で、src/log_view.js の showDetailPanel /
               hideDetailPanel が開閉する。
+
+              フォーカスと支援技術（Issue #50）: role="region" と
+              aria-labelledby（見出し）で領域として名前を持たせる。
+              モーダル（role="dialog"）にはしない——パネルを開いたまま行一覧を
+              読み進められる設計であり、背後の操作を塞ぐ必要がないため。
+              tabindex="-1" は、開いた直後にこのパネルへプログラムから
+              フォーカスを移すためのもの（タブ順には入らない）。Esc で閉じ、
+              閉じたら開く操作をした継続行バッジへフォーカスを戻す。
             -->
-            <div class="log-detail-panel" id="log-detail-panel" hidden>
+            <div
+              class="log-detail-panel"
+              id="log-detail-panel"
+              role="region"
+              aria-labelledby="log-detail-panel-title"
+              tabindex="-1"
+              hidden
+            >
               <div class="log-detail-panel__header">
                 <span class="log-detail-panel__title" id="log-detail-panel-title"></span>
                 <button
