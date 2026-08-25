@@ -8,7 +8,7 @@
    * 書いていたため、配色を調整するときに書き換え漏れが起きやすかった。
    *
    * 色は「背景（bg）・文字（text）・差し色（accent）」の三つ組で、エラー系
-   * （赤系。.config-banner--error、.status-dialog、.target-row__status--error
+   * （赤系。.config-banner--error、.status-dialog、.target-row__badge--error
    * など）と情報系（青系。.config-banner--info、.status-dialog--info、
    * .log-row__badge--continuation など）の2系統を持つ。accent は枠線
    * （下線・囲み枠）に使い、text は文字色のほか、箇所によっては枠線の色
@@ -113,11 +113,15 @@ body {
   background: #fafafa;
 }
 
+/* 見出しと「ファイルを開く」を1行に収め、一覧の表示領域を広く取る
+ * （Issue #97 の左ペイン再設計。表示できる件数を優先する）。 */
 .target-pane__header {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  padding: 12px;
+  padding: 8px 10px;
   flex: none;
   border-bottom: 1px solid #ddd;
 }
@@ -138,148 +142,91 @@ body {
   overflow-y: auto;
 }
 
+/*
+ * 一覧の1行（Issue #97 の左ペイン再設計）。「ファイル名＋必要時だけ右端の短い状態表示」
+ * の1行に収め、画面内に表示できる件数を優先する。状態別の操作・詳細は
+ * 行内には置かず、行クリックで右ペイン（タブまたは #target-status-pane）へ
+ * 表示する（src/shell.js の handleTargetRowClick）。
+ */
 .target-row {
-  border-bottom: 1px solid #e6e6e6;
+  border-bottom: 1px solid #ececec;
 }
 
 .target-row__main {
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  padding: 8px 12px;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
   cursor: pointer;
+  /* タブを開いている行の目印（下の .target-row--open）。非対象の行にも同じ
+   * 幅の透明な帯を敷き、目印の有無で文字位置が動かないようにする。 */
+  border-left: 3px solid transparent;
 }
 
-.target-row--ready .target-row__main:hover,
-.target-row--not_opened .target-row__main:hover {
+/* すべての行がクリックで選択できる（Issue #97 の左ペイン再設計）。 */
+.target-row__main:hover {
   background: #eef4ff;
 }
 
 .target-row__name {
-  font-weight: bold;
-  /* 強調は太字だけで足りるため、既定（1rem）に任せず本文相当を明示する
-   * （Issue #9 の利用者フィードバック）。 */
   font-size: var(--font-size-body);
-  word-break: break-all;
+  /* 1行表示のため折り返さず省略する。全文はツールチップ（title）と
+   * aria-label で補う（src/shell.js の updateTargetRowElement）。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
-.target-row__origin {
+/*
+ * タブを開いている対象の強調（Issue #97 の左ペイン再設計）。太字と左端の帯で示す。
+ * ハイコントラストでは帯の色の区別が失われ得るため、太字が最終的な
+ * 手がかりになる（Issue #50 の方針と同じ考え方）。
+ */
+.target-row--open > .target-row__main {
+  border-left-color: var(--color-info-text);
+}
+
+.target-row--open .target-row__name {
+  font-weight: bold;
+}
+
+/*
+ * 現在右ペインに表示中の対象（ログ表示中はアクティブなタブ、状態表示ペイン
+ * 表示中は選択した行）。上の :hover の規則より後に置き、ポインターを
+ * 載せてもこの背景が優先されるようにする（同じ詳細度のため後勝ち）。
+ * ハイコントラストでの扱いは末尾の forced-colors ブロックを参照。
+ */
+.target-row--current > .target-row__main {
+  background: #dbe9ff;
+}
+
+/*
+ * 右端の短い状態表示（Issue #97 の左ペイン再設計。src/shell.js の shortStatusFor）。
+ * 注意が要る状態（読み込み進捗・エラー・部分読み込み・更新未反映）だけを
+ * 短く示す。全文は行のツールチップと右ペインで確認できる。
+ */
+.target-row__badge {
+  flex: none;
   font-size: 0.75rem;
-  color: var(--color-text-muted);
+  white-space: nowrap;
 }
 
-.target-row__status {
-  font-size: 0.8rem;
-}
-
-.target-row__status--not_opened {
-  color: var(--color-text-muted);
-}
-
-.target-row__status--loading {
+.target-row__badge--loading {
   color: var(--color-info-text);
 }
 
-.target-row__status--ready {
-  color: #1b7a1b;
-}
-
-.target-row__status--error {
+.target-row__badge--error {
   color: var(--color-error-accent);
   font-weight: bold;
 }
 
-.target-row__status--cancelled_partial {
+/* 部分読み込み・変更済み・更新未反映などの警告系。 */
+.target-row__badge--attention {
   color: #a15c00;
   font-weight: bold;
-}
-
-.target-row__status--changed {
-  color: #a15c00;
-  font-weight: bold;
-}
-
-/*
- * 行末尾の可変ブロック（キャンセル／再読み込み／再試行／昇格ボタン、
- * エラー理由、「選んで再解析」）をまとめるコンテナ（Issue #48）。
- * src/shell.js の renderTargetList が差分更新の単位として使うために
- * 導入したラッパーであり、見た目には関与させたくない。`display: contents`
- * によりボックス自体を生成させず、子要素を `.target-row` の直接の子と
- * 同じ見た目（既存のマージンによる縦積み）にする。
- */
-.target-row__trailing {
-  display: contents;
-}
-
-.target-row__retry {
-  margin: 0 12px 8px;
-}
-
-/*
- * 明示的な再読み込み（LOG-028、ADR-0007）。Ready 状態の行に常設する（既存の
- * 行内ボタン群と同じ控えめな見た目にし、常設化で行の視覚的ノイズを増やさない。
- * src/shell.js の handleReloadTargetClick の doc コメント参照）。
- */
-.target-row__reload {
-  margin: 0 12px 8px;
-}
-
-/*
- * アクセス拒否時の「管理者として新しいウィンドウで開く」ボタン
- * （PRIV-002〜004、P11-2）。誤用防止のため、アクセス拒否時だけ表示する
- * （src/shell.js の buildTargetRowElement 参照）。
- */
-.target-row__elevate {
-  margin: 0 12px 8px;
-}
-
-/*
- * 読み込み中のキャンセルボタン（P07-2）。読み込み中の行にだけ
- * 表示する。
- */
-.target-row__cancel {
-  margin: 0 12px 8px;
-}
-
-.target-row__error-reason {
-  margin: 0 12px 8px;
-  font-size: 0.75rem;
-  color: var(--color-error-text);
-  word-break: break-all;
-}
-
-/*
- * LOG-022 の「選んで再解析」操作（P07-2）。生表示へ
- * 退避した対象（ready／cancelled_partial かつ fell_back_to_raw_display）に
- * だけ表示する。常設の行内 UI（モーダルにしない、という裁定）。
- * プロファイルと日時書式の2つのセレクトが並ぶため、左ペインの幅では折り返す
- * ことを前提に flex-wrap を効かせている。
- */
-.target-row__reparse {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin: 0 12px 8px;
-}
-
-.target-row__reparse-label {
-  font-size: 0.75rem;
-  color: var(--color-info-text);
-}
-
-/*
- * 各セレクトに付く可視ラベル。セレクトが2つ並ぶため、どちらが
- * 何の選択かを見た目で区別できるようにする。
- */
-.target-row__reparse-field-label {
-  font-size: 0.75rem;
-  color: var(--color-info-text);
-}
-
-.target-row__reparse-select {
-  font-size: 0.75rem;
 }
 
 /*
@@ -306,14 +253,20 @@ body {
 }
 
 /*
- * 時系列統合の ON/OFF トグル（P09-1、LOG-007〜LOG-008）。
- * タブバーの直前に固定表示する。
+ * ビュー操作のツールバー（タブバーの直前に固定表示）。時系列統合の ON/OFF
+ * トグル（P09-1、LOG-007〜LOG-008）と、アクティブなタブの対象への操作
+ * （再読み込み・再試行・選んで再解析。配置は Issue #97 の左ペイン再設計の
+ * 裁定）が並ぶ。
+ * 狭いウィンドウではグループ単位で折り返す（.log-toolbar と同じ方針）。
  */
 .view-toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   padding: 4px 4px 0;
   flex: none;
+  font-size: var(--font-size-body);
 }
 
 /* トグルのラベル（「時系列統合: OFF」等）を、狭いウィンドウでも字内で
@@ -327,6 +280,55 @@ body {
   background: #dbe9ff;
   border-color: #7aa7e8;
   font-weight: bold;
+}
+
+/*
+ * 「更新未反映」の表示（ADR-0007。前回の明示的な再読み込みが上限超過で
+ * 拒否され、旧スナップショットの表示を維持していることを示す）。
+ * 「再読み込み」ボタンの隣に、対象が update_pending の間だけ現れる
+ * （src/shell.js の renderViewToolbar）。
+ */
+.view-update-pending {
+  font-size: 0.75rem;
+  color: #a15c00;
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+/*
+ * LOG-022 の「選んで再解析」操作（配置は Issue #97 の左ペイン再設計の裁定）。
+ * 生表示へ退避した対象（fell_back_to_raw_display）がアクティブなタブの間
+ * だけ表示する。常設のツールバー UI（モーダルにしない、という裁定）。
+ */
+.view-reparse {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* [hidden] を確実に効かせる（作成者の display: flex は UA の
+ * [hidden] { display: none } に勝ってしまうため。Issue #78 の教訓）。 */
+.view-reparse[hidden] {
+  display: none;
+}
+
+.view-reparse__label {
+  font-size: 0.75rem;
+  color: var(--color-info-text);
+}
+
+/*
+ * 各セレクトに付く可視ラベル。セレクトが2つ並ぶため、どちらが
+ * 何の選択かを見た目で区別できるようにする。
+ */
+.view-reparse__field-label {
+  font-size: 0.75rem;
+  color: var(--color-info-text);
+}
+
+.view-reparse__select {
+  font-size: 0.75rem;
 }
 
 /*
@@ -402,6 +404,92 @@ body {
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
+}
+
+/* 状態表示ペイン（#target-status-pane）を表示している間は hidden になる。
+ * [hidden] を確実に効かせる（作成者の display: flex は UA の
+ * [hidden] { display: none } に勝ってしまうため。Issue #78 の教訓）。 */
+.view-area[hidden] {
+  display: none;
+}
+
+/*
+ * 選択した対象の状態表示ペイン（Issue #97 の左ペイン再設計。src/index.html の
+ * #target-status-pane のコメント参照）。読み込み進捗とキャンセル、エラーの
+ * 5要素（ERR-002）と再試行・昇格を、ビュー領域（.view-area）と排他で表示する。
+ */
+.target-status-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+  font-size: var(--font-size-body);
+  line-height: 1.5;
+}
+
+.target-status-pane[hidden] {
+  display: none;
+}
+
+.target-status-pane__title {
+  margin: 0 0 10px;
+  /* 強調は太字（h2 既定）だけで足りるため、文字サイズは本文相当へ揃える
+   * （Issue #9 の方針）。フルパスを含み得るため折り返す（マスキングしない。
+   * DIAG-004）。 */
+  font-size: var(--font-size-body);
+  word-break: break-all;
+}
+
+/* 状態1件分のカード。配色はダイアログ（.status-dialog）と同じ系統を使い、
+ * エラー（赤系）と情報（青系。読み込み中）を見分けられるようにする。 */
+.target-status-pane__card {
+  max-width: 720px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--color-info-accent);
+  background: var(--color-info-bg);
+  color: var(--color-info-text);
+}
+
+.target-status-pane__card--error {
+  border-color: var(--color-error-accent);
+  background: var(--color-error-bg);
+  color: var(--color-error-text);
+}
+
+.target-status-pane__heading {
+  margin: 0;
+  font-weight: bold;
+}
+
+.target-status-pane__text {
+  margin: 0;
+}
+
+/* ERR-002 の5要素の定義リスト。.status-dialog__fields と同じ構成。 */
+.target-status-pane__fields {
+  margin: 8px 0 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+}
+
+.target-status-pane__term {
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+.target-status-pane__description {
+  margin: 0;
+  word-break: break-all;
+  font-family: "Consolas", "Yu Gothic UI", monospace;
+}
+
+.target-status-pane__actions {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .log-toolbar {
@@ -572,9 +660,9 @@ body {
  * `display: contents` によりボックスを生成させないのは、包んだ結果として
  * 中身が `.log-row`（flex コンテナ）の直接のフレックスアイテムでなくなると、
  * column-gap による列間の余白と各列の flex 指定（`.log-row__lineno` の
- * `flex: none` など）が一斉に効かなくなるからである（`.target-row__trailing`
- * と同じ手法）。列を実際の grid セルへ分割しない理由は buildRowElement の
- * doc コメントを参照（列の有無が行ごとに変わるため）。
+ * `flex: none` など）が一斉に効かなくなるからである。列を実際の grid セルへ
+ * 分割しない理由は buildRowElement の doc コメントを参照（列の有無が行ごとに
+ * 変わるため）。
  */
 .log-row__cell {
   display: contents;
@@ -639,7 +727,7 @@ body {
 
 /*
  * 未確定行（LOG-026）。書き込み途中の可能性がある末尾の行。解析エラー
- * （.config-banner--error 等の赤系、.target-row__status--error）や警告
+ * （.config-banner--error 等の赤系、.target-row__badge--error）や警告
  * （.config-banner--warning 等の橙系）とは明確に異なる、中立的な見た目にする
  * （P08-2、作業項目5）。
  */
@@ -994,6 +1082,18 @@ body {
  */
 @media (forced-colors: active) {
   .log-row--selected {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+  }
+
+  /*
+   * 左ペインで現在表示中の対象の行（Issue #97 の左ペイン再設計）。淡い青の背景だけで
+   * 表しているため、選択行と同じ定石でシステムの選択色へ描き直す。タブを
+   * 開いている対象の強調（.target-row--open）はここでは扱わない（太字が
+   * 強制されずに残るため、それが手がかりになる）。
+   */
+  .target-row--current > .target-row__main {
     forced-color-adjust: none;
     background: Highlight;
     color: HighlightText;

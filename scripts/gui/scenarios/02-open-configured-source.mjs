@@ -38,15 +38,21 @@ export async function run({ page, expect }) {
   expect.expectEqual("開いたタブが選択状態になる", tab?.selected, true);
   expect.expectEqual("ファイル別タブには閉じるボタンがある", tab?.closable, true);
 
-  // 左ペインの状態表示は、読み込み完了で「読み込み済み（<行数> 行）」へ変わる
-  // （`src/shell.js` の `STATUS_LABELS` と `statusLabelFor`）。行数の表記まで
-  // 固定すると表示の細部に縛られるため、状態の種別だけを前方一致で見る。
-  // タブと左ペインが同じ実態を指していることの確認でもある。
+  // 左ペイン再設計（Issue #97）: 行の状態は data-status-kind で読む。読み込み完了で
+  // ready になり、タブを開いた対象として強調（target-row--open）され、
+  // アクティブなタブの行として current が付く。タブと左ペインが同じ実態を
+  // 指していることの確認でもある。
   const targetRow = (await readTargetRows(page)).find((row) => row.name === target);
-  expect.check(
-    "左ペインの状態が「読み込み済み」になる",
-    targetRow?.status?.startsWith("読み込み済み") === true,
-    `左ペインの状態 ${JSON.stringify(targetRow?.status)}`,
+  expect.expectEqual("左ペインの状態が読み込み済み（ready）になる", targetRow?.kind, "ready");
+  expect.expectEqual(
+    "タブを開いている対象として強調される（target-row--open）",
+    targetRow?.open,
+    true,
+  );
+  expect.expectEqual(
+    "アクティブなタブの行として強調される（target-row--current）",
+    targetRow?.current,
+    true,
   );
 
   // 行の中身。先頭行は表示集合の1件目であり、行番号は原本の行番号

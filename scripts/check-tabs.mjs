@@ -7,7 +7,7 @@
 //   2. 閉じたときの後継タブの選び方（`closeTab`。右優先、無ければ左、全て
 //      閉じたら `null`）
 //   3. フォーカスを動かさない内容更新（`updateTabContent`。`LOG-028` の
-//      明示的な再読み込みは、背景のタブに対しても押せる）
+//      明示的な再読み込みで、タブの並びやフォーカスを動かさない）
 //   4. 存在しない `targetId` を渡されたときの防御（同一の状態をそのまま返す）
 //
 // タブの並び・見出し・どれが選択中かは、`src/shell.js` の DOM 操作と
@@ -226,7 +226,7 @@ function checkClose() {
 //   既存タブの内容（displaySetId・generation・totalItems）だけを更新する。
 //   `upsertTab` と異なり、タブの位置・フォーカス（activeTargetId）は変えない。
 //   一致するタブが無ければ何もせず同じ state を返す。
-// 背景の対象を再読み込みしただけで利用者の視点が奪われないことが要件
+// 再読み込みでタブの並び・フォーカスが不必要に動かないことが要件
 // （`src/shell.js` の handleReloadTargetClick）。
 
 function checkUpdateTabContent() {
@@ -427,7 +427,7 @@ function checkPremises() {
   check(
     "前提: shell.js が再読み込みを updateTabContent へ委ねる（LOG-028）",
     source.includes("state.tabs = updateTabContent(state.tabs, targetId, {"),
-    "再読み込みが upsertTab 経由になると、背景の対象の更新で視点が奪われます",
+    "再読み込みが upsertTab 経由になると、更新のたびにタブの位置・フォーカスが動きます",
   );
   check(
     "前提: shell.js がアクティブなタブの復元に getActiveTab を使う",

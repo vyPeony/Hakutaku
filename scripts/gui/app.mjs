@@ -616,7 +616,12 @@ export function readTabs(page) {
  * 左ペインの参照対象一覧を読み出す（`#target-list`）。
  *
  * パスは読み出さない。フロントエンドへはそもそも渡らないため（`SEC-012`）、
- * 表示名・由来・状態だけで検査する。
+ * 表示名と状態だけで検査する。左ペイン再設計（Issue #97）により、行は
+ * 「ファイル名＋必要時だけ右端の短い状態表示（`badge`）」の1行表示で、状態の種別は
+ * `data-status-kind`（`src/shell.js` の `updateTargetRowElement` が検査用に
+ * 付ける機械可読の属性）から読む。タブを開いている対象の強調は
+ * `target-row--open`（`open`）、右ペインに表示中の対象は
+ * `target-row--current`（`current`）のクラスで表す。
  *
  * @param {import("playwright-core").Page} page
  */
@@ -624,8 +629,10 @@ export function readTargetRows(page) {
   return page.evaluate(() =>
     Array.from(document.querySelectorAll("#target-list > li")).map((row) => ({
       name: row.querySelector(".target-row__name")?.textContent?.trim() ?? "",
-      origin: row.querySelector(".target-row__origin")?.textContent?.trim() ?? "",
-      status: row.querySelector(".target-row__status")?.textContent?.trim() ?? "",
+      kind: row.dataset.statusKind ?? "",
+      badge: row.querySelector(".target-row__badge")?.textContent?.trim() ?? "",
+      open: row.classList.contains("target-row--open"),
+      current: row.classList.contains("target-row--current"),
     })),
   );
 }
