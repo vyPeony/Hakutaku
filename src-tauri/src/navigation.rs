@@ -61,9 +61,7 @@ mod tests {
     fn allows_the_bundled_asset_and_ipc_origins() {
         assert!(is_allowed(&url("http://tauri.localhost/")));
         assert!(is_allowed(&url("http://tauri.localhost/index.html")));
-        assert!(is_allowed(&url(
-            "http://ipc.localhost/core_responsibilities"
-        )));
+        assert!(is_allowed(&url("http://ipc.localhost/get_config_status")));
         // use_https_scheme を有効にした場合に備えて https も許可する。
         assert!(is_allowed(&url("https://tauri.localhost/")));
         assert!(is_allowed(&url("https://ipc.localhost/")));

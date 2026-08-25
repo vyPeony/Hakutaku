@@ -1,0 +1,88 @@
+name: 依存の脆弱性検査
+# 依存関係（Cargo.lock・package-lock.json）に既知の脆弱性が報告されていないかを
+# 定期的に確認する（Issue #52）。
+#
+# # PR のゲートにしない理由
+#
+# 脆弱性勧告（advisory）は依存の更新と無関係に、任意の日に新しく公開される。
+# これを PR の必須チェックにすると、その PR の差分と因果関係のない失敗で
+# マージが止まる。対処（依存の更新、影響評価、除外の判断）は、その PR とは
+# 別の作業として扱うほうが速く安全に進む。
+#
+# そのため、このワークフローは `pull_request`・`push` では起動せず、週1回の
+# 定期実行と手動実行だけで動かす。ブランチ保護の必須ステータスチェックは
+# `ci.yml` の集約ジョブ `CI 完了判定` に固定しており、このワークフローは
+# その判定に一切関与しない（ジョブ名も判定式も別ファイル）。
+#
+# 失敗は Issue にせず、ワークフローの失敗としてリポジトリの管理者へ通知される。
+on:
+  schedule:
+    # 毎週月曜 06:17（JST）。UTC では日曜 21:17。分をずらしているのは、
+    # 毎時0分に集中する定期実行の混雑を避けるため（GitHub の推奨）。
+    - cron: "17 21 * * 0"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: audit-${{ github.ref }}
+  # 定期実行どうしが重なることは通常ないため、途中で打ち切らない。
+  cancel-in-progress: false
+jobs:
+  # ビルドは行わず、ロックファイルの依存グラフだけを検査するため ubuntu で
+  # 実行する。Hakutaku のビルド対象は Windows（`x86_64-pc-windows-msvc`）だが、
+  # `Cargo.lock`・`package-lock.json` の内容は OS に依存しない。
+  #
+  # ただし、この「OS に依存しない」ことは検査結果の読み方に影響する。
+  # `cargo audit` は `Cargo.lock` 全体を見るため、**Windows 向けビルドには
+  # 実際には入らない依存（Linux 限定の推移依存など）の勧告も報告し得る**。
+  # 報告を受けたら、まずビルド対象で実際に使われるかを確認してから対処の要否を
+  # 判断する（`cargo tree --target x86_64-pc-windows-msvc` など）。
+  audit:
+    name: 依存の脆弱性検査（cargo audit / npm audit）
+    runs-on: ubuntu-latest
+    # 勧告データベースの取得と cargo-audit の初回ビルドを含む上限。
+    timeout-minutes: 30
+    steps:
+      # 供給網対策として、アクションはタグではなくコミット SHA で固定する。
+      # 行末コメントは固定した版を示す。更新時は、上げたい版の SHA を取り直して差し替える。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # 検査中に GITHUB_TOKEN を .git/config へ残さない
+          persist-credentials: false
+
+      # --- Rust 側（cargo audit、Cargo.lock が対象） ---
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      # cargo-audit の実行ファイルだけをキャッシュする（毎回のビルドは数分かかる
+      # 一方、実行ファイルは版を上げるまで変わらない）。勧告データベースは
+      # キャッシュせず毎回取得する（古い判断材料で「問題なし」と報告しないため）。
+      #
+      # cargo-audit 自体を新しくしたいときは、鍵の末尾（`-v1`）を上げてキャッシュを
+      # 捨てる。復元に失敗しても次のステップが導入し直すため、検査の成否には
+      # 影響しない。
+      - id: cargo-audit-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-v1
+      - if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked
+      # 既定では、脆弱性（vulnerability）が見つかった場合に失敗する。
+      # 未保守（unmaintained）などの警告は報告するが失敗させない（対処の緊急度が
+      # 異なるため。必要になった時点で `--deny warnings` を検討する）。
+      - run: cargo audit
+
+      # --- npm 側（npm audit、package-lock.json が対象） ---
+      #
+      # 依存は Tauri CLI と GUI 検査用の playwright-core（`scripts/check-gui.mjs`。
+      # 手動実行）だけで、フロントエンドのビルド工程は無い（`Tauri.toml` の
+      # frontendDist は src/ の静的ファイルを直接指す）。`npm audit` は
+      # package-lock.json だけを見るため `npm ci` は不要。
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      # 片方が失敗しても、もう片方の結果を同じ実行で得るために続行する
+      # （ジョブ全体の成否は変わらない）。
+      - if: ${{ !cancelled() }}
+        run: npm audit --audit-level=high
