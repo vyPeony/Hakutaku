@@ -1698,14 +1698,21 @@ function updateTargetRowElement(entry, row) {
     entry.badgeEl.className = badgeClassName;
   }
 
-  // 行の見た目からは落とした詳細（状態の全文・タブの有無）を、ツールチップと
-  // 支援技術向けの名前で補う。
-  const description = `${row.displayName}（${statusLabelFor(row.status)}${
-    hasOpenTab ? "、タブを開いています" : ""
-  }）`;
-  if (entry.main.title !== description) {
-    entry.main.title = description;
-    entry.main.setAttribute("aria-label", description);
+  // 行の見た目からは落とした状態の全文を、ツールチップと支援技術向けの名前で
+  // 補う。タブを開いていることは行の太字の強調（--open）で見て取れるため
+  // ツールチップには載せず、強調が伝わらない支援技術向けの名前にだけ加える
+  // （Issue #97）。そのため2本の文字列を作り、同値回避のガードも属性ごとに
+  // 分ける（片方だけが変わる場合があるため）。
+  const statusLabel = statusLabelFor(row.status);
+  const tooltip = `${row.displayName}（${statusLabel}）`;
+  const accessibleName = hasOpenTab
+    ? `${row.displayName}（${statusLabel}、タブを開いています）`
+    : tooltip;
+  if (entry.main.title !== tooltip) {
+    entry.main.title = tooltip;
+  }
+  if (entry.main.getAttribute("aria-label") !== accessibleName) {
+    entry.main.setAttribute("aria-label", accessibleName);
   }
   if (isCurrent) {
     if (entry.main.getAttribute("aria-current") !== "true") {
