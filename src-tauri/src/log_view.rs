@@ -533,6 +533,27 @@ impl From<hakutaku_core::RangeResponse> for FetchLogRangeResponse {
 /// フロントエンドは `kind` で分岐します。`generation_mismatch` は
 /// `LOG-023`／`LOG-028` の下地（表示集合が再構築されたため、古い範囲を掴んだ
 /// ままにならないようにする）です。
+///
+/// # `ERR-002` の利用者向けエラーではない（Issue #47）
+///
+/// この型は、他のコマンドの失敗（`crate::targets::UserFacingErrorDto`）と違い
+/// **`ERR-002` の5要素を持ちません**。範囲取得はスクロール・表示更新のたびに
+/// 背景で走る機械的な処理であり、ここでの失敗はフロントエンドが自分で解決
+/// する契約になっているためです。
+///
+/// - `generation_mismatch`: 表示集合が作り直された合図。フロントエンドは
+///   `current` の世代でキャッシュを捨てて取得し直すだけで、利用者へは何も
+///   通知しません（`src/log_view.js` の `handleGenerationMismatch`）。
+///   利用者が取るべき「次の操作」は存在しないため、5要素を詰めても
+///   表示されない情報が増えるだけになります
+/// - `unknown_display_set`: 表示集合が既に無い。フロントエンドは同じチャンクの
+///   取得が規定回数続けて失敗したときだけ、上部バナーで開き直しを促します
+///   （`src/log_view.js` の `recordChunkFetchFailure`）。この文面はフロント
+///   エンド側が組み立てる背景処理の通知であり、対象を開く操作の失敗を
+///   1件ずつ示す `ERR-002` のダイアログ（`src/error_panel.js`）とは別の経路です
+///
+/// 利用者の対処が必要な失敗（対象を開けない、統合表示を開始できない、コピーを
+/// 中止した等）は、この型ではなく `UserFacingErrorDto` で返します。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FetchLogRangeError {
@@ -735,20 +756,43 @@ impl From<hakutaku_core::MergedViewHandle> for MergedViewHandleDto {
     }
 }
 
-/// `enable_merged_view` が失敗した理由です（`ERR-002`、Issue #37）。
+/// 統合表示の開始がメモリ予算（`PERF-008`）で拒否されたことを表す、`ERR-002`
+/// の5要素を持つ利用者向けエラーを組み立てます（Issue #47）。
 ///
-/// 以前は理由の文字列だけを返していましたが、フロントエンドが「何が起きたか」
-/// 「なぜか」「次に何をすればよいか」を組み立てられるよう、種別と実値
-/// （`reason`）を分けた形にしています。種別ごとに利用者へ案内すべき次の操作が
-/// 異なるため（メモリ予算超過なら、開いている対象を閉じてから再試行する）、
-/// フロントエンドは `kind` で分岐します。
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum EnableMergedViewError {
-    /// `PERF-008`。統合表示の参照列（`(source_id, seq)` の並び）の確保が
-    /// メモリ予算で拒否された。**既存の表示は何も変わりません**（統合表示を
-    /// 開始しなかっただけで、ファイル別タブの閲覧は継続できます）。
-    MemoryReservationRejected { reason: String },
+/// `ERR-002` は失敗の種類ごとではなく、利用者向けエラー全般に5要素を求めて
+/// います。したがって統合表示の開始も、対象を開く操作（`crate::targets`）と
+/// 同じ [`UserFacingErrorDto`] で返し、「どのコマンドの失敗か」によって
+/// 利用者へ示せる情報が変わらないようにします。5要素の組み立てをここで行い、
+/// フロントエンドの固定文言で補わないのも同じ理由です（受け側ごとに文言が
+/// 分かれると、片方だけが更新されて食い違います）。
+///
+/// # 各要素の決め方
+///
+/// - **対象**: 統合表示は特定の1ファイルではなく「開いている全対象を横断する
+///   表示」そのものが対象のため、その旨を名称として示します
+/// - **発生位置**: 付けません（`None`）。参照列の確保は表示集合全体に対する
+///   操作であり、対象内の行・バイト位置が存在しないためです
+///   （`docs/requirements/functional.md` の `ERR-002`。表示側
+///   `src/error_panel.js` は「（特定できません）」と示します）
+/// - **理由**: メモリ予約の拒否の実値（要求量・予算）をそのまま含めます。
+///   `ERR-002` は実値の表示を制限しません
+/// - **継続可否**: 継続可能（`true`）。統合表示を開始しなかっただけで、
+///   ファイル別タブの閲覧は何も変わりません
+/// - **次の操作**: 予算を空けてからの再試行（不要な対象のタブを閉じる）
+///
+/// エラーコードは付けません。`docs/development/error-codes.md` の割り当て基準
+/// （手順書・FAQ・問い合わせ対応から参照される見込みのある失敗）に該当すると
+/// 判断していないためで、必要になった時点で領域の採番台帳とあわせて付与します。
+fn merged_view_rejection_error(
+    rejected: &hakutaku_memory_accounting::ReservationRejected,
+) -> hakutaku_core::notification::UserFacingError {
+    hakutaku_core::notification::UserFacingError::new(
+        "時系列統合表示（開いている全対象）",
+        format!(
+            "開いている全対象を横断する並び順を保持するためのメモリを確保できません（{rejected}）。"
+        ),
+        "不要な対象のタブを閉じてから、もう一度「時系列統合」を押してください。",
+    )
 }
 
 /// 現在開いている全ソースを横断する統合表示集合を構築し、ON にします
@@ -760,20 +804,34 @@ pub enum EnableMergedViewError {
 /// （`RangeRequest`／`RangeResponse`）は個別ファイルの表示集合と変わりません。
 ///
 /// メモリ予算（`PERF-008`）の逼迫で参照列（`(source_id, seq)` の並び）の確保が
-/// 拒否された場合、統合表示集合を開始せず [`EnableMergedViewError`] を返します。
+/// 拒否された場合、統合表示集合を開始せず、`ERR-002` の5要素を持つ
+/// [`UserFacingErrorDto`] を返します（Issue #47。組み立ては
+/// [`merged_view_rejection_error`]）。フロントエンド（`src/shell.js`）は、
+/// 対象を開く操作の失敗と同じ ERR-002 ダイアログ（`src/error_panel.js` の
+/// `showTargetError`）へそのまま渡します。
+///
+/// # `Err` を `Box` に入れている理由
+///
+/// [`UserFacingErrorDto`] は5要素ぶんの `String`／`Option<String>` を持つため
+/// 128バイトあり、成功側（[`MergedViewHandleDto`] は20バイト）に対して
+/// `Result` 全体が失敗側の大きさに引きずられます（`clippy::result_large_err`）。
+/// この関数の失敗はメモリ予算が尽きたときだけの例外経路なので、そこだけ
+/// ヒープへ逃がします。`serde` は `Box<T>` を中身の `T` と同じ JSON へ
+/// 直列化するため、フロントエンドとの契約（`ERR-002` の5要素を持つ
+/// オブジェクト）は変わりません。
 #[tauri::command]
 pub fn enable_merged_view(
     registry: State<'_, DisplaySetRegistryState>,
-) -> Result<MergedViewHandleDto, EnableMergedViewError> {
+) -> Result<MergedViewHandleDto, Box<UserFacingErrorDto>> {
     let mut registry_guard = registry.0.lock().unwrap_or_else(PoisonError::into_inner);
     registry_guard
         .enable_merged_view()
         .map(MergedViewHandleDto::from)
-        .map_err(
-            |rejected| EnableMergedViewError::MemoryReservationRejected {
-                reason: rejected.to_string(),
-            },
-        )
+        .map_err(|rejected| {
+            Box::new(UserFacingErrorDto::from(&merged_view_rejection_error(
+                &rejected,
+            )))
+        })
 }
 
 /// 統合表示集合を破棄し、OFF にします（`LOG-008`、`LOG-015`）。参加していた
@@ -843,26 +901,71 @@ mod tests {
         assert_eq!(converted, FetchLogRangeError::UnknownDisplaySet);
     }
 
-    // 受け入れ条件（`ERR-002`、Issue #37）: 統合表示を開始できなかった理由が、
-    // 種別（kind）と実値（reason）に分かれてフロントエンドへ届く。
-    #[test]
-    fn enable_merged_view_error_carries_kind_and_reason() {
-        let rejected = hakutaku_memory_accounting::ReservationRejected {
+    /// 統合表示のメモリ予約拒否（`PERF-008`）を表す代表値。
+    fn merged_view_rejection() -> hakutaku_memory_accounting::ReservationRejected {
+        hakutaku_memory_accounting::ReservationRejected {
             requested_bytes: 16,
             allocated_bytes: 1,
             outstanding_reserved_bytes: 2,
             budget_bytes: 3,
-        };
-        let error = EnableMergedViewError::MemoryReservationRejected {
-            reason: rejected.to_string(),
-        };
-        let json = serde_json::to_value(&error).expect("直列化できるはず");
-        assert_eq!(json["kind"], "memory_reservation_rejected");
+        }
+    }
+
+    // 受け入れ条件（`ERR-002`、Issue #47）: 統合表示を開始できなかった失敗が、
+    // 対象を開く操作の失敗と同じ5要素（対象・発生位置・理由・継続可否・
+    // 次の操作）を持つ利用者向けエラーとして届く。
+    #[test]
+    fn enable_merged_view_error_carries_all_five_user_facing_elements() {
+        let error = merged_view_rejection_error(&merged_view_rejection());
+
         assert!(
-            json["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("メモリ予約を拒否しました")),
-            "拒否理由の実値がそのまま含まれるはず: {json}"
+            error.target.contains("時系列統合表示"),
+            "何の操作が失敗したかを対象欄で識別できるはず: {}",
+            error.target
+        );
+        assert!(
+            error.reason.contains("メモリ予約を拒否しました"),
+            "拒否理由の実値がそのまま含まれるはず（ERR-002 は実値の表示を制限しない）: {}",
+            error.reason
+        );
+        assert!(
+            error.continuable,
+            "統合表示を開始しなかっただけで、ファイル別タブの閲覧は継続できるはず"
+        );
+        assert!(
+            !error.next_action.is_empty(),
+            "利用者が次に取れる操作が示されるはず"
+        );
+    }
+
+    // 受け入れ条件（`ERR-002`、Issue #47）: この失敗はファイル内の行・バイト
+    // 位置を持たない表示集合単位の失敗のため、発生位置は付けない（表示側は
+    // 「（特定できません）」を示す）。
+    #[test]
+    fn enable_merged_view_error_omits_the_location_element() {
+        let error = merged_view_rejection_error(&merged_view_rejection());
+        assert_eq!(error.location, None);
+    }
+
+    // 受け入れ条件（Issue #47）: フロントエンドへは `UserFacingErrorDto` の形
+    // （5要素＋エラーコード）で直列化され、対象を開く系のコマンドの失敗と
+    // 同じ受け側（`src/error_panel.js` の `showTargetError`）へ渡せる。
+    #[test]
+    fn enable_merged_view_error_serializes_as_the_user_facing_error_dto() {
+        let dto = UserFacingErrorDto::from(&merged_view_rejection_error(&merged_view_rejection()));
+        let json = serde_json::to_value(&dto).expect("直列化できるはず");
+
+        for field in ["target", "location", "reason", "continuable", "next_action"] {
+            assert!(
+                json.get(field).is_some(),
+                "{field} が含まれるはず（ERR-002 の5要素）: {json}"
+            );
+        }
+        assert_eq!(json["continuable"], true);
+        assert!(json["location"].is_null(), "発生位置は付けない: {json}");
+        assert!(
+            json.get("kind").is_none(),
+            "種別タグ付きの独自形式ではなく DTO であるはず: {json}"
         );
     }
 

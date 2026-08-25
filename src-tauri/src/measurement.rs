@@ -221,6 +221,20 @@ pub struct MeasurementModeResponse {
 }
 
 /// 計測モードでない場合の拒否理由、または結果の書き込みに失敗した理由です。
+///
+/// # `ERR-002` の対象外（Issue #47）
+///
+/// この型は、他のコマンドの失敗（`crate::targets::UserFacingErrorDto`）と違い
+/// **`ERR-002` の5要素を持ちません**。`ERR-002` が定めるのは「ユーザー向け
+/// エラー」の内容であり、計測モードの3コマンドは開発・検証専用で、通常の
+/// 利用者は環境変数 `HAKUTAKU_MEASURE_FILE` を設定しない限り到達しません
+/// （モジュール doc コメント、および `docs/security/data-handling.md` の
+/// 「計測モードの出力（開発・検証専用）」）。
+///
+/// 受け側も利用者向けの通知経路ではありません。計測スクリプト
+/// （`src/measurement.js`）が計測の中断を検出し、`logs/measurements/` へ
+/// 失敗記録を書き残すためだけに使います。5要素のうち「継続可否」「次の操作」
+/// を詰めても、それを読む利用者も、それを示す画面もありません。
 #[derive(Debug, Clone, Serialize)]
 pub struct MeasurementModeError {
     pub reason: String,

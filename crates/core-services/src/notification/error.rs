@@ -35,7 +35,11 @@ pub struct UserFacingError {
     /// フルパス）。何を処理していて失敗したかを示します。
     pub target: String,
     /// 発生位置（対象内のオフセット、行番号、設定ファイルの行・列など）。
-    /// 対象の文字列自体が位置を兼ねる場合は `None` でも構いません。
+    ///
+    /// 失敗が対象全体に関わり、対象内のそうした位置が存在しない場合は `None`
+    /// にします（`docs/requirements/functional.md` の `ERR-002` の節）。表示側
+    /// （`src/error_panel.js`）は欄を消さず「（特定できません）」と示すため、
+    /// `None` にしても5要素のうち位置だけが黙って抜けることはありません。
     pub location: Option<String>,
     /// 失敗の理由。
     pub reason: String,
@@ -74,6 +78,12 @@ impl UserFacingError {
     }
 
     /// 発生位置を設定します。
+    ///
+    /// 現在の呼び出し側（`src-tauri`）はこれを一度も使っていません。今の失敗は
+    /// すべて対象全体に関わるもの（ファイルを開けない、選択範囲全体が上限を
+    /// 超える、表示集合を構築できない）で、対象内の位置が存在しないためです
+    /// （`location` フィールドの doc コメント）。行や設定ファイルの行・列を伴う
+    /// 失敗を利用者へ返すようになった時点で使います。
     #[must_use]
     pub fn with_location(mut self, location: impl Into<String>) -> Self {
         self.location = Some(location.into());
