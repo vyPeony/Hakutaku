@@ -458,6 +458,11 @@ function invokeLaunchElevated() {
  * 現在開いている全ソースを横断する統合表示集合を構築する（P09-1、
  * `LOG-007`〜`LOG-008`）。
  *
+ * 失敗（`Promise` の reject）は `ERR-002` の5要素を持つ
+ * `UserFacingErrorDto` で届く（Issue #47。`src-tauri/src/log_view.rs` の
+ * `enable_merged_view`）。対象を開く操作の失敗と同じ形のため、同じ
+ * `showTargetError` へそのまま渡せる。
+ *
  * @returns {Promise<{ display_set_id: number, generation: number, total_items: number }>}
  */
 function invokeEnableMergedView() {
@@ -911,13 +916,18 @@ async function handleMergedViewToggleClick() {
 }
 
 /**
- * 統合表示の切り替えに失敗したことを、`ERR-002` の要素（何が起きたか・理由・
- * 継続可否・次の操作）を含めて通知する（Issue #37）。
+ * 統合表示の切り替えに失敗したことを、`ERR-002` の5要素を示して通知する
+ * （Issue #37、#47）。
  *
- * `enable_merged_view` は失敗理由を種別（`kind`）と実値（`reason`）に分けて
- * 返す（`src-tauri/src/log_view.rs` の `EnableMergedViewError`）。理由を捨てて
- * 固定文言だけを出すと、利用者は「なぜ切り替わらないのか」も「何をすれば
- * 切り替わるのか」も分からないまま同じ操作を繰り返すことになる。
+ * 開始（`enable_merged_view`）の失敗は `UserFacingErrorDto` で届くため、対象を
+ * 開く操作の失敗と同じダイアログ（`src/error_panel.js` の `showTargetError`）
+ * へそのまま渡す。5要素の組み立て（理由・継続可否・次の操作）は Rust 側が
+ * 持ち、ここでは見出しだけを操作に合わせて差し替える（Issue #11 と同じ形。
+ * 既定の「対象を開けませんでした」は、対象ではなく表示の切り替えが失敗した
+ * この経路とは食い違うため）。
+ *
+ * 解除（`disable_merged_view`）は値を返さず失敗理由も持たないため、従来どおり
+ * 固定文言の上部バナーで伝える。
  *
  * @param {boolean} wasEnabled 押した時点で統合表示が ON だったか（＝解除の操作）。
  * @param {unknown} error `invoke` が返した失敗（Rust 側の `Result::Err`）。
@@ -933,21 +943,39 @@ function showMergedViewToggleError(wasEnabled, error) {
     return;
   }
 
-  if (error && typeof error === "object" && "kind" in error) {
-    if (error.kind === "memory_reservation_rejected") {
-      showErrorBanner(
-        "時系列統合表示を開始できませんでした。開いている全対象を横断する並び順を" +
-          `保持するためのメモリを確保できないためです（${String(error.reason ?? "")}）。` +
-          "ファイル別タブの表示はそのまま継続できます。不要な対象のタブを閉じてから、" +
-          "もう一度「時系列統合」を押してください。",
-      );
-      return;
-    }
+  if (isUserFacingErrorDto(error)) {
+    showTargetError(/** @type {import("./targets.js").UserFacingErrorDto} */ (error), {
+      headingText: "時系列統合表示を開始できませんでした",
+    });
+    return;
   }
 
+  // DTO ではない失敗（IPC 自体の失敗など、Rust のコマンド本体へ届かなかった
+  // 場合）。5要素を作れないため、継続可否と次の操作だけを固定文言で伝える。
   showErrorBanner(
     "時系列統合表示を開始できませんでした。ファイル別タブの表示はそのまま継続できます。" +
       "もう一度「時系列統合」を押してお試しください。",
+  );
+}
+
+/**
+ * `invoke` が返した失敗が `ERR-002` の5要素を持つ `UserFacingErrorDto` かを
+ * 判定する（Issue #47）。
+ *
+ * IPC 層の失敗（コマンド本体へ届かなかった、直列化できなかった等）は文字列や
+ * 別の形で届き得るため、`showTargetError` へ渡す前に形を確かめる。`location`
+ * と `error_code` は省略され得る（`null`）ので必須の判定材料にしない。
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isUserFacingErrorDto(error) {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    typeof (/** @type {{ target?: unknown }} */ (error).target) === "string" &&
+    typeof (/** @type {{ reason?: unknown }} */ (error).reason) === "string" &&
+    typeof (/** @type {{ next_action?: unknown }} */ (error).next_action) === "string"
   );
 }
 

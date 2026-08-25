@@ -582,6 +582,19 @@ function invokeFetchLogRange(args) {
 }
 
 /**
+ * @typedef {Object} CopyRejectionDto 上限超過によるコピーの拒否
+ * （`COPY-005`／`CFG-018`。`src-tauri/src/clipboard.rs` の
+ * `CopySelectionResponse::Rejected`）。
+ * @property {number} limit_bytes 上限バイト数。
+ * @property {number} limit_lines 上限行数。
+ * @property {number} selected_lines 選択の合計行数。
+ * @property {number} [selected_bytes] 判明している範囲のバイト数（行数超過で
+ *   即拒否した場合は届かない）。
+ * @property {import("./targets.js").UserFacingErrorDto} error `ERR-002` の
+ *   5要素（Issue #47）。理由と次の操作は通知文へそのまま差し込む。
+ */
+
+/**
  * `copy_selection` コマンドを呼び出す（P10、COPY-002、Issue #85）。
  *
  * `ranges` は `start` 昇順・互いに素・`count` が1以上で、すべて表示集合の
@@ -589,10 +602,15 @@ function invokeFetchLogRange(args) {
  * 条件を検証し、満たさない場合は `invalid_selection` で拒否する）。この形は
  * `src/selection.js` の `toCopyRanges` が保証する。
  *
+ * 上限超過による拒否（`COPY-005`）は異常系ではなく正常系の応答で返り、
+ * `ERR-002` の5要素を持つ `error`（`UserFacingErrorDto`）を伴う（Issue #47）。
+ * 上限値・選択量は、単位付きの日本語表記へ整形するために数値のまま別
+ * フィールドで届く（`formatCopyRejectionMessage`）。
+ *
  * @param {{ displaySetId: number, generation: number, ranges: import("./selection.js").SelectionRange[] }} args
  * @returns {Promise<
  *   | { copied: { bytes: number, lines: number } }
- *   | { rejected: { limit_bytes: number, limit_lines: number, selected_lines: number, selected_bytes?: number } }
+ *   | { rejected: CopyRejectionDto }
  * >}
  */
 function invokeCopySelection(args) {
@@ -2417,7 +2435,17 @@ function formatByteCount(bytes) {
  * 上限超過による拒否（`COPY-005`）の通知文を組み立てる。上限値と選択量
  * （行数・判明しているバイト数）を必ず含める（作業指示「拒否時の表示」）。
  *
- * @param {{ limit_bytes: number, limit_lines: number, selected_lines: number, selected_bytes?: number }} rejected
+ * 理由と次の操作は `ERR-002` の5要素を持つ DTO（`rejected.error`）から取り、
+ * この関数では文言を持たない（Issue #47）。同じ失敗をダイアログで示す経路
+ * （`src/error_panel.js`）と文言が二重管理にならないようにするため。上限値と
+ * 選択量だけは、桁区切りと単位（`16.0 MB`）の整形が表示側の責務なので、
+ * 数値のまま受け取ってここで差し込む。
+ *
+ * 表示方式はバナーのまま変えない（Issue #49 の裁定。コピーは進行表示・世代
+ * カウンターと組で扱う操作であり、モーダルダイアログにすると連続したコピー
+ * 操作のたびに閉じる手間が要る）。
+ *
+ * @param {CopyRejectionDto} rejected
  * @returns {string}
  */
 function formatCopyRejectionMessage(rejected) {
@@ -2429,9 +2457,9 @@ function formatCopyRejectionMessage(rejected) {
       ? `、判明しているバイト数 ${formatByteCount(rejected.selected_bytes)}`
       : "";
   return (
-    `選択範囲が上限を超えているため、コピーを中止しました` +
+    `${rejected.error.reason}` +
     `（上限 ${limitLines} 行 / ${limitBytes}、選択 ${selectedLines} 行${selectedBytesPart}）。` +
-    `選択範囲を絞り込んでください。`
+    `${rejected.error.next_action}`
   );
 }
 

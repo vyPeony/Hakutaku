@@ -25,6 +25,7 @@ use hakutaku_diagnostics::{diag_info, diag_warn, Diagnostics};
 
 use crate::bootstrap::config::ConfigState;
 use crate::log_view::DisplaySetRegistryState;
+use crate::targets::UserFacingErrorDto;
 
 /// フロントエンドが指定するコピー範囲（`hakutaku_core::CopyRange` の
 /// serde 化。Issue #85）。JS 側は `{ start, count }` の配列で渡します。
@@ -52,7 +53,7 @@ impl From<CopyRangeArg> for hakutaku_core::CopyRange {
 /// 既定（`#[serde(rename_all = "snake_case")]` 付きの外部タグ表現）により、
 /// JSON は `{ "copied": { "bytes": .., "lines": .. } }` または
 /// `{ "rejected": { "limit_bytes": .., "limit_lines": .., "selected_lines": ..,
-/// "selected_bytes": .. } }` になります（作業指示の応答形どおり）。
+/// "selected_bytes": .., "error": { .. } } }` になります。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CopySelectionResponse {
@@ -60,13 +61,52 @@ pub enum CopySelectionResponse {
         bytes: u64,
         lines: u64,
     },
+    /// 上限超過による拒否（`COPY-005`／`CFG-018`）。異常ではなく正規の応答
+    /// ですが、**利用者が選択を絞り込まない限りコピーできない**ため、
+    /// `ERR-002` の利用者向けエラーとして扱います（Issue #47）。
+    ///
+    /// `error` は5要素を持つ DTO です。上限値・選択量（`limit_*`・
+    /// `selected_*`）は、フロントエンドが日本語の単位表記（`16.0 MB` など）へ
+    /// 整形して文面へ差し込むため、DTO とは別に数値のまま残しています。
+    /// 文面の組み立ては `src/log_view.js` の `formatCopyRejectionMessage` が
+    /// 行い、そこで `error.reason` と `error.next_action` を使います。
     Rejected {
         limit_bytes: u64,
         limit_lines: u64,
         selected_lines: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         selected_bytes: Option<u64>,
+        error: UserFacingErrorDto,
     },
+}
+
+/// 上限超過によるコピーの拒否（`COPY-005`）を、`ERR-002` の5要素を持つ
+/// 利用者向けエラーとして組み立てます（Issue #47）。
+///
+/// # 各要素の決め方
+///
+/// - **対象**: コピーはファイルではなく利用者の選択範囲に対する操作のため、
+///   選択範囲そのものを対象として示します。`SEC-012` によりフロントエンドへ
+///   パスを渡さないこのコマンドでは、ファイル名も持っていません
+/// - **発生位置**: 付けません（`None`）。判定は選択範囲全体の合計に対して
+///   行われ、特定の1行で失敗したわけではないためです
+///   （`docs/requirements/functional.md` の `ERR-002`）
+/// - **理由**・**次の操作**: 上限値と選択量の数値は含めません。桁区切りと
+///   単位（`16.0 MB`）の整形はフロントエンドの責務であり、応答には数値の
+///   まま別フィールドで載せています（[`CopySelectionResponse::Rejected`]）
+/// - **継続可否**: 継続可能（`true`）。クリップボードは変更しておらず
+///   （`COPY-005`）、閲覧も選択もそのまま続けられます
+///
+/// 行数超過とバイト数超過を文面で区別しないため、拒否の実値
+/// （[`hakutaku_core::CopyRejection`]）は引数に取りません。利用者が取る操作
+/// （選択を絞り込む）はどちらでも同じで、どちらの上限に当たったかは応答に
+/// 載せる上限値と選択量の対比から読み取れます。
+fn copy_rejection_error() -> UserFacingErrorDto {
+    UserFacingErrorDto::from(&hakutaku_core::notification::UserFacingError::new(
+        "選択範囲のコピー",
+        "選択範囲が上限を超えているため、コピーを中止しました",
+        "選択範囲を絞り込んでください。",
+    ))
 }
 
 /// `copy_selection` が失敗した理由です。
@@ -74,6 +114,20 @@ pub enum CopySelectionResponse {
 /// `unknown_display_set`・`generation_mismatch` は既存の範囲取得コマンド
 /// （`fetch_log_range`）と同じ意味・同じ表現（`src-tauri/src/log_view.rs` の
 /// `FetchLogRangeError` を参照）です。
+///
+/// # `ERR-002` の5要素は種別ごとにフロントエンドが組み立てる（Issue #47）
+///
+/// この型は `UserFacingErrorDto` を持ちません。ここに並ぶのはいずれも
+/// 「コピーが成立しなかった」異常系であり、利用者へ示すべき理由と次の操作が
+/// 種別ごとに大きく異なる（表示を取り直す、対象を開き直す、選択し直す、
+/// 対象の状態を確認する）ため、文面の組み立ては受け側
+/// （`src/log_view.js` の `handleCopySelectionError`）が種別で分岐して行い、
+/// 上部バナー1枚で伝えます（表示方式は Issue #49 の裁定どおり）。
+///
+/// 一方、**上限超過による拒否**（`CFG-018`）は異常系ではなく `COPY-005` が
+/// 定める正規の応答であり、[`CopySelectionResponse::Rejected`] として正常系で
+/// 返ります。そちらは利用者が選択を絞り込まない限りコピーできない失敗のため、
+/// `ERR-002` の5要素を持つ DTO を含めています（[`copy_rejection_error`]）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CopySelectionError {
@@ -238,6 +292,7 @@ pub fn copy_selection(
                 limit_lines: rejection.limit_lines,
                 selected_lines: rejection.selected_lines,
                 selected_bytes: rejection.selected_bytes,
+                error: copy_rejection_error(),
             })
         }
     }
@@ -443,6 +498,67 @@ mod tests {
         assert!(matches!(converted, CopySelectionError::SourceUnavailable));
         let json = serde_json::to_string(&converted).expect("直列化できるはず");
         assert_eq!(json, r#"{"kind":"source_unavailable"}"#);
+    }
+
+    // 受け入れ条件（`ERR-002`、Issue #47）: 上限超過による拒否が、対象を開く
+    // 操作の失敗と同じ5要素（対象・発生位置・理由・継続可否・次の操作）を
+    // 持つ利用者向けエラーを伴ってフロントエンドへ届く。
+    #[test]
+    fn copy_rejection_carries_all_five_user_facing_elements() {
+        let error = copy_rejection_error();
+
+        assert_eq!(error.target, "選択範囲のコピー");
+        assert!(
+            error.reason.contains("上限"),
+            "上限を超えたことが理由として示されるはず: {}",
+            error.reason
+        );
+        assert!(
+            error.continuable,
+            "クリップボードは変更しておらず、閲覧も選択も続けられるはず（COPY-005）"
+        );
+        assert!(
+            !error.next_action.is_empty(),
+            "利用者が次に取れる操作が示されるはず"
+        );
+    }
+
+    // 受け入れ条件（`ERR-002`、Issue #47）: 上限判定は選択範囲全体の合計に
+    // 対して行われ、特定の1行で失敗したわけではないため、発生位置は付けない
+    // （表示側は「（特定できません）」を示す）。
+    #[test]
+    fn copy_rejection_error_omits_the_location_element() {
+        assert_eq!(copy_rejection_error().location, None);
+    }
+
+    // 受け入れ条件（Issue #47）: 拒否応答は5要素の DTO（`error`）と、
+    // フロントエンドが単位付きで整形するための数値（上限値・選択量）の
+    // 両方を持つ。数値を DTO へ畳み込むと桁区切り・単位の整形先が Rust 側へ
+    // 移り、既存の通知文（`src/log_view.js`）の情報量が落ちる。
+    #[test]
+    fn copy_selection_rejected_response_carries_both_the_dto_and_the_raw_numbers() {
+        let response = CopySelectionResponse::Rejected {
+            limit_bytes: 16 * 1024 * 1024,
+            limit_lines: 100_000,
+            selected_lines: 250_000,
+            selected_bytes: Some(20 * 1024 * 1024),
+            error: copy_rejection_error(),
+        };
+        let json = serde_json::to_value(&response).expect("直列化できるはず");
+        let rejected = &json["rejected"];
+
+        assert_eq!(rejected["limit_lines"], 100_000);
+        assert_eq!(rejected["selected_lines"], 250_000);
+        assert_eq!(rejected["selected_bytes"], 20 * 1024 * 1024);
+        assert_eq!(rejected["error"]["continuable"], true);
+        assert!(
+            rejected["error"]["reason"].is_string() && rejected["error"]["next_action"].is_string(),
+            "受け側が文面へ差し込む理由と次の操作が含まれるはず: {json}"
+        );
+        assert!(
+            rejected["error"]["location"].is_null(),
+            "発生位置は付けない: {json}"
+        );
     }
 
     // 受け入れ条件（COPY-002）: 実際に Win32 クリップボードへ書き込み、
