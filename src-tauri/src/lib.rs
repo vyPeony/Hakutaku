@@ -9,11 +9,6 @@ pub mod targets;
 
 use hakutaku_diagnostics::{diag_error, diag_info, diag_warn};
 
-#[tauri::command]
-fn core_responsibilities() -> [&'static str; 4] {
-    hakutaku_core::responsibilities()
-}
-
 /// Tauri の起動処理（`tauri::Builder::run`）そのものが失敗した場合の終了コード。
 ///
 /// `bootstrap::Aborted` が使う `2`〜`4`（実行ファイル位置不明・Runtime 使用不可・
@@ -285,8 +280,11 @@ pub fn run() {
     );
 
     let build_result = tauri::Builder::default()
+        // SEC-012: 登録するコマンドは、フロントエンドが実際に呼ぶものだけに
+        // 限る。ここへ登録したコマンドは `src-tauri/permissions/<コマンド名>.toml`
+        // の許可定義と `src-tauri/capabilities/default.toml` の列挙を必ず伴う
+        // （対応関係は `node scripts/check-capabilities.mjs` が検査する）。
         .invoke_handler(tauri::generate_handler![
-            core_responsibilities,
             config_status::get_config_status,
             log_view::open_log_file,
             log_view::fetch_log_range,
@@ -473,15 +471,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamped_initial_window_size, core_responsibilities};
-
-    #[test]
-    fn tauri_command_delegates_to_the_core_layer() {
-        assert_eq!(
-            core_responsibilities(),
-            ["データソース", "形式判定", "パーサー", "共通サービス"]
-        );
-    }
+    use super::clamped_initial_window_size;
 
     /// 表示スケール 150% の 1920×1080（モニタ論理サイズ 1280×720）では、高さを
     /// 利用可能サイズ（720 − 88 = 632）へ丸める（Issue #9 の再現条件）。

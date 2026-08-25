@@ -2,7 +2,7 @@
 
 - 状態: 採用済み（Accepted）
 - 管理責任者: リポジトリメンテナー
-- 最終更新日: 2026-08-21
+- 最終更新日: 2026-08-25
 
 ## 目的
 
@@ -16,6 +16,10 @@ CI はビルド、テスト、整形、静的解析、文書リンクを実行�
 | --- | --- | --- | --- |
 | 仮想スクロールの規模依存ロジック（純粋関数） | 2000万行規模でスクロールの末尾へ到達できない。保持上限の判定が効かない。破棄の順序が非決定的になる | [`scripts/check-virtual-scroll.mjs`](../../scripts/check-virtual-scroll.mjs) | CI（`quality` ジョブ）で毎回。ローカルでは `node scripts/check-virtual-scroll.mjs` |
 | 行選択モデル（純粋関数） | 飛び飛びの選択で範囲の分割・結合を誤る。表示集合の外を指したままコピーを要求する。選択行のハイライトが二分探索の境界でずれる | [`scripts/check-selection.mjs`](../../scripts/check-selection.mjs) | CI（`quality` ジョブ）で毎回。ローカルでは `node scripts/check-selection.mjs` |
+| 取得（非同期）と破棄の順序（モデル＋呼び出し順） | 取得完了時の破棄判定が失われ、保持行数が上限を一時的に超える（段階0で観測した退行。[2.3.1節](stage0-results.md#231-機能ゲート-保持行数保持バイト数cfg-022)） | [`scripts/check-virtual-scroll.mjs`](../../scripts/check-virtual-scroll.mjs)（[判定する性質](#取得と破棄の順序競合の扱い)） | CI（`quality` ジョブ）で毎回 |
+| タブの状態モデル（純粋関数） | 対象を開き直すとタブが末尾へ移動する。閉じたときの後継タブを取り違える。背景の対象を再読み込みしただけで利用者の視点が飛ぶ | [`scripts/check-tabs.mjs`](../../scripts/check-tabs.mjs) | CI（`quality` ジョブ）で毎回。ローカルでは `node scripts/check-tabs.mjs` |
+| 参照対象一覧の状態モデル（純粋関数） | 行の鍵が変わり、読み込み中のポーリングのたびにフォーカスと選択値が失われる（Issue #48）。状態 DTO の変換漏れで進捗・エラー・昇格ボタンの提示が壊れる | [`scripts/check-targets.mjs`](../../scripts/check-targets.mjs) | CI（`quality` ジョブ）で毎回。ローカルでは `node scripts/check-targets.mjs` |
+| 登録コマンドと Capability の許可の対応（静的） | 登録したコマンドの許可を書き忘れ、その画面を操作した時点で失敗する。使わなくなったコマンドの登録・許可が残り、最小権限（`SEC-012`）が崩れる | [`scripts/check-capabilities.mjs`](../../scripts/check-capabilities.mjs) | CI（`quality` ジョブ）で毎回。ローカルでは `node scripts/check-capabilities.mjs` |
 | 画面操作を通したフロントエンドの振る舞い（対象を開く、日時精度、DOM 行ノードの上限、行番号ジャンプ、選択とコピー、統合表示、タブ、詳細パネル） | 表示ラベル・行内容の描画が壊れる。日時が元の精度で提示されなくなる。イベント委譲が切れてバッジやタブが反応しなくなる。ドラッグやCtrl+クリックが選択モデルへつながらなくなる | [`scripts/check-gui.mjs`](../../scripts/check-gui.mjs)（[GUI 自動検査](#gui-自動検査scriptscheck-guimjs)） | 手動。ローカルで `node scripts/check-gui.mjs`（CI では実行しない） |
 | 画面レイアウトの寸法（横スクロールの封じ込め、詳細パネルの見た目の非表示） | 長い行の幅がウィンドウ全体へ伝播し、左ペインごと横に流れる。`hidden` 属性が作成者スタイルに打ち消され、閉じているはずのパネルが見えたままになる | [`scripts/check-gui.mjs`](../../scripts/check-gui.mjs)（[GUI 自動検査](#gui-自動検査scriptscheck-guimjs)） | 手動。ローカルで `node scripts/check-gui.mjs`（CI では実行しない） |
 | Rust コアの内部状態（ヒープ会計、表示集合、範囲取得、設定読み込み） | 予算判定の抜け、境界のずれ、設定値の解釈違い | `cargo test --workspace --locked` | CI（`lint-test` ジョブ）。ビルド入力が変わった PR で実行 |
@@ -46,6 +50,46 @@ CI はビルド、テスト、整形、静的解析、文書リンクを実行�
 - **操作の組み合わせ**: 決定的な擬似乱数で作った400手の操作列の各段階で、範囲集合の不変条件・`isRowSelected`・選択行数・コピー範囲が、行インデックスの集合（参照モデル）と一致すること
 - **前提の同期**: [`src/log_view.js`](../../src/log_view.js) が選択モデルの関数を実際に使っていること、廃止したコピー列 UI（[ADR-0011](../architecture/decisions/0011-copy-raw-text-only.md)）を参照していないこと
 
+[`scripts/check-tabs.mjs`](../../scripts/check-tabs.mjs) は [`src/tabs.js`](../../src/tabs.js) の純粋関数を同じやり方で呼び、次を判定します（[Issue #52](https://github.com/vyPeony/Hakutaku/issues/52)）。
+
+- **追加と再オープン**（`upsertTab`）: 新しい対象は末尾へ追加してアクティブにすること。同じ対象を開き直した場合は**位置を変えず**に内容（表示集合 ID・世代・総行数）だけを差し替えること（`LOG-028`）。他のタブを巻き添えで書き換えないこと
+- **後継タブの選び方**（`closeTab`）: アクティブなタブを閉じたら右隣、右が無ければ左隣を選ぶこと。最後の1枚を閉じたら `activeTargetId` を手放すこと。背景のタブを閉じても利用者が見ているタブを動かさないこと
+- **フォーカスを動かさない内容更新**（`updateTabContent`）: 並びもアクティブなタブも変えずに内容だけを更新すること（`LOG-028` の再読み込みは背景の行にも押せるため、視点を奪わない）。見出しと対象 ID を保つこと
+- **防御的な既定動作**: 存在しない `targetId` を渡した場合（一覧の再同期のずれ、二重クリック）に、状態を壊さず同一の状態をそのまま返すこと。`getActiveTab` が一覧に無いアクティブ ID に対して `null` を返すこと
+- **不変更新**: 呼び出しのたびに新しいオブジェクトを返し、引数の状態をその場で書き換えないこと（[ADR-0006](../architecture/decisions/0006-frontend-vanilla-es-modules.md) の素の ES モジュール構成では、呼び出し側が戻り値を再代入する形で使うため）
+- **操作の組み合わせ**: 決定的な擬似乱数で作った300手の操作列の各段階で、`targetId` が重複しないこと、`activeTargetId` が `null` か現在のタブのいずれかを必ず指すこと、`getActiveTab` の結果と一致すること
+- **前提の同期**: [`src/shell.js`](../../src/shell.js) がタブの追加・切り替え・クローズ・再読み込みをこのモデルへ委ねていること
+
+[`scripts/check-targets.mjs`](../../scripts/check-targets.mjs) は [`src/targets.js`](../../src/targets.js) の純粋関数を同じやり方で呼び、次を判定します（[Issue #52](https://github.com/vyPeony/Hakutaku/issues/52)）。
+
+- **並び順と突き合わせ**: 設定由来（`get_config_status` の順序）→ アドホック（登録順）の順に並ぶこと。設定由来の名前に対応するセッションが無ければ「未読み込み」の行を作ること。名前に一致しない設定由来のセッション（通常は起こらない）を末尾へ回すこと
+- **行の鍵の安定性**（`TargetRow.key`。[Issue #48](https://github.com/vyPeony/Hakutaku/issues/48)）: 設定由来の行は未読み込み・読み込み中・読み込み済みのすべてで同じ鍵（`configured:<名前>`）を指し、対象 ID を含まないこと。一覧の中で鍵が一意であること。鍵が変わると左ペインの DOM が作り直され、読み込み中のポーリング（500ms 間隔）のたびにキーボードフォーカスと select の選択値が失われる
+- **状態 DTO の変換**: 読み込み中の進捗（総量不明は `null` のまま。0 に潰さない）、読み込み済み（`LOG-022` の生表示退避、`LOG-028` の更新未反映）、キャンセル済み・部分読み込み（`LOG-027`）、エラー（`ERR-002` の5要素、`PRIV-002` のアクセス拒否）。数値は文字列で届いても数値へ、省略された真偽値は `false` へ揃えること（昇格ボタンを誤って出さないため）
+- **防御的な既定動作**: 未知の状態種別は「読み込み中」として扱い、画面を壊さないこと
+- **前提の同期**: [`src/shell.js`](../../src/shell.js) が左ペインの行をこのモデルから作り、`TargetRow.key` を DOM 要素の対応表の鍵に使っていること
+
+[`scripts/check-capabilities.mjs`](../../scripts/check-capabilities.mjs) は、`src/` の純粋関数ではなく**ソースの静的な対応関係**を突き合わせます（[Issue #52](https://github.com/vyPeony/Hakutaku/issues/52)）。Tauri のコマンドは、`src-tauri/src/lib.rs` の `tauri::generate_handler!`（IPC の受け口）と、`src-tauri/permissions/<コマンド名>.toml`＋`src-tauri/capabilities/default.toml`（許可）の2箇所へ書く必要があり、片方だけを書いた状態はビルドでも静的解析でも検出できません。
+
+- **登録と許可の双方向**: 登録したコマンドに許可があること、許可があるコマンドが登録されていること。前者が欠けると実行時に失敗し、後者が残ると最小権限（`SEC-012`）が崩れる
+- **許可定義と Capability の列挙**: 定義した許可がすべて `default.toml` に列挙され、列挙された識別子すべてに定義があること（定義しただけでは許可されない）
+- **最小権限の形**: 1つの許可定義が1コマンドだけを許可すること。識別子とファイル名が規約（`allow-<コマンド名>`）どおりであること。1つのコマンドを複数の許可が重複して認めていないこと
+- **呼び出し側との整合**: `src/` が `invoke(...)` で呼ぶコマンドがすべて登録・許可されていること
+- **解析できない場合は失敗させる**: 想定した記法（`generate_handler!` の並び、`[[permission]]`、`commands.allow`）が見つからない・複数ある場合は、0件と比較して「差分なし」と報告せずエラーで停止する
+
+### 取得と破棄の順序競合の扱い
+
+段階0の2000万行実測では、保持行数が上限を一時的に超える事象を観測しました（241サンプル中18件、最大 +12.6%。[2.3.1節](stage0-results.md#231-機能ゲート-保持行数保持バイト数cfg-022)）。原因は [`src/log_view.js`](../../src/log_view.js) の再描画が「取得を**開始する**（`ensureChunksLoaded`。非同期、完了を待たない）→ その時点でキャッシュ済みのものだけを破棄対象にする（`evictFarChunks`）」の順に進むことにあり、対処として「取得完了直後にも破棄判定を再実行する」方式（`runPostFetchEvictionPass`）を採りました（[10.1節](stage0-results.md#101-採用した修正方針)）。
+
+この競合を CI で毎回検知するため、[`scripts/check-virtual-scroll.mjs`](../../scripts/check-virtual-scroll.mjs) に次の2つを置いています。**どちらも `log_view.js` の非同期処理そのものは実行しません。**
+
+1. **順序モデル**: 公開されている純粋関数（`computeVisibleRangeForScroll`・`computeRequiredChunkIndices`・`computeChunkRange`・`selectChunksToEvict`）だけで「スクロール → 取得開始 → 遅れて完了」の順序を組み立て、観測点ごとの保持量を確かめます。取得完了ごとに破棄する現在の方式では上限（`CFG-022`）を満たすこと、**対照実験**としてバッチ末尾でしか破棄しない旧方式では超過が再現することの両方を判定します。対照実験を置くのは、モデルが競合を表現できなくなったときに「問題なし」と報告し続けることを防ぐためです
+2. **呼び出し順の突き合わせ**: `log_view.js` のソースから、再描画が `ensureChunksLoaded` → `evictFarChunks` の順であること、`fetchChunk` がキャッシュ格納の直後に `runPostFetchEvictionPass` を呼ぶことを確認します
+
+**実物の非同期経路そのものは自動化していません。** `ensureChunksLoaded`・`evictFarChunks`・`runPostFetchEvictionPass` は `log_view.js` のモジュール内部の関数で、export されておらず、モジュール内の `state`・DOM（`requestAnimationFrame`、行要素の組み立て）・`window.__TAURI_INTERNALS__.invoke` に密結合しています。Node から実物を動かすには、(a) 内部関数を export する（検査のためにプロダクションコードの境界を変える）か、(b) DOM と IPC の代替実装を持ち込む（外部依存を増やし、[ADR-0006](../architecture/decisions/0006-frontend-vanilla-es-modules.md) の素の ES モジュール構成から外れる）ことになり、どちらも検査で得られるものに見合いません。実物の経路は次の2つで確認します。
+
+- **画面操作を通した確認**: [GUI 自動検査](#gui-自動検査scriptscheck-guimjs)の「仮想スクロール」シナリオ（10万行を全域までスクロールし、DOM 行ノード数が上限を超えないこと）
+- **大規模データでの実測**: 計測モードによる2000万行の連続スクロール検証（[手動で実行する手段](#除外した重い試験を手動で実行する手段)）。保持行数・保持バイト数の推移そのものはここでしか観測できません
+
 ### 期待値の決め方
 
 期待値は、実装が現在返す値を写したものではなく、各関数の JSDoc が定める仕様から独立に導いた値を書きます。導出の根拠（どの式へどの数値を代入したか）は、検査スクリプト内の各検査の直前にコメントとして残します。
@@ -65,13 +109,14 @@ CI はビルド、テスト、整形、静的解析、文書リンクを実行�
 
 ## 実行契機
 
-- **CI で毎回**: 軽量な純粋ロジック検査（仮想スクロール・行選択）だけを [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) の `quality` ジョブ（Ubuntu、Node のみ。`npm ci` も不要）で実行します。数十秒で終わるため、変更範囲によらず常に実行します
+- **CI で毎回**: 軽量な純粋ロジック検査（仮想スクロール・行選択・タブ・参照対象一覧）と静的な対応関係の検査（登録コマンドと Capability）だけを [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) の `quality` ジョブ（Ubuntu、Node のみ。`npm ci` も不要）で実行します。数十秒で終わるため、変更範囲によらず常に実行します
 - **CI でビルド入力の変更時**: Rust のテストと release ビルドは Windows のジョブで実行します。省略されたジョブが PR を滞らせないよう、ブランチ保護の必須ステータスチェックには集約ジョブ `CI 完了判定` を指定しています
+- **定期実行（週1回）**: 依存関係の脆弱性検査（[`.github/workflows/audit.yml`](../../.github/workflows/audit.yml)）。PR のゲートにはしません（[理由](#依存の脆弱性検査githubworkflowsaudityml)）
 - **手動**: 画面操作を通した検査（[GUI 自動検査](#gui-自動検査scriptscheck-guimjs)）と、大規模データを使う検証（[手動で実行する手段](#除外した重い試験を手動で実行する手段)）
 
 ## GUI 自動検査（`scripts/check-gui.mjs`）
 
-フロントエンドのビジネスロジック（[`src/log_view.js`](../../src/log_view.js)、[`src/shell.js`](../../src/shell.js) など）は、純粋関数の検査（`check-virtual-scroll.mjs`）でも静的検査（`check-frontend.mjs`）でも到達できない部分が残ります。表示ラベルの更新、行 DOM の組み立て、イベント委譲、Tauri コマンドとの往復は、実際に画面を動かさなければ壊れたことに気付けません（[Issue #52](https://github.com/vyPeony/Hakutaku/issues/52) の指摘、[Issue #57](https://github.com/vyPeony/Hakutaku/issues/57)）。
+フロントエンドのビジネスロジック（[`src/log_view.js`](../../src/log_view.js)、[`src/shell.js`](../../src/shell.js) など）は、純粋関数の検査（`check-virtual-scroll.mjs`・`check-selection.mjs`・`check-tabs.mjs`・`check-targets.mjs`）でも静的検査（`check-frontend.mjs`）でも到達できない部分が残ります。表示ラベルの更新、行 DOM の組み立て、イベント委譲、Tauri コマンドとの往復は、実際に画面を動かさなければ壊れたことに気付けません（[Issue #52](https://github.com/vyPeony/Hakutaku/issues/52) の指摘、[Issue #57](https://github.com/vyPeony/Hakutaku/issues/57)）。
 
 [`scripts/check-gui.mjs`](../../scripts/check-gui.mjs) は、release ビルドの `Hakutaku.exe` を環境変数 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<ポート>` 付きで起動し、`playwright-core` の `chromium.connectOverCDP` で WebView2 へ接続してこの隙間を埋めます。プロダクトコード（`src/`・`src-tauri/`・`crates/`）は一切変更していません。
 
@@ -161,10 +206,22 @@ CI へ組み込むかどうかは、ローカルで安定して動き続ける�
 | 画面と操作を通した確認（自動） | [`scripts/check-gui.mjs`](../../scripts/check-gui.mjs)。release ビルドのあと `node scripts/check-gui.mjs` を実行します（[GUI 自動検査](#gui-自動検査scriptscheck-guimjs)） |
 | 画面と操作を通した確認（手動） | [手動での動作確認手順](manual-check.md) |
 
+## 依存の脆弱性検査（`.github/workflows/audit.yml`）
+
+依存関係（`Cargo.lock`・`package-lock.json`）に既知の脆弱性が報告されていないかを、`cargo audit` と `npm audit --audit-level=high` で確認します（[Issue #52](https://github.com/vyPeony/Hakutaku/issues/52)）。
+
+**PR のゲートにはしません。** 週1回の定期実行（`schedule`）と手動実行（`workflow_dispatch`）だけで動かし、`pull_request`・`push` では起動しません。脆弱性の勧告（advisory）は依存の更新と無関係に任意の日へ新しく公開されるため、必須検査にすると、その PR の差分と因果関係のない失敗でマージが止まります。対処（依存の更新、影響評価、除外の判断）は、その PR とは別の作業として扱うほうが速く安全に進みます。ブランチ保護の必須ステータスチェックは `ci.yml` の集約ジョブ `CI 完了判定` に固定しており、このワークフローはその判定に一切関与しません。失敗は Issue にせず、ワークフローの失敗として通知されます。
+
+結果の読み方には注意が必要です。
+
+- **ビルド対象との照合が要る**: `cargo audit` は `Cargo.lock` 全体を見ます。Hakutaku のビルド対象は Windows（`x86_64-pc-windows-msvc`。[Windows ビルド互換性](../development/windows-build-compatibility.md)）に固定されているため、**実際にはビルドへ入らない依存（Linux 限定の推移依存など）の勧告も報告され得ます**。報告を受けたら、まずビルド対象で実際に使われるかを確認してから対処の要否を判断します
+- **警告では失敗させない**: 既定の `cargo audit` は脆弱性で失敗し、未保守（unmaintained）などの警告は報告するだけです。緊急度が違うため、この既定のままにしています
+- **実行環境**: ビルドを行わずロックファイルの依存グラフだけを見るため ubuntu で実行します。ロックファイルの内容は OS に依存しません
+
 ## 関連情報
 
 - 実行するコマンドの一覧: [開発ワークフローの「段階0の標準検査」](../development/workflow.md#段階0の標準検査)
 - 性能・メモリの確定要件（`PERF-*`）: [品質要件](../requirements/quality.md)
 - 保持上限の設定要件（`CFG-022`）: [機能要件](../requirements/functional.md)
 - 技術検証の段階分け（`VER-*`）: [アーキテクチャ概要](../architecture/overview.md#技術検証の確定要件)
-- 発端: [Issue #16](https://github.com/vyPeony/Hakutaku/issues/16)（大規模データでの回帰測定の自動化）、[Issue #57](https://github.com/vyPeony/Hakutaku/issues/57)（GUI 自動テストの導入）
+- 発端: [Issue #16](https://github.com/vyPeony/Hakutaku/issues/16)（大規模データでの回帰測定の自動化）、[Issue #57](https://github.com/vyPeony/Hakutaku/issues/57)（GUI 自動テストの導入）、[Issue #52](https://github.com/vyPeony/Hakutaku/issues/52)（検証体系の拡充: フロントエンド純関数検査、CI 設定、スクリプトのガード）

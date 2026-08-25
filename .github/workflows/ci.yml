@@ -16,6 +16,11 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 jobs:
+  # 各ジョブには timeout-minutes を明示する。既定は6時間で、ネットワーク待ちや
+  # ハングしたコマンドがあると、その間ランナーが占有され、`concurrency` の設定に
+  # より後続の push も待たされる。値は過去の所要時間へ十分な余裕を持たせた上限で
+  # あり、目標時間ではない（超えたら異常として打ち切る、という意味）。
+  #
   # ビルド入力に変更があるときだけ、重い Windows ジョブを実行する。
   #
   # 段階0の標準検査は `cargo fmt` / `clippy` / `build` / `test` と Tauri の release
@@ -32,6 +37,7 @@ jobs:
   changes:
     name: 変更範囲の判定
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       run: ${{ steps.filter.outputs.run }}
     steps:
@@ -127,6 +133,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: windows-latest
+    # 依存の再取得（キャッシュ復元に失敗した場合）を含む cold ビルドでも収まる上限。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -149,6 +157,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: windows-latest
+    # release ビルドは段階0の実測で2分01秒〜2分57秒（開発端末）。共有ランナーの
+    # 遅さと cold ビルドを見込んでも収まる上限。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -163,6 +174,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
+          # `npm ci` が使う ~/.npm（ダウンロードキャッシュ）を package-lock.json の
+          # ハッシュを鍵に復元し、毎回レジストリから取得する必要をなくす。復元に
+          # 失敗しても `npm ci` がそのまま取得するため、ビルドの成否には影響しない。
+          cache: 'npm'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: npm ci
       - run: npm run tauri -- build --no-bundle
@@ -174,6 +189,8 @@ jobs:
   quality:
     name: 非 Rust の検査
     runs-on: ubuntu-latest
+    # いずれも数十秒で終わる検査。数分を超えるのは異常。
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -184,13 +201,23 @@ jobs:
           node-version: 24
       # 構文、相対 import の解決、index.html の参照先を検査する
       - run: node scripts/check-frontend.mjs
-      # 仮想スクロールの規模依存ロジック（クランプ、比例写像、破棄判定）の回帰検査。
-      # 純粋関数だけを呼ぶため試験データも WebView2 も要らない
-      # （docs/verification/regression-checks.md）
+      # 仮想スクロールの規模依存ロジック（クランプ、比例写像、破棄判定、取得と
+      # 破棄の順序競合）の回帰検査。純粋関数だけを呼ぶため試験データも WebView2 も
+      # 要らない（docs/verification/regression-checks.md）
       - run: node scripts/check-virtual-scroll.mjs
       # 行選択モデル（飛び飛びの選択、ドラッグ、クランプ、コピー範囲の変換）の
       # 回帰検査。これも純粋関数だけを呼ぶ（Issue #85）
       - run: node scripts/check-selection.mjs
+      # タブの状態モデル（追加と再オープン、後継タブの選択、フォーカスを
+      # 動かさない内容更新）の回帰検査（Issue #52）
+      - run: node scripts/check-tabs.mjs
+      # 参照対象一覧の状態モデル（並び順、行の鍵の安定性、状態 DTO の変換）の
+      # 回帰検査（Issue #52、Issue #48）
+      - run: node scripts/check-targets.mjs
+      # 登録コマンド（src-tauri/src/lib.rs）と Capability の許可
+      # （src-tauri/permissions・capabilities）の対応を突き合わせる。
+      # ビルドでは検出できない片側だけの記述を防ぐ（SEC-012、Issue #52）
+      - run: node scripts/check-capabilities.mjs
       # Markdown の相対リンクと見出しアンカーの整合を検査する（外部 URL は対象外）
       - run: node scripts/check-docs-links.mjs
       # 解析のみで、スクリプトは実行しない
@@ -223,6 +250,8 @@ jobs:
     needs: [changes, lint-test, build, quality]
     if: always()
     runs-on: ubuntu-latest
+    # 判定式の評価と echo だけ。長引くのはランナー側の異常。
+    timeout-minutes: 10
     steps:
       - env:
           # 判定の材料を個別にログへ残す。上の事象では最終的な真偽値しか記録が無く、

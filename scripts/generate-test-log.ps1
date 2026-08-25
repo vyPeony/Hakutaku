@@ -37,13 +37,15 @@
     記録する。回帰試験の基準値として使う実測（P12 作業項目7、`VER-005`）に使う。
 
     生成したファイルはリポジトリの外（一時領域など）に置いてください。試験
-    データをリポジトリ内に残さないでください。
+    データをリポジトリ内に残さないでください。リポジトリ内を出力先に指定した
+    場合はエラーで停止します。
 
 .PARAMETER LineCount
     生成する行数（継続行を含む、出力ファイルの総行数）。
 
 .PARAMETER OutputPath
-    出力先のファイルパス（絶対パス・相対パスのどちらでも可）。
+    出力先のファイルパス（絶対パス・相対パスのどちらでも可）。リポジトリ内は
+    指定できません。
 
 .PARAMETER StartTimestamp
     生成する最初の行の日時。省略時は現在時刻。
@@ -236,6 +238,15 @@ function Get-CodePageEncoding {
         [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
         return [System.Text.Encoding]::GetEncoding($CodePage)
     }
+}
+
+# 生成先がリポジトリ内でないことを確認する（試験データをリポジトリへ残さない。
+# scripts/generate-sample-logs.ps1 の OutputDir 判定と同じ考え方）。フォルダを
+# 作る前に判定するのは、弾く経路でリポジトリ内へ空フォルダを残さないため。
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path.TrimEnd('\') + '\'
+$outputPathFull = [System.IO.Path]::GetFullPath($OutputPath)
+if ($outputPathFull.StartsWith($repoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "OutputPath がリポジトリ内です ($OutputPath)。試験データをリポジトリへ残さないため、リポジトリ外（一時領域など）を指定してください。"
 }
 
 $outputDir = Split-Path -Parent $OutputPath
