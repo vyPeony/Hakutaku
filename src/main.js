@@ -30,6 +30,7 @@
 import { showInfoBanner, showWarningBanner } from "./banner.js";
 import { initShell } from "./shell.js";
 import { runMeasurement } from "./measurement.js";
+import { enableWindowPublication } from "./retention_stats.js";
 
 /**
  * `get_config_status` コマンドを呼び出す。
@@ -84,7 +85,9 @@ const FALLBACK_RETENTION_LIMITS = {
  *
  * 計測モードは開発・検証専用の機能であり、`HAKUTAKU_MEASURE_FILE` 環境変数を
  * 設定して起動した場合だけ `active: true` になる。通常の利用者向け起動では
- * 常に `active: false` であり、`src/measurement.js` は一切実行されない。
+ * 常に `active: false` であり、`src/measurement.js` は一切実行されず、
+ * 保持上限の内部状態観測 API（`window.__hakutakuStats`）も公開しない
+ * （Issue #46）。
  *
  * @returns {Promise<{ active: boolean }>}
  */
@@ -147,6 +150,22 @@ async function bootstrap() {
       }
     : FALLBACK_RETENTION_LIMITS;
 
+  // P04-3: 計測モード（開発・検証専用）かどうかを、共通シェルの初期化より前に
+  // 確定させる。保持上限の内部状態観測 API（window.__hakutakuStats）は計測モード
+  // のときだけ公開するため（Issue #46）、log_view.js の初期化がその公開を試みる
+  // 時点（initShell → initLogView）で可否が決まっている必要がある。
+  // 計測の失敗で通常の起動処理を止めないよう、ここでも例外を握りつぶして
+  // コンソールへ記録するだけにする。
+  let measurementMode = { active: false };
+  try {
+    measurementMode = await fetchMeasurementMode();
+  } catch (error) {
+    console.error("計測モードの確認に失敗しました:", error);
+  }
+  if (measurementMode.active) {
+    enableWindowPublication();
+  }
+
   // CFG-016（安全モード）では ConfigState::config が組み込み既定値になり
   // data_source_names も空になるため、事前定義パスの一覧には現れない
   // （設定由来のデータソースを無効化する要件どおり）。get_config_status 自体が
@@ -157,16 +176,8 @@ async function bootstrap() {
     dataSourceNames: status ? status.data_source_names : [],
   });
 
-  // P04-3: 計測モード（開発・検証専用）が有効な場合だけ、計測
-  // スクリプトを自動実行する。通常起動では get_measurement_mode が
-  // active: false を返し、以降は何も行わない。計測の失敗で通常の起動処理を
-  // 止めないよう、ここでも例外を握りつぶしてコンソールへ記録するだけにする。
-  let measurementMode = { active: false };
-  try {
-    measurementMode = await fetchMeasurementMode();
-  } catch (error) {
-    console.error("計測モードの確認に失敗しました:", error);
-  }
+  // 計測モードが有効な場合だけ、計測スクリプトを自動実行する。通常起動では
+  // get_measurement_mode が active: false を返し、以降は何も行わない。
   if (measurementMode.active) {
     runMeasurement(retentionLimits).catch((error) => {
       console.error("計測モードの実行に失敗しました:", error);

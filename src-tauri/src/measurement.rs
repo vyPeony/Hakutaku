@@ -15,9 +15,17 @@
 //!
 //! # SEC-009 との整合
 //!
-//! 計測結果 JSON の書き込み先は、起動時に確定した `logs` ディレクトリに限定
-//! します（実行時に作成・書き込みするフォルダを `logs`・`temp`・`WebView2` に
-//! 限定する方針に従う。新しいフォルダは作りません）。
+//! 計測結果 JSON の書き込み先は、起動時に確定した `logs` ディレクトリの直下へ
+//! 作る `measurements` サブフォルダに限定します（実行時に作成・書き込みする
+//! フォルダを `logs`・`temp`・`WebView2` に限定する方針に従う。`logs` の外へは
+//! 書き込まず、実行時フォルダも増やしません）。導入フォルダごと退避・削除すれば
+//! 計測結果も一緒に処分できます。サブフォルダは結果を書き出すときにだけ作るため、
+//! 通常の利用者向け起動では作られません。
+//!
+//! 計測結果は診断ログではないため、`DIAG-002` のローテーション（10 MiB × 5世代）
+//! の対象ではなく、`SEC-006` の `temp` 清掃の対象でもありません（削除は手動、
+//! または導入フォルダごとの削除）。`logs` 直下ではなくサブフォルダへ分ける理由は
+//! [`RESULT_DIR_NAME`] を参照してください（Issue #46）。
 //!
 //! # 計測モードでない場合の拒否
 //!
@@ -25,6 +33,25 @@
 //! 有効でない場合、対象ファイルの読み込みや結果の書き込みを一切行わずに拒否
 //! します（[`open_measurement_file_core`]・[`record_measurement_results_core`]
 //! の単体テストで確認しています）。
+//!
+//! # 製品ビルドから分離しない理由（Issue #46）
+//!
+//! この3コマンドは release ビルドでも `tauri::generate_handler!` へ登録され、
+//! Capability（`src-tauri/capabilities/default.toml`）にも常時含まれます。
+//! ビルドで切り分けない理由:
+//!
+//! 1. 計測は release ビルドでの実測が目的であり、`#[cfg(debug_assertions)]` で
+//!    落とすと、計測したいビルドから計測手段が消える
+//! 2. Cargo feature で切り分けると `generate_handler!` の登録一覧が feature ごとに
+//!    二重化し、静的な toml である Capability にも feature 分岐が要る。
+//!    `scripts/check-capabilities.mjs` は「登録一覧と許可の1対1対応」を前提に
+//!    整合を検査しており、その前提が壊れて検査が成立しなくなる
+//! 3. 実行時ゲート（環境変数 `HAKUTAKU_MEASURE_FILE`）が3コマンドすべてで
+//!    機能しており、未設定の起動では対象ファイルの読み取りも結果の書き込みも
+//!    行われない（このモジュールの単体テストで固定）
+//!
+//! この判断は `docs/security/data-handling.md` の「計測モードの出力（開発・
+//! 検証専用）」にも記録しています。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -47,6 +74,15 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 計測結果 JSON のファイル名の接頭辞。
 const RESULT_FILE_PREFIX: &str = "measurement-p04-";
+
+/// 計測結果 JSON を置く、`logs` 直下のサブフォルダ名（Issue #46）。
+///
+/// `logs` 直下へ直接置くと、`DIAG-002` のローテーション（10 MiB × 5世代）で
+/// 管理される診断ログと、ローテーションも自動清掃もされない計測結果とが同じ
+/// 場所に並ぶ。`docs/security/data-handling.md` の `logs` の説明（10 MiB × 5世代）
+/// からは後者の無期限の蓄積を想定できないため、計測結果はこのサブフォルダへ
+/// 隔離し、そこだけを手動削除の対象として文書化する。
+const RESULT_DIR_NAME: &str = "measurements";
 
 /// PrivateUsage 時系列の1点（経過ミリ秒・合計バイト・プロセス数）。
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -75,9 +111,19 @@ impl MeasurementState {
     /// 計測モードが意図せず有効になることを避ける）。`logs_dir` は結果 JSON の
     /// 書き込み先（`record_measurement_results`）です。
     pub fn from_env(logs_dir: PathBuf) -> Self {
-        let measure_file = resolve_measure_file_path(std::env::var_os(MEASURE_FILE_ENV_VAR));
+        Self::from_raw_env_value(std::env::var_os(MEASURE_FILE_ENV_VAR), logs_dir)
+    }
+
+    /// 環境変数の生の値から状態を組み立てます。
+    ///
+    /// [`MeasurementState::from_env`] は現在のプロセスの環境変数を読むだけで、
+    /// 有効・無効の判断はすべてこちらへ集約します。これにより、単体テストは
+    /// 「環境変数が未設定」（`None`）の状態を、プロセスの環境変数を書き換えずに
+    /// 再現できます（環境変数の書き換えは同一プロセスで並行して走る他のテストへ
+    /// 影響するため使いません）。
+    fn from_raw_env_value(raw: Option<std::ffi::OsString>, logs_dir: PathBuf) -> Self {
         MeasurementState {
-            measure_file,
+            measure_file: resolve_measure_file_path(raw),
             logs_dir,
             samples: Mutex::new(Vec::new()),
         }
@@ -87,16 +133,6 @@ impl MeasurementState {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.measure_file.is_some()
-    }
-
-    /// テスト専用のコンストラクタ（環境変数を経由せず、状態を直接組み立てる）。
-    #[cfg(test)]
-    fn for_test(measure_file: Option<PathBuf>, logs_dir: PathBuf) -> Self {
-        MeasurementState {
-            measure_file,
-            logs_dir,
-            samples: Mutex::new(Vec::new()),
-        }
     }
 
     /// テスト専用: サンプラースレッドを起動せずに、時系列へ1点だけ直接追加する。
@@ -204,14 +240,22 @@ fn rejected(reason: impl Into<String>) -> MeasurementModeError {
     }
 }
 
+/// [`get_measurement_mode`] の中核ロジックです。ほかの2コマンドと同じく、
+/// `State` を必要としない形に切り出して単体テストできるようにします。
+fn measurement_mode_core(measurement: &MeasurementState) -> MeasurementModeResponse {
+    MeasurementModeResponse {
+        active: measurement.is_active(),
+    }
+}
+
 /// 計測モードが有効かどうかを返します。フロントエンドの起動フロー
 /// （`src/main.js`）がこれを見て、計測スクリプト（`src/measurement.js`）を
-/// 自動実行するかどうかを判断します。
+/// 自動実行するかどうかと、保持上限の内部状態観測 API
+/// （`window.__hakutakuStats`、`src/retention_stats.js`）を公開するかどうかを
+/// 判断します（Issue #46）。
 #[tauri::command]
 pub fn get_measurement_mode(state: State<'_, Arc<MeasurementState>>) -> MeasurementModeResponse {
-    MeasurementModeResponse {
-        active: state.is_active(),
-    }
+    measurement_mode_core(state.inner())
 }
 
 /// [`open_measurement_file`] の中核ロジックです。`State` を必要としない形に
@@ -375,9 +419,23 @@ fn record_measurement_results_core(
 
     let body = serde_json::to_vec_pretty(&document).unwrap_or_else(|_| results_json.into_bytes());
 
-    let file_name = format!("{RESULT_FILE_PREFIX}{}.json", unix_timestamp_secs());
-    // SEC-009: logs ディレクトリの直下だけに書き込む。
-    let target_path = measurement.logs_dir.join(&file_name);
+    // SEC-009: 書き込み先は logs 配下だけに限る。サブフォルダ
+    // （[`RESULT_DIR_NAME`]）は計測結果を書き出すこの場面でだけ作るため、
+    // 通常の利用者向け起動では作られない。
+    let target_dir = measurement.logs_dir.join(RESULT_DIR_NAME);
+    if let Err(error) = std::fs::create_dir_all(&target_dir) {
+        diag_warn!(
+            diagnostics,
+            module = "measurement",
+            operation = "measurement.record",
+            "計測結果の保存先フォルダを作成できませんでした: {}（{error}）",
+            target_dir.display()
+        );
+        return Err(rejected(format!(
+            "計測結果の保存先フォルダを作成できませんでした: {error}"
+        )));
+    }
+    let target_path = target_dir.join(result_file_name());
 
     match std::fs::write(&target_path, &body) {
         Ok(()) => {
@@ -405,13 +463,14 @@ fn record_measurement_results_core(
     }
 }
 
-/// 計測結果を `logs` ディレクトリへ書き出します。
+/// 計測結果を `logs\measurements` フォルダへ書き出します。
 ///
 /// フロントエンド（`src/measurement.js`）が集計した JSON 文字列
 /// （`results_json`）に、Rust 側で採取した PrivateUsage 時系列（作業項目5）を
-/// 添えて、`measurement-p04-<UNIXタイムスタンプ>.json` として `logs`
-/// ディレクトリへ書き出します（`SEC-009`）。計測モードでない場合は書き込みを
-/// 行わず拒否します（[`record_measurement_results_core`]）。
+/// 添えて、`measurement-p04-<PID>-<ナノ秒>.json` として `logs` 直下の
+/// `measurements` フォルダへ書き出します（`SEC-009`。フォルダが無ければ作成
+/// します）。計測モードでない場合は書き込みを行わず拒否します
+/// （[`record_measurement_results_core`]）。
 #[tauri::command]
 pub fn record_measurement_results(
     state: State<'_, Arc<MeasurementState>>,
@@ -423,11 +482,23 @@ pub fn record_measurement_results(
     record_measurement_results_core(measurement_state, diagnostics_ref, results_json)
 }
 
-fn unix_timestamp_secs() -> u64 {
-    SystemTime::now()
+/// 計測結果 JSON のファイル名を作ります。
+///
+/// プロセス ID と現在時刻（UNIX エポックからのナノ秒）を組み合わせます
+/// （`bootstrap::layout` の書き込み確認用ファイル名と同じ流儀）。以前は秒精度
+/// だったため、同じ秒のうちに2回書き出すと1回目を黙って上書きしていました
+/// （Issue #46）。同一プロセスの連続書き出しはナノ秒で、別プロセスの同時計測は
+/// PID で区別されます。
+///
+/// `SystemTime::duration_since` が失敗する（システム時計がエポックより前）
+/// という通常起こり得ない状況でも panic せず `0` へフォールバックします。
+fn result_file_name() -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{RESULT_FILE_PREFIX}{pid}-{nanos}.json")
 }
 
 #[cfg(test)]
@@ -457,6 +528,35 @@ mod tests {
         ))
     }
 
+    /// 環境変数 `HAKUTAKU_MEASURE_FILE` が未設定のまま起動した状態
+    /// （通常の利用者向け起動と同じ）を、プロセスの環境変数を書き換えずに作る。
+    fn state_without_env_var(logs_dir: PathBuf) -> MeasurementState {
+        MeasurementState::from_raw_env_value(None, logs_dir)
+    }
+
+    /// 環境変数へ絶対パスを設定して起動した状態（計測モード）を作る。
+    fn state_with_env_var(measure_file: &std::path::Path, logs_dir: PathBuf) -> MeasurementState {
+        MeasurementState::from_raw_env_value(
+            Some(measure_file.as_os_str().to_os_string()),
+            logs_dir,
+        )
+    }
+
+    /// `logs\measurements` 配下の計測結果ファイル名を昇順で返す。
+    fn result_file_names(logs_dir: &std::path::Path) -> Vec<String> {
+        let measurements_dir = logs_dir.join(RESULT_DIR_NAME);
+        let Ok(entries) = std::fs::read_dir(&measurements_dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(RESULT_FILE_PREFIX))
+            .collect();
+        names.sort();
+        names
+    }
+
     // --- resolve_measure_file_path（純粋関数）の単体テスト ---
 
     #[test]
@@ -477,13 +577,65 @@ mod tests {
         assert_eq!(resolve_measure_file_path(None), None);
     }
 
+    // --- 環境変数が未設定のとき（＝通常の利用者向け起動）の3コマンド ---
+
+    // 受け入れ条件: 環境変数 HAKUTAKU_MEASURE_FILE が未設定の起動では、
+    // get_measurement_mode が active: false を返す（`SEC-012`、Issue #46）。
+    // 3コマンドは release ビルドにも登録・許可されたままのため、実行時ゲートが
+    // 効いていることをここで固定する（モジュール doc コメント「製品ビルドから
+    // 分離しない理由」参照）。
+    #[test]
+    fn measurement_mode_core_reports_inactive_when_env_var_is_unset() {
+        let measurement = state_without_env_var(unique_temp_dir("mode-inactive"));
+
+        assert!(!measurement.is_active());
+        assert!(
+            !measurement_mode_core(&measurement).active,
+            "環境変数が未設定なら計測モードは無効のはず"
+        );
+    }
+
+    // 受け入れ条件: 環境変数が未設定なら、実在する読み取り可能なファイルが
+    // あっても open_measurement_file はそれを読まない（`SEC-012`、Issue #46）。
+    //
+    // open_measurement_file はフロントエンドからパスを受け取らず（引数が無い）、
+    // 対象パスの唯一の入力は環境変数である。したがって環境変数が未設定の起動では、
+    // フロントエンド（WebView 上のスクリプト）がこのコマンドを呼び出せたとしても、
+    // 任意パスの読み取りには使えない。
+    #[test]
+    fn open_measurement_file_core_cannot_read_any_path_without_the_env_var() {
+        let dir = unique_temp_dir("open-no-env");
+        std::fs::create_dir_all(&dir).expect("作業ディレクトリを作成できません");
+        let readable_file = dir.join("readable.log");
+        std::fs::write(
+            &readable_file,
+            "2026/07/28 15:12:23.456 読まれないはずの行\n",
+        )
+        .expect("対象ファイルを作成できません");
+
+        let measurement = state_without_env_var(dir.clone());
+        let mut registry = hakutaku_core::DisplaySetRegistry::new();
+        let diagnostics = inactive_diagnostics();
+
+        let result = open_measurement_file_core(&measurement, &mut registry, &diagnostics, &[]);
+
+        assert!(result.is_err(), "環境変数が未設定の場合は拒否するはず");
+        assert!(registry.is_empty(), "拒否時は表示集合を登録しないはず");
+        assert!(
+            readable_file.exists(),
+            "対象ファイル自体は残る（読み取りも行われない）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- open_measurement_file_core の単体テスト ---
 
     // 受け入れ条件: 計測モードでないときに open_measurement_file が動かない
     // （要求を拒否する）。
     #[test]
     fn open_measurement_file_core_rejects_when_inactive() {
-        let measurement = MeasurementState::for_test(None, unique_temp_dir("open-inactive"));
+        let measurement = state_without_env_var(unique_temp_dir("open-inactive"));
         let mut registry = hakutaku_core::DisplaySetRegistry::new();
         let diagnostics = inactive_diagnostics();
 
@@ -506,7 +658,7 @@ mod tests {
         )
         .expect("計測対象ファイルを作成できません");
 
-        let measurement = MeasurementState::for_test(Some(file_path.clone()), dir.clone());
+        let measurement = state_with_env_var(&file_path, dir.clone());
         let mut registry = hakutaku_core::DisplaySetRegistry::new();
         let diagnostics = inactive_diagnostics();
 
@@ -534,11 +686,12 @@ mod tests {
     // --- record_measurement_results_core の単体テスト ---
 
     // 受け入れ条件: 計測モードでないときに record_measurement_results が動かない
-    // （要求を拒否し、ファイルを書き出さない）。
+    // （要求を拒否し、ファイルを書き出さない）。環境変数が未設定なら、
+    // measurements サブフォルダの作成も行わない（Issue #46）。
     #[test]
     fn record_measurement_results_core_rejects_when_inactive() {
         let dir = unique_temp_dir("record-inactive");
-        let measurement = MeasurementState::for_test(None, dir.clone());
+        let measurement = state_without_env_var(dir.clone());
         let diagnostics = inactive_diagnostics();
 
         let result = record_measurement_results_core(&measurement, &diagnostics, "{}".to_string());
@@ -550,7 +703,7 @@ mod tests {
         );
     }
 
-    // 受け入れ条件: 計測モードが有効な場合、logs ディレクトリへ
+    // 受け入れ条件: 計測モードが有効な場合、logs\measurements へ
     // measurement-p04-*.json を書き出し、フロントエンド結果と PrivateUsage
     // 時系列の両方を含む。
     #[test]
@@ -558,7 +711,7 @@ mod tests {
         let dir = unique_temp_dir("record-active");
         std::fs::create_dir_all(&dir).expect("logs ディレクトリを作成できません");
         let measure_file = dir.join("dummy.log");
-        let measurement = MeasurementState::for_test(Some(measure_file), dir.clone());
+        let measurement = state_with_env_var(&measure_file, dir.clone());
         measurement.push_sample_for_test(PrivateUsageSamplePoint {
             elapsed_ms: 500,
             total_private_usage_bytes: 12_345,
@@ -578,20 +731,11 @@ mod tests {
         );
         assert!(result.is_ok(), "{result:?}");
 
-        let entries: Vec<_> = std::fs::read_dir(&dir)
-            .expect("logs ディレクトリを読み取れません")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(RESULT_FILE_PREFIX)
-            })
-            .collect();
-        assert_eq!(entries.len(), 1, "計測結果ファイルが1件生成されるはず");
+        let names = result_file_names(&dir);
+        assert_eq!(names.len(), 1, "計測結果ファイルが1件生成されるはず");
 
-        let content =
-            std::fs::read_to_string(entries[0].path()).expect("計測結果ファイルを読み取れません");
+        let content = std::fs::read_to_string(dir.join(RESULT_DIR_NAME).join(&names[0]))
+            .expect("計測結果ファイルを読み取れません");
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("有効な JSON のはず");
         assert_eq!(parsed["frontend"]["note"], "テスト用の結果");
         let time_series = parsed["private_usage_time_series"]
@@ -600,6 +744,89 @@ mod tests {
         assert_eq!(time_series.len(), 2);
         assert_eq!(time_series[0]["elapsed_ms"], 500);
         assert_eq!(time_series[1]["total_private_usage_bytes"], 23_456);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 受け入れ条件: 計測結果は logs 直下ではなく logs\measurements へ書き出し、
+    // サブフォルダが無ければ書き込み時に作成する（`SEC-009`、Issue #46）。
+    #[test]
+    fn record_measurement_results_core_writes_into_the_measurements_subdirectory() {
+        let dir = unique_temp_dir("record-subdir");
+        std::fs::create_dir_all(&dir).expect("logs ディレクトリを作成できません");
+        let measurements_dir = dir.join(RESULT_DIR_NAME);
+        assert!(
+            !measurements_dir.exists(),
+            "書き込み前はサブフォルダが無い状態から始める"
+        );
+
+        let measure_file = dir.join("dummy.log");
+        let measurement = state_with_env_var(&measure_file, dir.clone());
+        let diagnostics = inactive_diagnostics();
+
+        let result = record_measurement_results_core(&measurement, &diagnostics, "{}".to_string());
+        assert!(result.is_ok(), "{result:?}");
+
+        assert!(
+            measurements_dir.is_dir(),
+            "書き込み時にサブフォルダを作成するはず"
+        );
+        assert_eq!(result_file_names(&dir).len(), 1);
+
+        // logs 直下（診断ログとローテーションの場所）へは何も置かない。
+        let leftovers_in_logs_root: Vec<String> = std::fs::read_dir(&dir)
+            .expect("logs ディレクトリを読み取れません")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(RESULT_FILE_PREFIX))
+            .collect();
+        assert!(
+            leftovers_in_logs_root.is_empty(),
+            "logs 直下に計測結果が残っています: {leftovers_in_logs_root:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 受け入れ条件: 同一プロセスで連続して書き出しても、前回の結果を上書きせず
+    // 別名で残る（秒精度のファイル名による黙った上書きの解消。Issue #46）。
+    #[test]
+    fn record_measurement_results_core_does_not_overwrite_consecutive_results() {
+        let dir = unique_temp_dir("record-consecutive");
+        std::fs::create_dir_all(&dir).expect("logs ディレクトリを作成できません");
+        let measure_file = dir.join("dummy.log");
+        let measurement = state_with_env_var(&measure_file, dir.clone());
+        let diagnostics = inactive_diagnostics();
+
+        for note in ["1回目", "2回目"] {
+            let result = record_measurement_results_core(
+                &measurement,
+                &diagnostics,
+                format!(r#"{{"note":"{note}"}}"#),
+            );
+            assert!(result.is_ok(), "{result:?}");
+        }
+
+        let names = result_file_names(&dir);
+        assert_eq!(names.len(), 2, "2回分が別名で残るはず: {names:?}");
+        assert_ne!(names[0], names[1]);
+
+        // どちらの回の内容も失われていないこと（先の回が後の回で潰されていない）。
+        let mut notes: Vec<String> = names
+            .iter()
+            .map(|name| {
+                let content = std::fs::read_to_string(dir.join(RESULT_DIR_NAME).join(name))
+                    .expect("計測結果ファイルを読み取れません");
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&content).expect("有効な JSON のはず");
+                parsed["frontend"]["note"]
+                    .as_str()
+                    .expect("note は文字列のはず")
+                    .to_string()
+            })
+            .collect();
+        notes.sort();
+        assert_eq!(notes, vec!["1回目".to_string(), "2回目".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
