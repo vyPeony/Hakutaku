@@ -92,6 +92,10 @@
 //   `.log-row--selected` でハイライトする。仮想スクロールで行 DOM は作り直され
 //   るため、選択状態はモデル側だけが持ち、描画のたびに `isRowSelected` で
 //   復元する。
+// - **キーボードでの選択（Issue #49）**: `Shift+↓`／`Shift+↑` で選択範囲を
+//   1行ずつ拡張・縮小し、`Esc` で選択を解除する。詳細は後述の
+//   「キーボードでの選択操作」を参照。素の矢印キー・PageUp／PageDown の
+//   スクロール挙動は変えない。
 // - **Ctrl+C**: 選択があれば `copy_selection` を呼ぶ（`preventDefault` で
 //   ブラウザ既定のコピーを抑止し、常にこの経路を通す）。選択が無ければ
 //   何もしない（クリップボードを変更しない。`COPY-006`）。上限判定
@@ -107,6 +111,31 @@
 //   分岐しない。統合表示の画面にだけ出る読み込み元ラベル列（`LOG-007`）は
 //   コピーに含まれない（コピーは原文そのままのため）。
 //
+// ## コピーの進行表示と、応答が返らない場合の復帰（Issue #49）
+//
+// `copy_selection` の往復は、選択が大きいほど（上限は既定16 MiB）時間がかかる。
+// 従来は往復中の表示が何も無く、多重実行を防ぐ `state.copyInFlight` を戻す
+// のも応答が届いた場合だけだったため、**IPC が解決も拒否もしないまま終わると
+// 以後の Ctrl+C が無言で効かなくなる**（利用者には操作の失敗と区別が付かない）。
+// 次の3点で、進行中であることと、詰まったままにならないことを保証する。
+//
+//   1. 解決・拒否のどちらの経路でも必ず `copyInFlight` を戻す
+//      （`finishCopyAttempt`）
+//   2. 開始から `COPY_PROGRESS_BANNER_DELAY_MS` 経っても決着しない場合だけ
+//      「コピー中…」の情報バナーを出し、決着時に消す（すぐ終わるコピーで
+//      バナーが一瞬ちらつかないよう、遅延して出す）
+//   3. `COPY_TIMEOUT_MS` を過ぎても決着しない場合は `copyInFlight` を強制的に
+//      戻し、警告バナーで再試行を促す。**タイムアウト後に遅れて届いた応答は
+//      通知しない**（世代カウンター `state.copyRequestSerial` で判定する。
+//      「失敗しました」と言った直後に「コピーしました」と言わないため）
+//
+// タイムアウトは IPC を中断しない（Tauri のコマンド呼び出しにキャンセル手段が
+// 無い。範囲取得の文脈照合と同じ制約）。したがってタイムアウトは「Rust 側の
+// 処理を止めるもの」ではなく、「画面側の詰まりを解くもの」である。遅れて
+// 届いた応答が実際にはクリップボードを書き換えている可能性があるため、警告の
+// 文面は「コピーできませんでした」ではなく「完了しません」とし、結果を断定
+// しない。
+//
 // ## 選択操作を mousedown へ一本化した理由（Issue #85）
 //
 // ドラッグ選択を追加するには押した瞬間に開始行を決める必要があるため、行の
@@ -120,6 +149,28 @@
 // からの挙動をそのまま維持する）。バッジの Enter / Space による操作は
 // `mousedown` を伴わず `click` だけが届くため、この分担でキーボード操作も
 // 従来どおり動く。
+//
+// ## キーボードでの選択操作（Issue #49）
+//
+// マウスを使わずに選択を作れるよう、ビューポートの `keydown`
+// （`handleViewportKeydown`。既存の単一購読）へ次の2つを足した。
+//
+// - **`Shift+↓` / `Shift+↑`**: アンカーを固定したまま可動端（フォーカス行）を
+//   1行動かし、「アンカー〜可動端」の範囲へ選択を置き換える
+//   （`src/selection.js` の `extendSelectionByStep`）。アンカーは直近の選択
+//   操作（クリック・Ctrl+クリック・ドラッグ・Shift+矢印）の基準行であり、
+//   選択が無い状態から押した場合は**可視範囲の先頭行**から始める。可動端が
+//   画面の外へ出る場合は、その行が見えるところまで自動スクロールする
+//   （`scrollRowIntoView`）
+// - **`Esc`**: 選択を解除する（`clearSelection`）。**選択が空のときは何もせず、
+//   `preventDefault` もしない**。Esc は他の用途（モーダルダイアログを閉じる、
+//   将来の入力欄のキャンセル）でも使われるため、選択解除として実際に働いた
+//   ときだけ既定動作を止める
+//
+// 素の矢印キー・PageUp／PageDown・修飾キー無しの Home／End は従来どおり
+// ブラウザ既定のスクロールに任せる（`handleViewportKeydown` の doc コメント）。
+// フォーカスの可視化・ARIA・Tab 順序は Issue #50 の担当範囲であり、ここでは
+// 扱わない（選択の可動端は `.log-row--selected` のハイライトでのみ見える）。
 //
 // ## 新しい単一購読（PERF-012: 行ごとのイベントリスナーを追加しない設計の継続）
 //
@@ -171,19 +222,23 @@ import {
   computeVisibleRangeForScroll,
   computeSpacerHeightsForScroll,
   computeScrollTopForRowIndexScaled,
+  JUMP_CONTEXT_ROWS,
 } from "./virtual_scroll.js";
 import {
   clampSelectionToTotalItems,
+  clearSelection,
   createSelectionState,
+  extendSelectionByStep,
   extendSelectionTo,
   isRowSelected,
+  isSelectionEmpty,
   selectAll,
   selectSingleRow,
   toCopyRanges,
   toggleRowSelection,
   updateDragSelection,
 } from "./selection.js";
-import { showErrorBanner, showInfoBanner } from "./banner.js";
+import { dismissBanner, showErrorBanner, showInfoBanner, showWarningBanner } from "./banner.js";
 import * as retentionStats from "./retention_stats.js";
 
 /**
@@ -262,6 +317,55 @@ const DRAG_AUTO_SCROLL_INTERVAL_MS = 50;
  * 制御できなくなる。3行ぶん × 20回/秒 = 毎秒60行を上限とする。
  */
 const DRAG_AUTO_SCROLL_MAX_STEP_PX = ROW_HEIGHT_PX * 3;
+
+/**
+ * キーボードでの選択（Shift+↓／Shift+↑）で可動端が画面外へ出たとき、その行を
+ * 画面の端からいくつ内側へ入れるか（行数。Issue #49）。
+ *
+ * 自動スクロールの目標位置は `computeScrollTopForRowIndexScaled`（行番号
+ * ジャンプと同じ順写像）で求める。この関数は比例写像が効く規模（総理論高さが
+ * `MAX_TOTAL_HEIGHT_PX` を超える場合。`src/virtual_scroll.js`）では目標行を
+ * 画面最上部から `JUMP_CONTEXT_ROWS` 行ぶん下に置き、さらに
+ * 実機（WebView2）の座標量子化で1行前後する。端ちょうどを狙うと、その分だけ
+ * 可動端が画面の外へはみ出して「選択が見えないまま伸びる」ことになるため、
+ * ずれの最大値（`JUMP_CONTEXT_ROWS` + 1行）を余裕として内側へ入れる。
+ * 1:1写像の通常規模では、この余裕がそのまま可動端の先の文脈行数になる。
+ */
+const KEYBOARD_SCROLL_CONTEXT_ROWS = JUMP_CONTEXT_ROWS + 1;
+
+/**
+ * コピーの進行表示（「コピー中…」の情報バナー）を出すまでの待ち時間
+ * （ミリ秒。Issue #49）。
+ *
+ * 小さな選択のコピーは一瞬で終わるため、開始と同時に出すとバナーが現れて
+ * すぐ消える点滅になる。人が「反応が無い」と感じ始める前で、かつ通常の
+ * コピーでは到達しない長さとしてこの値を置く。
+ */
+const COPY_PROGRESS_BANNER_DELAY_MS = 300;
+
+/**
+ * コピーの安全タイムアウト（ミリ秒。Issue #49）。
+ *
+ * `copy_selection` が解決も拒否もしないまま終わると、多重実行を防ぐ
+ * `state.copyInFlight` が戻らず、以後の Ctrl+C が無言で効かなくなる。上限
+ * （既定16 MiB）に近い選択のコピーが正常に終わるだけの余裕を取りつつ、
+ * 詰まりに気付いた利用者が待ち続けない長さとしてこの値を置く。
+ */
+const COPY_TIMEOUT_MS = 30_000;
+
+/**
+ * コピーの進行表示に使う固定のバナーキー（`src/banner.js` の
+ * `InfoBannerOptions`。Issue #49）。決着時に `dismissBanner` で消すため、
+ * 文面ではなくキーで指す。
+ */
+const COPY_PROGRESS_BANNER_KEY = "log-view-copy-progress";
+
+/**
+ * コピー成功の通知に使う固定のバナーキー（Issue #49）。行数・バイト数は毎回
+ * 変わるが、「最後に成功したコピー」の1枚だけが見えていればよいため、文面に
+ * よらず同じキーで上書きする（コピーのたびにバナーが積み上がらない）。
+ */
+const COPY_RESULT_BANNER_KEY = "log-view-copy-result";
 
 /**
  * @typedef {Object} SavedTabViewState タブを離れる直前に保存する、そのタブへ
@@ -411,6 +515,16 @@ const state = {
    */
   selection: createSelectionState(),
   /**
+   * キーボードでの選択（Shift+↓／Shift+↑）の可動端（Issue #49）。直近の選択
+   * 操作が基準にした行を覚えておき、次の Shift+矢印がここから1行動かす。
+   * 選択そのもの（＝コピーされる行）には影響しないため `state.selection` とは
+   * 別に持つ（`src/selection.js` モジュール冒頭のコメント参照）。`null` は
+   * 「可動端が未定」で、その場合はアンカー、アンカーも無ければ可視範囲の
+   * 先頭行から始める（`resolveKeyboardSelectionBase`）。
+   * @type {number | null}
+   */
+  selectionFocusIndex: null,
+  /**
    * ドラッグによる範囲選択の進行状態（Issue #85）。ドラッグ中だけ値が入り、
    * `mouseup`（`endDragSelection`）で必ず `null` へ戻す。
    * @type {{
@@ -422,6 +536,25 @@ const state = {
   dragSelection: null,
   /** @type {boolean} copy_selection 呼び出し中の多重実行防止。 */
   copyInFlight: false,
+  /**
+   * コピー要求の世代カウンター（Issue #49）。要求のたびに1つ進め、応答・
+   * タイムアウトの処理は「自分の世代が現在の世代と同じ場合」だけ通す。
+   * タイムアウト時にもこの値を進めるため、その後で遅れて届いた応答は世代が
+   * 古くなり、二重に通知されない。
+   * @type {number}
+   */
+  copyRequestSerial: 0,
+  /**
+   * 「コピー中…」バナーを出すまでの遅延タイマー（Issue #49）。決着時に必ず
+   * 止める（`clearCopyTimers`）。
+   * @type {ReturnType<typeof setTimeout> | null}
+   */
+  copyProgressTimerId: null,
+  /**
+   * コピーの安全タイムアウトのタイマー（Issue #49）。
+   * @type {ReturnType<typeof setTimeout> | null}
+   */
+  copyTimeoutTimerId: null,
 };
 
 /** @type {{
@@ -574,6 +707,12 @@ export function activateDisplaySet(descriptor) {
   state.selection = canRestore
     ? clampSelectionToTotalItems(savedViewState.selection, state.totalItems)
     : createSelectionState();
+  // キーボード選択の可動端は保存・復元しない（Issue #49）。復元した選択の
+  // アンカーは残っているため、戻ってきた直後の Shift+矢印はアンカーから
+  // 動き始める（`resolveKeyboardSelectionBase`）。可動端まで持ち回っても
+  // 利用者が覚えているのは「どこを選んだか」までであり、復元の対象を増やす
+  // 価値がない。
+  state.selectionFocusIndex = null;
 
   elements.sourceLabel.textContent = state.sourceLabel;
   updateTotalItemsLabel();
@@ -616,6 +755,7 @@ export function showEmptyState() {
   state.isMerged = false;
   state.everCachedChunkIndices.clear();
   state.selection = createSelectionState();
+  state.selectionFocusIndex = null;
 
   if (elements) {
     elements.sourceLabel.textContent = "";
@@ -1486,6 +1626,10 @@ function handleRowsMouseDown(event) {
     state.selection = selectSingleRow(rowIndex);
     beginDragSelection(rowIndex, event.clientY);
   }
+  // 直近の選択操作が触れた行を、キーボード選択の可動端として覚える
+  // （Issue #49）。3経路のいずれでも「次の Shift+矢印はこの行から動く」で
+  // よいため、分岐の後でまとめて代入する。
+  state.selectionFocusIndex = rowIndex;
 
   // ブラウザ既定の（この場では意味がない）ドラッグ開始・フォーカス移動を
   // 抑止する。フォーカスは下で明示的にビューポートへ移すため、既定動作に
@@ -1581,6 +1725,9 @@ function applyDragSelectionAtPointer() {
     return;
   }
   state.selection = updateDragSelection(drag.startIndex, rowIndex);
+  // ドラッグで最後に指した行が、キーボード選択の可動端になる（Issue #49。
+  // ドラッグを離した位置から Shift+矢印で微調整できる）。
+  state.selectionFocusIndex = rowIndex;
   scheduleRender();
 }
 
@@ -1814,6 +1961,15 @@ function handleJumpInputInput() {
  * 必ず `preventDefault` で抑止し、常に P10 の正式経路（`state.selection`・
  * `copy_selection` コマンド）を通す。
  *
+ * Issue #49 で、修飾キーの判定より前に次の2つを処理する。どちらも Ctrl を
+ * 伴わないため、既存の `event.ctrlKey` による早期 return より手前に置く必要が
+ * ある（順序依存）。
+ *   - `Esc`: 選択の解除。**選択が空のときは何もしない**（Esc の他の用途を
+ *     妨げないため、`preventDefault` もしない）
+ *   - `Shift+↓` / `Shift+↑`: 選択範囲の1行ずつの拡張・縮小。Shift 単独の
+ *     組み合わせだけを扱い、Ctrl や Alt を伴う場合は対象外にする（将来の
+ *     別の割り当てと衝突させない）
+ *
  * scrollHeight クランプ対応との関係: Ctrl+Home（`scrollTop = 0`）
  * と Ctrl+End（`scrollTop = viewport.scrollHeight`。ブラウザが実際の最大値へ
  * 自動的にクランプする）は、`computeVisibleRangeForScroll` の比例写像でも
@@ -1824,6 +1980,22 @@ function handleJumpInputInput() {
  * @param {KeyboardEvent} event
  */
 function handleViewportKeydown(event) {
+  if (event.key === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+    handleClearSelectionRequest(event);
+    return;
+  }
+  if (
+    event.shiftKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    (event.key === "ArrowDown" || event.key === "ArrowUp")
+  ) {
+    // 既定のスクロール（Shift+矢印でもスクロール領域は動く）を抑止し、
+    // 可動端に追従する自動スクロール（`scrollRowIntoView`）だけを通す。
+    event.preventDefault();
+    handleKeyboardRangeSelection(event.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
   if (!event.ctrlKey) {
     return;
   }
@@ -1848,7 +2020,156 @@ function handleSelectAllRequest() {
     return;
   }
   state.selection = selectAll(state.totalItems);
+  // 全選択のアンカーは先頭行（`selectAll`）。可動端を末尾行に置くことで、
+  // 直後の Shift+↑ が末尾から選択を縮める（Issue #49）。可動端を先頭に
+  // 置くと、Shift+矢印1回で全選択が2行へ畳まれてしまう。
+  state.selectionFocusIndex = state.totalItems - 1;
   scheduleRender();
+}
+
+/**
+ * Esc: 選択を解除する（Issue #49）。
+ *
+ * 選択が空のときは既定動作を止めない。Esc はモーダルダイアログを閉じる操作
+ * （`src/error_panel.js` の <dialog> ネイティブの挙動）などにも使われるため、
+ * 「選択解除として実際に働いたとき」だけ `preventDefault` する。
+ *
+ * 余白のクリックによる解除は用意しない（ドラッグ選択の開始・終了と紛らわしく、
+ * 意図しない解除が起きやすいため。Issue #49 の裁定）。
+ *
+ * @param {KeyboardEvent} event
+ */
+function handleClearSelectionRequest(event) {
+  if (isSelectionEmpty(state.selection)) {
+    return;
+  }
+  event.preventDefault();
+  state.selection = clearSelection();
+  state.selectionFocusIndex = null;
+  scheduleRender();
+}
+
+/**
+ * Shift+↓ / Shift+↑: 選択範囲を1行ぶん拡張・縮小する（Issue #49）。
+ *
+ * アンカーと可動端の決め方は `resolveKeyboardSelectionBase`、範囲の組み立ては
+ * `src/selection.js` の `extendSelectionByStep`（純粋関数）が担う。可動端が
+ * 画面外に出る場合は `scrollRowIntoView` が追従させる。
+ *
+ * @param {number} delta Shift+↓ は `1`、Shift+↑ は `-1`。
+ */
+function handleKeyboardRangeSelection(delta) {
+  if (state.displaySetId === null || state.totalItems <= 0) {
+    return;
+  }
+  const base = resolveKeyboardSelectionBase();
+  if (base === null) {
+    return;
+  }
+  const { selection, focusIndex } = extendSelectionByStep(
+    base.anchorIndex,
+    base.focusIndex,
+    delta,
+    state.totalItems,
+  );
+  state.selection = selection;
+  state.selectionFocusIndex = focusIndex;
+  if (focusIndex !== null) {
+    scrollRowIntoView(focusIndex);
+  }
+  scheduleRender();
+}
+
+/**
+ * キーボードでの選択が起点にするアンカーと可動端を決める（Issue #49）。
+ *
+ * 選択がある場合はその選択のアンカー（＝直近の選択操作の基準行）を使い、
+ * 可動端は直近の操作が触れた行（`state.selectionFocusIndex`）を使う。可動端が
+ * 未定なら、アンカーそのものから動かし始める（Shift+クリックと同じ起点）。
+ *
+ * 選択が無い場合（または復元・クランプでアンカーを手放している場合）は、
+ * **可視範囲の先頭行**から始める。画面に見えている行から選択が伸び始めるため、
+ * 遠くの行が黙って選ばれて画面が飛ぶことがない。
+ *
+ * @returns {{ anchorIndex: number, focusIndex: number } | null} 行を1つも
+ *   描画していない（＝起点を決められない）場合は `null`。
+ */
+function resolveKeyboardSelectionBase() {
+  const anchorIndex = state.selection.anchorIndex;
+  if (!isSelectionEmpty(state.selection) && anchorIndex !== null) {
+    return { anchorIndex, focusIndex: state.selectionFocusIndex ?? anchorIndex };
+  }
+  const firstVisibleRow = findFirstVisibleRowIndex();
+  if (firstVisibleRow === null) {
+    return null;
+  }
+  return { anchorIndex: firstVisibleRow, focusIndex: firstVisibleRow };
+}
+
+/**
+ * 画面最上部に見えている行のインデックスを返す（Issue #49）。行を1つも描画して
+ * いない場合は `null`。
+ *
+ * スクロール位置と行高からの逆算ではなく、描画済みの行 DOM を座標で引く
+ * （`findRowIndexAtClientY` と同じ理由。大規模な表示集合ではスクロール座標と
+ * 行インデックスが比例写像になるため、同じ写像をここへ再実装すると2か所が
+ * 食い違う余地を作る）。
+ *
+ * @returns {number | null}
+ */
+function findFirstVisibleRowIndex() {
+  const viewportRect = elements.viewport.getBoundingClientRect();
+  if (viewportRect.height <= 0) {
+    return null;
+  }
+  // 上端そのものは隣接要素との境界に当たり得るため、1px だけ内側を見る。
+  return findRowIndexAtClientY(viewportRect.top + 1);
+}
+
+/**
+ * 指定した行が画面に入っていなければ、その行が見えるところまでスクロールする
+ * （Issue #49。キーボードでの選択の追従）。既に見えている場合は何もしない
+ * （1行ずつの拡張で画面が動き続けると、どこを選んでいるか見失うため）。
+ *
+ * 目標位置は行番号ジャンプと同じ順写像（`computeScrollTopForRowIndexScaled`）
+ * で求める。比例写像が効く規模でもジャンプと同じ精度で行へ寄せられ、写像を
+ * このモジュールへ再実装しなくて済む。端ちょうどではなく
+ * `KEYBOARD_SCROLL_CONTEXT_ROWS` 行ぶん内側を狙う理由は同定数の JSDoc を参照。
+ *
+ * @param {number} rowIndex 見えるようにしたい行。
+ */
+function scrollRowIntoView(rowIndex) {
+  const viewportHeightPx = elements.viewport.clientHeight;
+  const visibleRowCount = Math.max(1, Math.floor(viewportHeightPx / ROW_HEIGHT_PX));
+  const firstVisibleRow = findFirstVisibleRowIndex();
+  if (
+    firstVisibleRow !== null &&
+    rowIndex >= firstVisibleRow &&
+    rowIndex <= firstVisibleRow + visibleRowCount - 1
+  ) {
+    return;
+  }
+
+  // 画面より下なら下端の内側へ、上なら上端の内側へ寄せる（最短の移動で目的の
+  // 行を出す。行が1行しか入らないほど狭いビューポートでは余裕を取れないため、
+  // 文脈行数を可視行数未満へ丸める）。
+  const contextRows = Math.min(KEYBOARD_SCROLL_CONTEXT_ROWS, Math.max(0, visibleRowCount - 1));
+  const scrollingDown = firstVisibleRow !== null && rowIndex > firstVisibleRow;
+  const targetTopRow = scrollingDown
+    ? rowIndex - visibleRowCount + 1 + contextRows
+    : rowIndex - contextRows;
+
+  const maxScrollTopPx = Math.max(
+    0,
+    elements.viewport.scrollHeight - elements.viewport.clientHeight,
+  );
+  elements.viewport.scrollTop = computeScrollTopForRowIndexScaled(
+    Math.max(0, targetTopRow),
+    ROW_HEIGHT_PX,
+    state.totalItems,
+    maxScrollTopPx,
+    BUFFER_ROWS,
+  );
 }
 
 /**
@@ -1861,6 +2182,10 @@ function handleSelectAllRequest() {
  * 飛び飛びの選択（Ctrl+クリック）は複数の範囲としてそのまま渡し、Rust 側が
  * `start` 昇順に連結する。上限判定（`COPY-004`／`COPY-005`）も全範囲の
  * 合計に対して行われる。
+ *
+ * 進行表示（「コピー中…」）と安全タイムアウトの扱いは、モジュール冒頭の
+ * コメント「コピーの進行表示と、応答が返らない場合の復帰」（Issue #49）を
+ * 参照。応答の適用可否は `finishCopyAttempt` が世代で判定する。
  */
 async function handleCopyRequest() {
   if (state.copyInFlight) {
@@ -1880,7 +2205,7 @@ async function handleCopyRequest() {
   /** @type {DisplayContext} */
   const context = { displaySetId: state.displaySetId, generation: state.generation };
 
-  state.copyInFlight = true;
+  const serial = beginCopyAttempt();
   try {
     const response = await invokeCopySelection({
       displaySetId: context.displaySetId,
@@ -1888,19 +2213,116 @@ async function handleCopyRequest() {
       ranges,
     });
 
+    // 解決経路。ここで必ず進行中の状態を畳む（Issue #49）。
+    if (!finishCopyAttempt(serial)) {
+      // 安全タイムアウトで打ち切った後に届いた応答。既に「完了しません」と
+      // 通知済みのため、結果を重ねて通知しない（原因調査用にだけ残す）。
+      console.warn("コピーのタイムアウト後に copy_selection の応答が届きました:", response);
+      return;
+    }
+
     if ("copied" in response) {
       showInfoBanner(
         `${response.copied.lines.toLocaleString("ja-JP")} 行（${formatByteCount(
           response.copied.bytes,
         )}）をクリップボードへコピーしました。`,
+        // 行数・バイト数が毎回変わっても1枚に収め、読み終える頃に自動で消す
+        // （Issue #49。`src/banner.js` の `InfoBannerOptions`）。
+        { key: COPY_RESULT_BANNER_KEY, autoDismiss: true },
       );
     } else if ("rejected" in response) {
       showErrorBanner(formatCopyRejectionMessage(response.rejected));
     }
   } catch (error) {
+    // 拒否経路。解決経路と同じく、必ず進行中の状態を畳んでから通知する。
+    if (!finishCopyAttempt(serial)) {
+      console.warn("コピーのタイムアウト後に copy_selection の失敗が届きました:", error);
+      return;
+    }
     handleCopySelectionError(error, context);
-  } finally {
-    state.copyInFlight = false;
+  }
+}
+
+/**
+ * コピー要求の開始を記録し、進行表示と安全タイムアウトのタイマーを張る
+ * （Issue #49）。
+ *
+ * @returns {number} この要求の世代（`finishCopyAttempt` へ渡す）。
+ */
+function beginCopyAttempt() {
+  const serial = state.copyRequestSerial + 1;
+  state.copyRequestSerial = serial;
+  state.copyInFlight = true;
+
+  state.copyProgressTimerId = setTimeout(() => {
+    state.copyProgressTimerId = null;
+    // 既に決着している要求の進行表示を、後から出さない。
+    if (state.copyRequestSerial !== serial || !state.copyInFlight) {
+      return;
+    }
+    showInfoBanner("コピー中…", { key: COPY_PROGRESS_BANNER_KEY });
+  }, COPY_PROGRESS_BANNER_DELAY_MS);
+
+  state.copyTimeoutTimerId = setTimeout(() => {
+    state.copyTimeoutTimerId = null;
+    handleCopyTimeout(serial);
+  }, COPY_TIMEOUT_MS);
+
+  return serial;
+}
+
+/**
+ * コピー要求の決着（成功・失敗のどちらでも）を記録する（Issue #49）。
+ *
+ * タイマーを止め、進行表示を消し、多重実行の抑止（`copyInFlight`）を解く。
+ * `finally` ではなく解決・拒否の各経路の先頭で呼ぶのは、**通知を出す前に**
+ * 「この応答を今の要求の結果として扱ってよいか」を判定する必要があるため。
+ *
+ * @param {number} serial `beginCopyAttempt` が返した世代。
+ * @returns {boolean} 応答を適用してよいか。安全タイムアウトで打ち切った後に
+ *   遅れて届いた応答では `false`（呼び出し側は通知しない）。
+ */
+function finishCopyAttempt(serial) {
+  if (state.copyRequestSerial !== serial) {
+    return false;
+  }
+  clearCopyTimers();
+  dismissBanner(COPY_PROGRESS_BANNER_KEY);
+  state.copyInFlight = false;
+  return true;
+}
+
+/**
+ * 安全タイムアウト（Issue #49）。`copy_selection` が解決も拒否もしないまま
+ * `COPY_TIMEOUT_MS` を過ぎた場合に、画面側の詰まりだけを解く。
+ *
+ * 世代を1つ進めるのは、後から届く応答を「古い要求の結果」にして二重通知を
+ * 防ぐため（`finishCopyAttempt` の照合が外れる）。IPC 自体は止められないため、
+ * クリップボードが実際に書き換わったかどうかは断定せず、再試行を促す文面に
+ * する（モジュール冒頭のコメント参照）。
+ *
+ * @param {number} serial
+ */
+function handleCopyTimeout(serial) {
+  if (state.copyRequestSerial !== serial || !state.copyInFlight) {
+    return;
+  }
+  state.copyRequestSerial = serial + 1;
+  clearCopyTimers();
+  dismissBanner(COPY_PROGRESS_BANNER_KEY);
+  state.copyInFlight = false;
+  showWarningBanner("コピーが完了しません。もう一度お試しください。");
+}
+
+/** コピーの進行表示・安全タイムアウトのタイマーを止める（Issue #49）。 */
+function clearCopyTimers() {
+  if (state.copyProgressTimerId !== null) {
+    clearTimeout(state.copyProgressTimerId);
+    state.copyProgressTimerId = null;
+  }
+  if (state.copyTimeoutTimerId !== null) {
+    clearTimeout(state.copyTimeoutTimerId);
+    state.copyTimeoutTimerId = null;
   }
 }
 
