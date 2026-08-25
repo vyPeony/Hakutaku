@@ -44,6 +44,12 @@
           左ペイン: 参照対象一覧（CFG-003／PROD-006 の事前定義パスと、
           アドホックに開いた対象を同じ一覧に表示する。src/shell.js が
           src/targets.js の状態モデルを使って描画する）。
+
+          行は「ファイル名＋必要時だけ右端の短い状態表示」の1行表示に絞り、
+          画面内に収まる件数を優先する（左ペイン再設計。状態別の操作
+          〔キャンセル・再試行・昇格・選んで再解析〕は右ペイン側
+          〔#target-status-pane・#view-toolbar〕へ集約した）。タブを開いて
+          いる対象の行は強調表示で区別する。
         -->
         <aside class="target-pane" id="target-pane">
           <div class="target-pane__header">
@@ -89,6 +95,27 @@
             >
               時系列統合: OFF
             </button>
+            <!--
+              アクティブなタブの対象への操作（左ペイン再設計で行内ボタンから
+              移設）。表示・非表示は src/shell.js の renderViewToolbar が
+              アクティブなタブの状態に応じて切り替える。
+
+              - #view-reload-button: 明示的な再読み込み（LOG-028、ADR-0007）。
+                Ready 状態の対象のタブでだけ表示する（reload_target は
+                Ready 以外を拒否するため）。
+              - #view-update-pending: 前回の再読み込みが上限超過で拒否され
+                「更新未反映」のままであることの表示（ADR-0007）。
+              - #view-retry-button: キャンセル済み（部分読み込み）の対象の
+                再試行（LOG-027）。エラー状態の対象の再試行は、タブが無い
+                ため #target-status-pane 側に置く。
+              - #view-reparse: 生表示へ退避した対象の「選んで再解析」
+                （LOG-022）。中身（セレクト2つと「再解析」）は shell.js が
+                対象の切り替わり時に組み立てる。
+            -->
+            <button type="button" id="view-reload-button" hidden>再読み込み</button>
+            <span id="view-update-pending" class="view-update-pending" hidden>更新未反映</span>
+            <button type="button" id="view-retry-button" hidden>再試行</button>
+            <div class="view-reparse" id="view-reparse" hidden></div>
           </div>
           <!--
             タブは WAI-ARIA のタブパターンに従う（Issue #50）。個々の
@@ -222,6 +249,30 @@
               <pre class="log-detail-panel__body" id="log-detail-panel-body"></pre>
             </div>
           </div>
+          <!--
+            選択した対象の状態表示ペイン（左ペイン再設計）。左ペインの行から
+            外した状態別の表示・操作——読み込み進捗とキャンセル（P07-2）、
+            エラーの5要素と再試行（LOG-027、ERR-002）、アクセス拒否時の昇格
+            （PRIV-002）——を、行クリックで選択した対象についてここに表示する。
+            読み込み済みの対象はタブ（#view-area）で表示するため、このペインが
+            見えるのは「まだ本文を表示できない対象」を選択している間だけ。
+            表示の切り替え（#view-area との排他）と中身の組み立ては
+            src/shell.js の renderStatusPane が行う。
+
+            [hidden] と display 指定の共存に注意: 作成者スタイルの display は
+            UA の [hidden] { display: none } に勝つため、styles.css 側で
+            .view-area[hidden] などへ明示的に display: none を書いている
+            （Issue #78 の教訓）。
+          -->
+          <section
+            class="target-status-pane"
+            id="target-status-pane"
+            aria-labelledby="target-status-pane-title"
+            hidden
+          >
+            <h2 class="target-status-pane__title" id="target-status-pane-title"></h2>
+            <div class="target-status-pane__body" id="target-status-pane-body"></div>
+          </section>
         </div>
       </div>
     </main>

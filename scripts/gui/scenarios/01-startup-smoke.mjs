@@ -38,15 +38,17 @@ export async function run({ page, app, expect }) {
     targetRows.length,
     status?.data_source_names?.length ?? -1,
   );
+  // 左ペイン再設計により、行は「ファイル名＋必要時だけ右端の短い状態表示」の
+  // 1行表示になった（由来の印は表示しない）。状態は data-status-kind から読む。
   expect.check(
-    "左ペインの各行が「設定」由来として表示される",
-    targetRows.length > 0 && targetRows.every((row) => row.origin === "設定"),
-    `由来の内訳 ${JSON.stringify([...new Set(targetRows.map((row) => row.origin))])}`,
+    "起動直後はどの対象も未読み込み（not_opened）である",
+    targetRows.length > 0 && targetRows.every((row) => row.kind === "not_opened"),
+    `状態の内訳 ${JSON.stringify([...new Set(targetRows.map((row) => row.kind))])}`,
   );
   expect.check(
-    "起動直後はどの対象も未読み込みである",
-    targetRows.every((row) => row.status === "未読み込み"),
-    `状態の内訳 ${JSON.stringify([...new Set(targetRows.map((row) => row.status))])}`,
+    "起動直後は短い状態表示（バッジ）もタブの強調も出ていない",
+    targetRows.every((row) => row.badge === "" && !row.open && !row.current),
+    `行の内訳 ${JSON.stringify(targetRows.slice(0, 5))}`,
   );
 
   // 正常起動（`loaded`）では通知を出さない（`src/main.js` の

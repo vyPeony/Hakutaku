@@ -25,13 +25,14 @@ export async function run({ page, expect }) {
     return;
   }
 
-  // 左ペインの状態は「読み込み済み（<行数> 行）」の形式（`src/shell.js` の
-  // `statusLabelFor`）。行数の表記に縛られないよう前方一致で見る。
+  // 左ペイン再設計: 行の状態は data-status-kind で読む。閉じる前は
+  // 読み込み済み（ready）で、タブを開いた対象として強調されている。
   const beforeRow = (await readTargetRows(page)).find((row) => row.name === target);
-  expect.check(
-    "閉じる前の左ペインの状態が「読み込み済み」である",
-    beforeRow?.status?.startsWith("読み込み済み") === true,
-    `左ペインの状態 ${JSON.stringify(beforeRow?.status)}`,
+  expect.expectEqual("閉じる前の左ペインの状態が読み込み済み（ready）である", beforeRow?.kind, "ready");
+  expect.expectEqual(
+    "閉じる前はタブを開いている対象として強調されている（target-row--open）",
+    beforeRow?.open,
+    true,
   );
   const tabCountBefore = (await readTabs(page)).length;
 
@@ -54,8 +55,7 @@ export async function run({ page, expect }) {
       const row = Array.from(document.querySelectorAll("#target-list > li")).find(
         (item) => (item.querySelector(".target-row__name")?.textContent?.trim() ?? "") === title,
       );
-      const status = row?.querySelector(".target-row__status")?.textContent?.trim() ?? "";
-      return !status.startsWith("読み込み済み");
+      return (row?.dataset.statusKind ?? "") !== "ready";
     },
     target,
     { timeout: 20_000 },
@@ -75,5 +75,10 @@ export async function run({ page, expect }) {
     afterRow !== undefined,
     `左ペイン ${JSON.stringify((await readTargetRows(page)).map((row) => row.name))}`,
   );
-  expect.expectEqual("左ペインの状態が「未読み込み」へ戻る", afterRow?.status, "未読み込み");
+  expect.expectEqual("左ペインの状態が未読み込み（not_opened）へ戻る", afterRow?.kind, "not_opened");
+  expect.expectEqual(
+    "タブを開いている対象の強調（target-row--open）が外れる",
+    afterRow?.open,
+    false,
+  );
 }
