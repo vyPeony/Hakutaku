@@ -61,14 +61,11 @@ windows = ["main"]
 #
 # P07-2 で進捗・キャンセル・手動プロファイル選択用に2コマンドを
 # 追加する（定義は src-tauri/permissions/cancel-load.toml・
-# list-log-profiles.toml）。進捗・完了イベント（"hakutaku://load-progress"・
-# "hakutaku://load-outcome"）は Rust 側から AppHandle::emit で発行するだけで
-# あり、Capability の許可（ACL）は invoke() 経由のコマンド呼び出しだけを
-# 対象とするため、イベント発行そのものに追加の permission は不要（詳細は
-# src-tauri/src/targets.rs のモジュール doc コメント「イベント vs
-# ポーリング」を参照）。フロントエンドは events を listen() せず、
-# list_targets のポーリングを主経路として使うため、core:event 系の
-# permission（allow-listen 等）もあえて追加しない。
+# list-log-profiles.toml）。進捗・完了の通知はイベントではなく対象一覧の
+# 状態（list_targets のポーリング）だけで行うため（購読側が無いまま常時
+# 発行していたイベントは Issue #51 で削除。詳細は src-tauri/src/targets.rs
+# のモジュール doc コメント「イベント vs ポーリング」を参照）、core:event
+# 系の permission（allow-listen 等）は追加しない。
 #
 # P06-5 で明示的な再読み込み（LOG-028）用に reload_target を
 # 追加する。同じ方針どおり、専用の最小権限だけを追加する（定義は
