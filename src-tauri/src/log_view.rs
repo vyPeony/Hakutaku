@@ -86,10 +86,23 @@ impl hakutaku_core::RegistryAccess for PerBatchRegistryLock<'_> {
 /// 登録するハンドラは、このフラグを立てるだけで [`DisplaySetRegistryState`]
 /// の `Mutex` には一切触れません（`crate::lib` の配線を参照）。実際の解放
 /// （`hakutaku_core::DisplaySetRegistry::evict_inactive_sources`）は、
-/// Tauri コマンド処理の入口（[`fetch_log_range`]）で、まだ他のロックを
-/// 保持していない安全な地点からこのフラグを確認して行います（遅延方式。
-/// デッドロック回避の設計判断は `hakutaku_core::registry` の
-/// `evict_inactive_sources` doc コメント「呼び出しタイミング」を参照）。
+/// Tauri コマンド処理の入口で、まだ他のロックを保持していない安全な地点から
+/// このフラグを確認して行います（遅延方式。デッドロック回避の設計判断は
+/// `hakutaku_core::registry` の `evict_inactive_sources` doc コメント
+/// 「呼び出しタイミング」を参照）。
+///
+/// 消費点は2つあり、どちらも「立っていれば解放して下ろす」という同じ処理を
+/// 行います（先に呼ばれた側が消費し、もう一方は空振りします）。
+///
+/// - [`fetch_log_range`][]: 利用者がスクロール・表示更新をしたとき
+/// - [`crate::targets::list_targets`][]: 読み込み中の対象がある間の 500ms
+///   ポーリング（Issue #51。読み込み中に画面を触っていない区間を埋める）
+///
+/// どちらも呼ばれない状態——読み込みが無く、かつ利用者が画面を触っていない
+/// ——ではフラグは立ったまま残ります。これは意図した割り切りです。この状態
+/// ではアプリ自身が新たにメモリを確保しておらず、解放が遅れても予算
+/// （`PERF-008`）を押し上げないためで、次に読み込みかスクロールが起きた
+/// 時点で必ず消費されます。フラグは立ちっぱなしでも失われません。
 #[derive(Clone, Default)]
 pub struct EvictionFlag(pub Arc<AtomicBool>);
 
@@ -115,6 +128,41 @@ pub(crate) fn drain_pending_eviction(
              バッファを解放しました（P08-3）: source_id={evicted:?}"
         );
     }
+}
+
+/// [`drain_pending_eviction`] を、`registry` の `Mutex` を**この関数の中で
+/// 取って**実行します（呼び出し側がまだレジストリをロックしていない経路
+/// 向け。[`crate::targets::list_targets`]、Issue #51）。
+///
+/// # なぜ消費点が [`fetch_log_range`] だけでは足りないか
+///
+/// 解放要求フラグ（[`EvictionFlag`]）を立てるのはメモリ予約の経路であり、
+/// 索引作成が進む**読み込み中**に立ちます。ところが `fetch_log_range` は
+/// 利用者がスクロール（または表示の初期化）をしたときにしか呼ばれないため、
+/// 読み込みを走らせたまま画面を触っていない間は、立ったフラグが誰にも消費
+/// されません。読み込み中の対象がある間 500ms 間隔で呼ばれる
+/// [`crate::targets::list_targets`] を2つ目の消費点にすると、この区間が
+/// 埋まります。
+///
+/// # フラグが下りている場合はロックを取らない
+///
+/// [`crate::targets::list_targets`] は読み込み中ずっとポーリングされるため、
+/// 呼び出しのたびにレジストリの `Mutex` を取ると、読み込みワーカーが
+/// バッチ登録で取る同じロック（[`PerBatchRegistryLock`]）と不要に競合します。
+/// フラグを先に読み、立っているときだけロックを取ります。読み取りと
+/// [`drain_pending_eviction`] 内の `swap` の間に別スレッドが先に消費しても、
+/// 空振りのロック1回で済み、逆に読み取り直後に立った場合も次の呼び出しで
+/// 消費されるだけで、取りこぼしにはなりません。
+pub(crate) fn drain_pending_eviction_locking(
+    eviction: &EvictionFlag,
+    registry: &Mutex<hakutaku_core::DisplaySetRegistry>,
+    diagnostics: &Diagnostics,
+) {
+    if !eviction.0.load(Ordering::Acquire) {
+        return;
+    }
+    let mut registry_guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    drain_pending_eviction(eviction, &mut registry_guard, diagnostics);
 }
 
 /// `open_log_file` / `open_measurement_file` の応答です。
@@ -581,7 +629,10 @@ fn log_restore_outcome(
 ///
 /// 1. **遅延解放ドレイン**（[`drain_pending_eviction`]）: しきい値到達時に
 ///    立てられた解放要求フラグ（[`EvictionFlag`]）を確認し、立っていれば
-///    非アクティブなソースのバッファを解放します。
+///    非アクティブなソースのバッファを解放します。同じフラグは
+///    [`crate::targets::list_targets`] でも消費します（Issue #51。
+///    [`drain_pending_eviction_locking`] の doc コメント「なぜ消費点が
+///    `fetch_log_range` だけでは足りないか」）。
 /// 2. **アクティブソースの伝播**: `display_set_id` から `source_id` を逆引きし
 ///    （`最小の実装`。専用の「タブ切り替え」コマンドを新設せず、範囲取得の
 ///    対象から常に導出する）、`hakutaku_core::DisplaySetRegistry::
@@ -591,6 +642,29 @@ fn log_restore_outcome(
 ///    復元後は世代が進むため、この呼び出しの `expected_generation` が古い
 ///    世代のままであれば `generation_mismatch` を返し、フロントエンドは
 ///    既存の再取得ロジック（`src/log_view.js`）で最新世代を取得し直します。
+///
+/// ## 手順3（透過復元）は現状**到達しません**（Issue #51）
+///
+/// `SourceStatus::Evicted` を作る経路が現在ありません。P08-5 で
+/// `evict_inactive_sources` は「デコード済みチャンクキャッシュのクリアだけ」に
+/// 単純化され、`SourceStatus` を変更しなくなったためです（索引そのものが解放
+/// する意味のある大きさではなくなった。`hakutaku_core::registry` の
+/// `evict_inactive_sources` doc コメント参照）。
+///
+/// それでもこの分岐を残しているのは、`Evicted` とその復元
+/// （`hakutaku_core::restore_evicted_source`）が**将来の退避機能のために維持
+/// している未到達配線**であり、コア層側でも対称性を保ったまま残されている
+/// ためです（PR #92）。片側だけを削ると、退避を再導入するときに「状態はある
+/// のに復元する側が無い」非対称な状態から作り直すことになります。
+///
+/// 設計上の注意（再導入するときに壊さないための前提）: この復元は
+/// **レジストリのロックを保持したままファイルを読み直します**。実際に
+/// `Evicted` が作られるようになった時点で、GB 級ファイルの再読み込みが
+/// ロック区間へ入り、読み込み中の応答性（`ENV-004`・`PERF-009`。
+/// [`PerBatchRegistryLock`] が読み込み経路で解いた問題）と同じ症状を、
+/// 今度は範囲取得の側で再現します。再導入する場合は、この場での同期復元では
+/// なく、ロックの外へ出す（`PerBatchRegistryLock` と同じ形にする、または
+/// 復元を要求だけして応答を遅らせる）設計が必要です。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_log_range(
@@ -611,6 +685,10 @@ pub fn fetch_log_range(
     if let Some(source_id) = registry_guard.source_id_for_display_set(display_set_id) {
         registry_guard.set_active_source(Some(source_id));
 
+        // 未到達の配線（Issue #51）。`Evicted` を作る経路は P08-5 以降
+        // 存在しないが、将来の退避機能のためにコア層と対称に残している。
+        // 再導入時はロック保持のままの再読み込みになる点に注意（この関数の
+        // doc コメント「手順3（透過復元）は現状到達しません」）。
         if matches!(
             registry_guard.source_status(source_id),
             Some(hakutaku_core::SourceStatus::Evicted)

@@ -104,8 +104,9 @@
 //!
 //! ワーカースレッドは [`tauri::AppHandle`]（`Send + Sync + 'static`。`Clone`
 //! でスレッドへ渡せる）経由で managed state を再取得し（[`run_open`]）、進捗・
-//! 完了・失敗・キャンセルを Tauri イベント（`EVENT_LOAD_PROGRESS`・
-//! `EVENT_LOAD_OUTCOME`）として emit します。
+//! 完了・失敗・キャンセルを**対象一覧の状態そのもの**（[`TargetStatus`] の
+//! 遷移と `Loading` の `progress` フィールド）へ反映します。フロントエンドへの
+//! 通知経路は [`list_targets`] のポーリング1本です（次節）。
 //!
 //! [`reload_target`] はこの非同期化の対象外です（同期のまま）。
 //! `hakutaku_core::reload_source` は進捗・キャンセルを受け付けない同期 API
@@ -113,17 +114,30 @@
 //! だけを P07-2 の非同期化対象としています）、明示的な再読み込みは短時間で
 //! 終わる想定のためです。
 //!
-//! # イベント vs ポーリング（採用: ポーリング。理由は `src/shell.js` を参照）
+//! # イベント vs ポーリング（採用: ポーリングのみ。理由は `src/shell.js` を参照）
 //!
-//! `AppHandle::emit` はフロントエンドの Capability 許可を必要としません
-//! （ACL は `invoke()` 経由のコマンド呼び出しだけを制限し、Rust 側から
-//! WebView へ発行するイベントは対象外です）。そのため、このモジュールは
-//! 常にイベントを発行します。一方フロントエンド（`src/shell.js`）は
-//! `list_targets` のポーリング（読み込み中の対象がある間だけ 500ms 間隔）を
-//! 主経路として採用しており、進捗・完了状態は対象一覧
-//! （[`TargetStatus::Loading`] の `progress` フィールド等）からも取得できる
-//! ようにしています。採用理由の詳細は `src/shell.js` のモジュール doc
-//! コメントを参照してください。
+//! フロントエンド（`src/shell.js`）は `list_targets` のポーリング（読み込み中の
+//! 対象がある間だけ 500ms 間隔）だけで進捗・完了・失敗・キャンセルを検出します
+//! （採用理由の詳細は `src/shell.js` のモジュール doc コメント）。したがって
+//! 進捗・完了状態は、対象一覧（[`TargetStatus::Loading`] の `progress`
+//! フィールドと状態遷移）が唯一の出所です。
+//!
+//! かつてはこれと並行して Tauri イベント（`hakutaku://load-progress`・
+//! `hakutaku://load-outcome`）も常に emit していましたが、**購読側が存在しない
+//! ため削除しました**（Issue #51）。`AppHandle::emit` は Capability 許可を
+//! 必要としない（ACL は `invoke()` 経由の呼び出しだけを制限する）ため発行自体は
+//! 成立していましたが、
+//!
+//! - 誰も `listen()` しない通知を読み込みのたびに WebView へ送っていた
+//! - 失敗イベントの payload には `ERR-002` の対象欄としてフルパスが載っていた。
+//!   フルパスを含めること自体は `ERR-002` のとおりで、[`list_targets`] が返す
+//!   エラー状態も同じ文字列を含む（モジュール doc コメント冒頭の `SEC-012` の
+//!   項）。問題は、**利用者へ表示されることのない経路**へその文字列を毎回
+//!   送り出していたことで、露出だけが増えて得るものが無かった
+//! - 同じ事実を伝える経路が二本立てで、どちらが正本か読み取れなかった
+//!
+//! ためです。将来 `listen()` 経由の購読へ切り替える場合は、購読側と同じ変更で
+//! 発行側を復活させてください（片側だけを先に用意しません）。
 //!
 //! # 対象の状態
 //!
@@ -147,7 +161,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 use hakutaku_core::notification::{
     CancellationToken, Progress, ProgressSink, ProgressUnit, TaskId, TaskOutcome, UserFacingError,
@@ -155,15 +169,10 @@ use hakutaku_core::notification::{
 use hakutaku_diagnostics::{diag_info, diag_warn, Diagnostics};
 
 use crate::bootstrap::config::ConfigState;
-use crate::log_view::{log_load_summary, DisplaySetRegistryState, PerBatchRegistryLock};
-
-/// 進捗イベント名（`hakutaku://load-progress`）。payload は
-/// [`LoadProgressEventPayload`]。
-const EVENT_LOAD_PROGRESS: &str = "hakutaku://load-progress";
-
-/// 完了・失敗・キャンセルイベント名（`hakutaku://load-outcome`）。payload は
-/// [`LoadOutcomeEventPayload`]。
-const EVENT_LOAD_OUTCOME: &str = "hakutaku://load-outcome";
+use crate::log_view::{
+    drain_pending_eviction_locking, log_load_summary, DisplaySetRegistryState, EvictionFlag,
+    PerBatchRegistryLock,
+};
 
 /// アクセス拒否（`ERROR_ACCESS_DENIED`）時の `ERR-002` 理由欄（`PRIV-002`、
 /// P11-1）。共通の `error_next_action`（対象ごとに異なる汎用文言）とは別に、
@@ -328,7 +337,15 @@ impl TargetRegistry {
     /// のフォルダ判定など）は、[`Self::abort_loading`] で取り消します。
     pub(crate) fn register(&mut self, display_name: String, origin: TargetOrigin) -> u32 {
         let target_id = self.next_target_id;
-        self.next_target_id += 1;
+        // 払い出しは `u32` の上限で飽和させる。`PERF-005` が想定する同時10件
+        // 程度の運用で約42億回の登録に達することはないが、素の加算は release
+        // ビルドで折り返し、既に開いている対象の `target_id` と衝突する。
+        // `close_pending_loads` の印が別の対象へ誤って効かないことは
+        // 「`target_id` を再利用しない」ことだけが保証しており（フィールドの
+        // doc コメント）、折り返しはその保証を黙って壊す。飽和なら衝突は
+        // 払い出しの最後の1個（`u32::MAX`）に閉じ込められ、既存の対象へは
+        // 波及しない。
+        self.next_target_id = self.next_target_id.saturating_add(1);
         self.targets.push(TargetEntry {
             target_id,
             display_name,
@@ -655,8 +672,28 @@ impl From<&TargetEntry> for TargetDto {
 /// フロントエンド（`src/shell.js`）は、読み込み中の対象がある間はこのコマンド
 /// を 500ms 間隔でポーリングし、進捗表示と完了検知の両方に使います
 /// （モジュール doc コメント「イベント vs ポーリング」参照）。
+///
+/// # 遅延解放ドレイン（P08-3、Issue #51）
+///
+/// 一覧を返す前に、ソフトしきい値到達で立てられた解放要求フラグ
+/// （[`crate::log_view::EvictionFlag`]）を確認・消費します。読み込み中に
+/// 立つフラグを、スクロール契機の
+/// [`fetch_log_range`](crate::log_view::fetch_log_range) だけに任せると、
+/// 読み込み中に画面を触っていない間は解放が走りません。読み込み中だけ
+/// ポーリングされるこのコマンドは、その区間を埋める2つ目の消費点として
+/// ちょうど対応します（詳細は [`drain_pending_eviction_locking`]）。
 #[tauri::command]
-pub fn list_targets(targets: State<'_, TargetRegistryState>) -> Vec<TargetDto> {
+pub fn list_targets(
+    targets: State<'_, TargetRegistryState>,
+    registry: State<'_, DisplaySetRegistryState>,
+    eviction: State<'_, EvictionFlag>,
+    diagnostics: State<'_, Arc<Diagnostics>>,
+) -> Vec<TargetDto> {
+    // 対象一覧のロックを取る**前**にドレインする。ロックの順序は「対象一覧 →
+    // レジストリ」（`close_target_core` 参照）であり、ここで入れ子にしなければ
+    // 順序を気にする必要がそもそも無い。
+    drain_pending_eviction_locking(eviction.inner(), &registry.0, diagnostics.inner());
+
     let target_guard = targets.0.lock().unwrap_or_else(PoisonError::into_inner);
     target_guard.list()
 }
@@ -810,46 +847,17 @@ pub fn cancel_load(target_id: u32, targets: State<'_, TargetRegistryState>) -> b
     target_guard.request_cancel(target_id)
 }
 
-/// 進捗イベント（`EVENT_LOAD_PROGRESS`）の payload です。
-#[derive(Debug, Clone, Serialize)]
-struct LoadProgressEventPayload {
-    target_id: u32,
-    done_bytes: u64,
-    total_bytes: Option<u64>,
-}
-
-/// 完了・失敗・キャンセルイベント（`EVENT_LOAD_OUTCOME`）の payload です。
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-enum LoadOutcomeEventPayload {
-    Completed {
-        target_id: u32,
-    },
-    Cancelled {
-        target_id: u32,
-    },
-    Failed {
-        target_id: u32,
-        error: UserFacingErrorDto,
-        /// `PRIV-002`、P11-1: [`TargetStatus::Error::access_denied`] と同じ値。
-        access_denied: bool,
-    },
-}
-
-/// [`ProgressSink`] の実装（P07-2）。対象一覧の進捗フィールドを更新しつつ、
-/// `emit_progress` コールバック（本体は Tauri イベント発行、単体テストでは
-/// 記録用クロージャ）を呼びます。
+/// [`ProgressSink`] の実装（P07-2）。読み込みワーカーからの進捗通知を、対象
+/// 一覧の `Loading` 状態の `progress` フィールドへ書き込みます。
 ///
-/// `AppHandle` へ直接依存させていない理由は [`run_open_core`] の doc
-/// コメントを参照してください（単体テストで `AppHandle` を必要としないための
-/// 設計）。
+/// フロントエンドはここへ書かれた値を [`list_targets`] のポーリングで読みます
+/// （モジュール doc コメント「イベント vs ポーリング」）。この型が対象一覧
+/// （`Mutex<TargetRegistry>`）だけを持ち [`AppHandle`] を知らないのは、
+/// 進捗の届け先が対象一覧しかないためであり、同時に単体テストで `AppHandle`
+/// を用意せずに済ませるためでもあります（[`run_open_core`] の doc コメント）。
 struct TargetProgressSink<'a> {
     targets: &'a Mutex<TargetRegistry>,
     target_id: u32,
-    /// `Send + Sync` を要求するのは、[`ProgressSink`]（`P04-6` の契約）自体が
-    /// `Send + Sync` を要求するためです（複数スレッドから安全に共有できる
-    /// 進捗通知の受け口という契約）。
-    emit_progress: &'a (dyn Fn(LoadProgressEventPayload) + Send + Sync),
 }
 
 impl ProgressSink for TargetProgressSink<'_> {
@@ -865,16 +873,8 @@ impl ProgressSink for TargetProgressSink<'_> {
             }
         };
 
-        {
-            let mut guard = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
-            guard.set_progress(self.target_id, done_bytes, total_bytes);
-        }
-
-        (self.emit_progress)(LoadProgressEventPayload {
-            target_id: self.target_id,
-            done_bytes,
-            total_bytes,
-        });
+        let mut guard = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.set_progress(self.target_id, done_bytes, total_bytes);
     }
 }
 
@@ -968,12 +968,6 @@ fn run_open(app: &AppHandle, request: OpenRequest) {
         throttle,
         hakutaku_data_source::DEFAULT_CHUNK_BYTES,
         &request,
-        &|payload| {
-            let _ = app.emit(EVENT_LOAD_PROGRESS, payload);
-        },
-        &|payload| {
-            let _ = app.emit(EVENT_LOAD_OUTCOME, payload);
-        },
     );
 }
 
@@ -1031,15 +1025,19 @@ impl<'a> FinishLoadGuard<'a> {
         self.source_id = Some(source_id);
     }
 
-    /// 終端処理を実行します。読み込み中に対象が閉じられていた場合は `true` を
-    /// 返します（この場合、呼び出し側は完了・失敗イベントを発行しません。
-    /// 宛先の対象が既に一覧から消えているためです）。
-    fn finish(mut self) -> bool {
+    /// 終端処理を実行します（`active_loads` のトークン除去と、読み込み中に
+    /// 対象が閉じられていた場合のコア側ソース・`SourceBudget` の予約の回収）。
+    ///
+    /// 「閉じられていたか」を呼び出し側へ返しません。読み込みの結末は対象一覧
+    /// の状態としてしか残らないため（`crate::targets` モジュール doc コメント
+    /// 「イベント vs ポーリング」）、既に一覧から消えた対象に対して呼び出し側が
+    /// 追加で抑止すべき処理が無いためです。
+    fn finish(mut self) {
         self.finished = true;
-        self.reclaim()
+        self.reclaim();
     }
 
-    fn reclaim(&mut self) -> bool {
+    fn reclaim(&mut self) {
         // 対象一覧のロックを先に手放してからレジストリのロックを取る
         // （「対象一覧 → レジストリ」というロック順序を守りつつ、入れ子に
         // しない）。印を取り切ってからレジストリを触るため、この間に別経路が
@@ -1051,7 +1049,7 @@ impl<'a> FinishLoadGuard<'a> {
             target_guard.take_close_pending(self.target_id)
         };
         if !closed {
-            return false;
+            return;
         }
         if let Some(source_id) = self.source_id {
             let mut registry_guard = self
@@ -1060,7 +1058,6 @@ impl<'a> FinishLoadGuard<'a> {
                 .unwrap_or_else(PoisonError::into_inner);
             registry_guard.close_source(source_id, self.budget);
         }
-        true
     }
 }
 
@@ -1079,7 +1076,12 @@ impl Drop for FinishLoadGuard<'_> {
 /// 実際に動作する Tauri アプリ（`tauri::test::mock_app` 等）がないと
 /// 構築できませんが、この関数はそれを必要とせず、プレーンな構造体だけで
 /// 「読み込み開始 → `register_source_with_control` 呼び出し → 対象一覧への
-/// 反映 → イベント発行」という一連の処理を検証できます。
+/// 反映」という一連の処理を検証できます。
+///
+/// 読み込みの結末（完了・キャンセル・失敗）は戻り値ではなく、**対象一覧の
+/// 状態としてだけ**残ります（[`apply_register_outcome`]）。フロントエンドは
+/// [`list_targets`] のポーリングでそれを読みます（モジュール doc コメント
+/// 「イベント vs ポーリング」）。
 #[allow(clippy::too_many_arguments)]
 fn run_open_core(
     targets: &Mutex<TargetRegistry>,
@@ -1096,8 +1098,6 @@ fn run_open_core(
     // 参照）。
     chunk_bytes: u64,
     request: &OpenRequest,
-    emit_progress: &(dyn Fn(LoadProgressEventPayload) + Send + Sync),
-    emit_outcome: &dyn Fn(LoadOutcomeEventPayload),
 ) {
     // 呼び出し側が begin_loading 済みであることを前提とするが、念のため
     // ここでも取得を試みる（テストの直接呼び出しなど、begin_loading を
@@ -1122,7 +1122,6 @@ fn run_open_core(
     let sink = TargetProgressSink {
         targets,
         target_id: request.target_id,
-        emit_progress,
     };
 
     let control = hakutaku_core::LoadControl {
@@ -1156,7 +1155,7 @@ fn run_open_core(
         &control,
     );
 
-    let event = match register_result {
+    match register_result {
         Ok(register_outcome) => {
             // 読み込み中に閉じられていた場合にコア側の後始末を代行できるよう、
             // 払い出された source_id を終端処理へ渡す（Issue #31）。`Err` の
@@ -1178,7 +1177,7 @@ fn run_open_core(
                 &request.source_label,
                 &register_outcome.summary,
             );
-            apply_register_outcome(targets, request.target_id, register_outcome)
+            apply_register_outcome(targets, request.target_id, register_outcome);
         }
         Err(error) => {
             diag_warn!(
@@ -1207,41 +1206,33 @@ fn run_open_core(
                     request.error_next_action,
                 )
             };
-            {
-                let mut guard = targets.lock().unwrap_or_else(PoisonError::into_inner);
-                guard.set_status(
-                    request.target_id,
-                    TargetStatus::Error {
-                        error: user_error.clone(),
-                        access_denied,
-                    },
-                );
-            }
-            LoadOutcomeEventPayload::Failed {
-                target_id: request.target_id,
-                error: UserFacingErrorDto::from(&user_error),
-                access_denied,
-            }
+            let mut guard = targets.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.set_status(
+                request.target_id,
+                TargetStatus::Error {
+                    error: user_error,
+                    access_denied,
+                },
+            );
         }
-    };
-
-    if finish_guard.finish() {
-        // 読み込み中に閉じられた対象。コア側のソースと予約は終端処理が回収
-        // 済みで、対象一覧にもエントリが無い。完了・失敗イベントの宛先も
-        // 無いため、ここで終える（Issue #31）。
-        return;
     }
 
-    emit_outcome(event);
+    // 終端処理（Issue #31）。読み込み中に閉じられていた場合は、ここでコア側の
+    // ソースと `SourceBudget` の予約が回収される。上の `set_status` は既に
+    // 一覧から消えたエントリに対する no-op になっており、この関数が他に行う
+    // ことは無いため、戻り値（閉じられていたか）による分岐も不要。
+    finish_guard.finish();
 }
 
-/// [`hakutaku_core::RegisterSourceOutcome`] を対象一覧の状態へ反映し、
-/// イベント payload を組み立てます。
+/// [`hakutaku_core::RegisterSourceOutcome`] を対象一覧の状態へ反映します。
+///
+/// 結末を呼び出し側へ返さないのは、対象一覧の状態がフロントエンドから見た
+/// 唯一の出所だからです（モジュール doc コメント「イベント vs ポーリング」）。
 fn apply_register_outcome(
     targets: &Mutex<TargetRegistry>,
     target_id: u32,
     outcome: hakutaku_core::RegisterSourceOutcome,
-) -> LoadOutcomeEventPayload {
+) {
     let fell_back_to_raw_display = outcome.summary.fell_back_to_raw_display;
     let mut guard = targets.lock().unwrap_or_else(PoisonError::into_inner);
     match outcome.outcome {
@@ -1259,7 +1250,6 @@ fn apply_register_outcome(
                     update_pending: false,
                 },
             );
-            LoadOutcomeEventPayload::Completed { target_id }
         }
         TaskOutcome::Cancelled => {
             guard.set_status(
@@ -1272,7 +1262,6 @@ fn apply_register_outcome(
                     fell_back_to_raw_display,
                 },
             );
-            LoadOutcomeEventPayload::Cancelled { target_id }
         }
         TaskOutcome::Failed(error) => {
             // PRIV-002・P11-1: ここは最初のバッチを登録済みの段階での失敗
@@ -1281,15 +1270,10 @@ fn apply_register_outcome(
             guard.set_status(
                 target_id,
                 TargetStatus::Error {
-                    error: error.clone(),
+                    error,
                     access_denied: false,
                 },
             );
-            LoadOutcomeEventPayload::Failed {
-                target_id,
-                error: UserFacingErrorDto::from(&error),
-                access_denied: false,
-            }
         }
     }
 }
@@ -2175,8 +2159,8 @@ mod tests {
                 .clone()
         }
 
-        fn run(&self, request: OpenRequest) -> Vec<LoadOutcomeEventPayload> {
-            self.run_with_profiles(&[], request)
+        fn run(&self, request: OpenRequest) {
+            self.run_with_profiles(&[], request);
         }
 
         /// 設定のログ解析プロファイルを渡して開く（`CFG-008` の
@@ -2185,8 +2169,7 @@ mod tests {
             &self,
             log_profiles: &[hakutaku_config::LogProfileConfig],
             request: OpenRequest,
-        ) -> Vec<LoadOutcomeEventPayload> {
-            let outcomes = Mutex::new(Vec::new());
+        ) {
             run_open_core(
                 &self.targets,
                 &self.display_set_registry,
@@ -2196,10 +2179,19 @@ mod tests {
                 &self.throttle,
                 self.chunk_bytes,
                 &request,
-                &|_progress| {},
-                &|outcome| outcomes.lock().unwrap().push(outcome),
             );
-            outcomes.into_inner().unwrap()
+        }
+
+        /// 対象一覧に `target_id` のエントリがまだ在るか（読み込み中に閉じられた
+        /// 場合の確認用。読み込みの結末は状態としてしか残らないため、
+        /// 「宛先が消えている」ことはこの形で確かめます）。
+        fn contains(&self, target_id: u32) -> bool {
+            self.targets
+                .lock()
+                .unwrap()
+                .list()
+                .iter()
+                .any(|dto| dto.target_id == target_id)
         }
 
         /// [`close_target_core`]（`close_target` の中核）をこの土台の状態に
@@ -2313,17 +2305,17 @@ mod tests {
         let fb = Arc::clone(&fixture_b);
         let handle_b = std::thread::spawn(move || fb.run(req_b));
 
-        let events_a = handle_a.join().expect("パニックしないはず");
-        let events_b = handle_b.join().expect("パニックしないはず");
+        handle_a.join().expect("パニックしないはず");
+        handle_b.join().expect("パニックしないはず");
         let elapsed = started.elapsed();
 
         assert!(matches!(
-            events_a[0],
-            LoadOutcomeEventPayload::Completed { .. }
+            fixture_a.status_of(target_a),
+            TargetStatusDto::Ready { .. }
         ));
         assert!(matches!(
-            events_b[0],
-            LoadOutcomeEventPayload::Completed { .. }
+            fixture_b.status_of(target_b),
+            TargetStatusDto::Ready { .. }
         ));
 
         // 直列化されていれば約480ms、並行に進んでいれば約240msになる想定
@@ -2374,7 +2366,18 @@ mod tests {
         let mut max_lock_wait = std::time::Duration::ZERO;
         let mut fetch_ok = 0usize;
         let mut partial_observations = 0usize;
+        // 進捗が対象一覧へ届いているか（`TargetProgressSink` の配線）。イベント
+        // 発行を廃した後（Issue #51）、進捗の唯一の出所は `Loading` 状態の
+        // `progress` フィールドであり、読み込み中にしか観測できないため、
+        // ロック待ちを測るこのループでまとめて拾う。
+        let mut progress_observations = 0usize;
         while !loader.is_finished() {
+            if matches!(
+                fixture.status_of(target_id),
+                TargetStatusDto::Loading { progress: Some(_) }
+            ) {
+                progress_observations += 1;
+            }
             let begin = std::time::Instant::now();
             let mut guard = fixture.display_set_registry.lock().unwrap();
             max_lock_wait = max_lock_wait.max(begin.elapsed());
@@ -2396,13 +2399,17 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        let events = loader.join().expect("パニックしないはず");
+        loader.join().expect("パニックしないはず");
         let load_elapsed = started.elapsed();
 
         assert!(matches!(
-            events[0],
-            LoadOutcomeEventPayload::Completed { .. }
+            fixture.status_of(target_id),
+            TargetStatusDto::Ready { .. }
         ));
+        assert!(
+            progress_observations > 0,
+            "読み込み中の進捗が対象一覧へ反映されていない（ProgressSink の配線が切れている疑い）"
+        );
         assert!(
             load_elapsed >= std::time::Duration::from_millis(200),
             "抑制により読み込みに十分な時間がかかっている前提が崩れている: {load_elapsed:?}"
@@ -2463,6 +2470,47 @@ mod tests {
         );
         assert_ne!(first, second);
         assert_eq!(registry.list().len(), 2);
+    }
+
+    // 受け入れ条件（Issue #51）: `target_id` の払い出しは `u32` の上限で飽和し、
+    // 0 へ折り返さない。折り返すと、既に開いている対象と同じ `target_id` が
+    // 再び払い出され、`close_pending_loads` の印（「`target_id` を再利用しない」
+    // ことだけを根拠に別の対象へ効かないことを保証している）が壊れる。
+    #[test]
+    fn register_saturates_target_id_at_the_u32_limit_instead_of_wrapping() {
+        let mut registry = TargetRegistry::default();
+        let long_lived = registry.register(
+            "a.log".to_string(),
+            TargetOrigin::AdHoc {
+                path: PathBuf::from("C:\\logs\\a.log"),
+            },
+        );
+        assert_eq!(long_lived, 0, "最初の払い出しは 0 である前提");
+
+        registry.next_target_id = u32::MAX;
+        let at_limit = registry.register(
+            "b.log".to_string(),
+            TargetOrigin::AdHoc {
+                path: PathBuf::from("C:\\logs\\b.log"),
+            },
+        );
+        let after_limit = registry.register(
+            "c.log".to_string(),
+            TargetOrigin::AdHoc {
+                path: PathBuf::from("C:\\logs\\c.log"),
+            },
+        );
+
+        assert_eq!(at_limit, u32::MAX);
+        assert_eq!(
+            after_limit,
+            u32::MAX,
+            "上限に達したら飽和させる（0 へ折り返して既存の対象と衝突させない）"
+        );
+        assert_ne!(
+            after_limit, long_lived,
+            "折り返すと、開いたままの対象と同じ target_id を再利用してしまう"
+        );
     }
 
     #[test]
@@ -2828,19 +2876,14 @@ mod tests {
     // --- run_open_core（コアの読み込み経路との統合、AppHandle 非依存） ---
 
     #[test]
-    fn run_open_core_marks_target_ready_on_success_and_emits_completed() {
+    fn run_open_core_marks_target_ready_on_success() {
         let contents = "2026/07/28 15:12:23.456 起動しました\n";
         let file = TempFile::create_text("open-core-ok", contents);
         let fixture = Fixture::new();
         let target_id = fixture.register_and_begin("a.log", file.path.clone());
 
-        let events = fixture.run(request(target_id, file.path.clone()));
+        fixture.run(request(target_id, file.path.clone()));
 
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            LoadOutcomeEventPayload::Completed { target_id: t } if t == target_id
-        ));
         match fixture.status_of(target_id) {
             TargetStatusDto::Ready {
                 total_items,
@@ -2859,18 +2902,13 @@ mod tests {
     }
 
     #[test]
-    fn run_open_core_marks_target_error_on_missing_file_and_emits_failed() {
+    fn run_open_core_marks_target_error_on_missing_file() {
         let missing = std::env::temp_dir().join("hakutaku-targets-test-open-core-missing-91af.log");
         let fixture = Fixture::new();
         let target_id = fixture.register_and_begin("missing.log", missing.clone());
 
-        let events = fixture.run(request(target_id, missing));
+        fixture.run(request(target_id, missing));
 
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            LoadOutcomeEventPayload::Failed { target_id: t, .. } if t == target_id
-        ));
         match fixture.status_of(target_id) {
             TargetStatusDto::Error {
                 error,
@@ -2910,11 +2948,10 @@ mod tests {
 
         let mut req = request(target_id, file.path.clone());
         req.error_target = file.path.display().to_string();
-        let events = fixture.run(req);
+        fixture.run(req);
 
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            LoadOutcomeEventPayload::Failed { error, .. } => {
+        match fixture.status_of(target_id) {
+            TargetStatusDto::Error { error, .. } => {
                 assert_eq!(error.target, file.path.display().to_string());
                 assert!(
                     error.reason.contains("共有") || error.reason.contains("LOG-027"),
@@ -2924,7 +2961,7 @@ mod tests {
                 assert!(error.continuable);
                 assert!(error.next_action.contains("再試行"));
             }
-            other => panic!("Failed を期待しましたが {other:?} でした"),
+            other => panic!("Error を期待しましたが {other:?} でした"),
         }
 
         assert_eq!(fixture.budget.total_bytes(), 0);
@@ -2935,8 +2972,7 @@ mod tests {
 
     // 受け入れ条件（PRIV-002、P11-1）: ERROR_ACCESS_DENIED によるオープン
     // 失敗は AccessDenied として分類され、ERR-002 の理由が昇格による再試行を
-    // 案内する専用の文面になり、対象一覧・イベント payload の access_denied
-    // フラグが立つ。
+    // 案内する専用の文面になり、対象一覧の access_denied フラグが立つ。
     //
     // `icacls` で自分自身に対する読み取りを明示的に拒否し、実際の ACL 拒否を
     // 再現する（分類ロジック自体の決定的な単体テストは
@@ -2981,7 +3017,7 @@ mod tests {
         let fixture = Fixture::new();
         let target_id = fixture.register_and_begin("denied.log", file.path.clone());
 
-        let events = fixture.run(request(target_id, file.path.clone()));
+        fixture.run(request(target_id, file.path.clone()));
 
         // 後始末: 拒否 ACE を解除する（ファイル自体の削除は TempFile::drop へ
         // 任せる。読み取り拒否は削除操作を妨げないはずだが、念のため先に
@@ -2992,30 +3028,21 @@ mod tests {
             .arg(&username)
             .status();
 
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            LoadOutcomeEventPayload::Failed {
+        match fixture.status_of(target_id) {
+            TargetStatusDto::Error {
                 access_denied,
                 error,
-                ..
             } => {
-                assert!(*access_denied, "AccessDenied として分類されるはず");
+                assert!(
+                    access_denied,
+                    "AccessDenied として分類され、対象一覧の状態へ反映されるはず"
+                );
                 assert!(
                     error.reason.contains("管理者権限"),
                     "理由が昇格による再試行を案内するはず: {}",
                     error.reason
                 );
                 assert!(error.continuable);
-            }
-            other => panic!("Failed を期待しましたが {other:?} でした"),
-        }
-
-        match fixture.status_of(target_id) {
-            TargetStatusDto::Error { access_denied, .. } => {
-                assert!(
-                    access_denied,
-                    "対象一覧の状態にも access_denied が反映されるはず"
-                );
             }
             other => panic!("Error を期待しましたが {other:?} でした"),
         }
@@ -3050,41 +3077,60 @@ mod tests {
         );
     }
 
+    // 受け入れ条件（P07-2、Issue #51）: 進捗通知は対象一覧の `Loading` 状態へ
+    // 書き込まれ、`list_targets` の DTO から読める。イベント発行を廃したため、
+    // ここが進捗の唯一の出所になる（`run_open_core` を通した配線の確認は
+    // `run_open_core_keeps_display_set_registry_available_during_load` が
+    // 読み込み中に観測している）。
     #[test]
-    fn run_open_core_reports_progress_through_the_callback() {
-        let mut contents = String::new();
-        for i in 0..20 {
-            contents.push_str(&format!("2026/07/28 15:12:{:02}.000 行{i}\n", i % 60));
-        }
-        let file = TempFile::create_text("open-core-progress", &contents);
+    fn target_progress_sink_records_progress_into_the_target_list() {
         let fixture = Fixture::new();
-        let target_id = fixture.register_and_begin("progress.log", file.path.clone());
-
-        let progress_calls: Mutex<Vec<(u64, Option<u64>)>> = Mutex::new(Vec::new());
-        let outcomes: Mutex<Vec<LoadOutcomeEventPayload>> = Mutex::new(Vec::new());
-        run_open_core(
-            &fixture.targets,
-            &fixture.display_set_registry,
-            &fixture.budget,
-            &fixture.diagnostics,
-            &[],
-            &fixture.throttle,
-            fixture.chunk_bytes,
-            &request(target_id, file.path.clone()),
-            &|payload| {
-                progress_calls
-                    .lock()
-                    .unwrap()
-                    .push((payload.done_bytes, payload.total_bytes));
-            },
-            &|outcome| outcomes.lock().unwrap().push(outcome),
+        let target_id = fixture.register_and_begin(
+            "progress.log",
+            PathBuf::from("C:\\Device\\Logs\\progress.log"),
         );
 
-        let calls = progress_calls.into_inner().unwrap();
-        assert!(!calls.is_empty(), "進捗が少なくとも1回は通知されるはず");
-        for (done, total) in &calls {
-            assert_eq!(*total, Some(contents.len() as u64));
-            assert!(done <= &total.unwrap());
+        let sink = TargetProgressSink {
+            targets: &fixture.targets,
+            target_id,
+        };
+
+        sink.report(
+            TaskId::generate(),
+            Progress::Determinate {
+                done: 128,
+                total: 512,
+                unit: ProgressUnit::Bytes,
+            },
+        );
+
+        match fixture.status_of(target_id) {
+            TargetStatusDto::Loading {
+                progress: Some(progress),
+            } => {
+                assert_eq!(progress.done_bytes, 128);
+                assert_eq!(progress.total_bytes, Some(512));
+            }
+            other => panic!("進捗つきの Loading を期待しましたが {other:?} でした"),
+        }
+
+        // 総量不明（Indeterminate）は total_bytes = None として届く。
+        sink.report(
+            TaskId::generate(),
+            Progress::Indeterminate {
+                done: 256,
+                unit: ProgressUnit::Bytes,
+            },
+        );
+
+        match fixture.status_of(target_id) {
+            TargetStatusDto::Loading {
+                progress: Some(progress),
+            } => {
+                assert_eq!(progress.done_bytes, 256);
+                assert_eq!(progress.total_bytes, None);
+            }
+            other => panic!("進捗つきの Loading を期待しましたが {other:?} でした"),
         }
     }
 
@@ -3102,13 +3148,8 @@ mod tests {
         // 経路。crates/core-services の同種テストと同じ考え方）。
         assert!(fixture.targets.lock().unwrap().request_cancel(target_id));
 
-        let events = fixture.run(request(target_id, file.path.clone()));
+        fixture.run(request(target_id, file.path.clone()));
 
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            LoadOutcomeEventPayload::Cancelled { target_id: t } if t == target_id
-        ));
         match fixture.status_of(target_id) {
             TargetStatusDto::CancelledPartial { .. } => {}
             other => panic!("CancelledPartial を期待しましたが {other:?} でした"),
@@ -3130,10 +3171,10 @@ mod tests {
         // 他の対象は影響を受けない（ERR-001）。
         let other = TempFile::create_text("open-core-cancel-other", "2026/07/28 15:12:00.000 別\n");
         let other_id = fixture.register_and_begin("other.log", other.path.clone());
-        let other_events = fixture.run(request(other_id, other.path.clone()));
+        fixture.run(request(other_id, other.path.clone()));
         assert!(matches!(
-            other_events[0],
-            LoadOutcomeEventPayload::Completed { .. }
+            fixture.status_of(other_id),
+            TargetStatusDto::Ready { .. }
         ));
     }
 
@@ -3156,19 +3197,7 @@ mod tests {
         let mut req = request(target_id, file.path.clone());
         req.manual_profile = Some("manual-utf8".to_string());
 
-        let outcomes: Mutex<Vec<LoadOutcomeEventPayload>> = Mutex::new(Vec::new());
-        run_open_core(
-            &fixture.targets,
-            &fixture.display_set_registry,
-            &fixture.budget,
-            &fixture.diagnostics,
-            std::slice::from_ref(&profile),
-            &fixture.throttle,
-            fixture.chunk_bytes,
-            &req,
-            &|_progress| {},
-            &|outcome| outcomes.lock().unwrap().push(outcome),
-        );
+        fixture.run_with_profiles(std::slice::from_ref(&profile), req);
 
         match fixture.status_of(target_id) {
             TargetStatusDto::Ready {
@@ -3248,12 +3277,9 @@ mod tests {
         let mut req = request(target_id, file.path.clone());
         req.manual_datetime_format = Some("LOG-DT-999".to_string());
 
-        let events = fixture.run(req);
-        assert!(
-            matches!(events[0], LoadOutcomeEventPayload::Completed { .. }),
-            "不正な書式 ID でも読み込み自体は成功するはず"
-        );
+        fixture.run(req);
 
+        // 不正な書式 ID でも読み込み自体は成功する（`Ready` になる）。
         match fixture.status_of(target_id) {
             TargetStatusDto::Ready {
                 fell_back_to_raw_display,
@@ -3840,11 +3866,11 @@ mod tests {
         );
         assert!(fixture.targets.lock().unwrap().list().is_empty());
 
-        let events = fixture.run(request(target_id, file.path.clone()));
+        fixture.run(request(target_id, file.path.clone()));
 
         assert!(
-            events.is_empty(),
-            "閉じた対象には完了・失敗イベントの宛先が無いので発行しないはず"
+            !fixture.contains(target_id),
+            "閉じた対象が読み込み完了によって一覧へ戻ってきている"
         );
         assert!(
             fixture.display_set_registry.lock().unwrap().is_empty(),
@@ -3919,9 +3945,12 @@ mod tests {
         );
 
         assert!(fixture.close(target_id));
-        let events = loader.join().expect("パニックしないはず");
+        loader.join().expect("パニックしないはず");
 
-        assert!(events.is_empty(), "閉じた対象のイベントは発行しないはず");
+        assert!(
+            !fixture.contains(target_id),
+            "閉じた対象が読み込み完了によって一覧へ戻ってきている"
+        );
         assert!(
             fixture.display_set_registry.lock().unwrap().is_empty(),
             "閉じた対象のソースがコア側に残っている（統合表示へ混入する）"

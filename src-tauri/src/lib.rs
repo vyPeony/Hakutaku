@@ -17,6 +17,17 @@ use hakutaku_diagnostics::{diag_error, diag_info, diag_warn};
 /// 使うため、`bootstrap` モジュールの `Aborted` には含めていない。
 const EXIT_CODE_TAURI_RUN_FAILURE: i32 = 1;
 
+/// メインウィンドウ（WebView）の生成そのものが失敗した場合の終了コード
+/// （Issue #51）。
+///
+/// [`EXIT_CODE_TAURI_RUN_FAILURE`] の `1` と `bootstrap::Aborted` が使う
+/// `2`〜`5` のいずれとも重複しない値として `6` を割り当てる。`build`（Tauri の
+/// 組み立て）の失敗とは別のコードにしているのは、利用者・導入担当が診断ログを
+/// 見る前に「Tauri は組み立てられたが WebView を出せなかった」ことを終了コード
+/// だけで切り分けられるようにするためで、この2つは原因（設定・生成物の破損 vs
+/// WebView2 の実行時状態）も次の対処も異なる。
+const EXIT_CODE_WINDOW_CREATION_FAILURE: i32 = 6;
+
 /// 初期ウィンドウの既定の幅（論理ピクセル）。値の正本は `Tauri.toml` の
 /// P01 実装契約コメント（width = 1024）と同期させる。
 const INITIAL_WINDOW_WIDTH: f64 = 1024.0;
@@ -96,7 +107,10 @@ fn clamped_initial_window_size(
 ///    「正常終了時に削除」に従って `temp` を再度清掃する。
 /// 4. Tauri の起動自体が失敗した場合（`build` が `Err` を返した場合）も `panic!` /
 ///    `expect` せず、診断ログへ記録したうえで [`bootstrap::notify::show`] で
-///    利用者へ理由を伝え、`std::process::exit` する。
+///    利用者へ理由を伝え、`std::process::exit` する。メインウィンドウの生成
+///    （`.setup(...)` の中の `WebviewWindowBuilder::build`）が失敗した場合も同じ
+///    形で終える（`EXIT_CODE_WINDOW_CREATION_FAILURE`、Issue #51）。起動を
+///    中止するすべての経路が、理由を利用者へ伝えてから終わるようにするため。
 ///
 /// # `Builder::run` ではなく `build` + `App::run_return` を使う理由
 ///
@@ -113,14 +127,24 @@ fn clamped_initial_window_size(
 /// 示されている）。`SEC-006`（正常終了時に削除）を満たすには、清掃処理を実行できる
 /// 地点が必要なため、こちらを使う。
 ///
-/// # 既知の制約（Tauri 側の挙動、要調整として報告済み）
+/// # `setup` から `Err` を返さない理由（Tauri 側の挙動）
 ///
 /// `App::run` / `App::run_return` は、`Builder::setup` に渡した関数
 /// （このモジュールの `.setup(...)`）が `Err` を返した場合、**Tauri 側が
 /// `panic!` する**（`tauri-2.11.5/src/app.rs` の `App::run_return` の doc コメント
-/// に `# Panics` として明記されている、ライブラリ自身の既定動作）。この経路は
-/// `src-tauri` 側のコードではなく Tauri 本体の内部実装であり、本フェーズの
-/// 対象ファイル（`bootstrap/mod.rs`・`lib.rs`・`main.rs`）からは変更できない。
+/// に `# Panics` として明記されている、ライブラリ自身の既定動作）。この挙動は
+/// Tauri 本体の内部実装であり、`src-tauri` 側からは変更できない。
+///
+/// そこで `.setup(...)` の中で失敗し得る唯一の処理（メインウィンドウの生成）を
+/// クロージャーの中で処理し切り、`Err` を返さないようにしている（Issue #51）。
+/// 以前はここが `?` でそのまま伝播し、**起動を中止する経路の中で唯一、利用者へ
+/// 何も伝えないまま panic する**という非一貫な扱いになっていた。初期サイズの
+/// 丸め（`clamped_initial_window_size`）はモニタ情報が取れないときに黙って
+/// 既定サイズへ倒す設計であり、そもそも失敗を返さない。
+///
+/// この形を保つため、`.setup(...)` へ新しい処理を足すときは、失敗を `?` で
+/// 返さず、その場で「診断ログ → ネイティブ通知 → `std::process::exit`」または
+/// 「無視して続行」のどちらかへ倒してください。
 ///
 /// `#[cfg_attr(mobile, tauri::mobile_entry_point)]` は Tauri のデスクトップ向け
 /// テンプレートが標準的に付与するものであり、`mobile` cfg は Windows 専用ビルド
@@ -149,6 +173,10 @@ pub fn run() {
     // 本関数の後半で共有できるようにする。
     let diagnostics = std::sync::Arc::new(diagnostics);
     let navigation_diagnostics = std::sync::Arc::clone(&diagnostics);
+    // ウィンドウ生成の失敗を `setup` の中で通知・記録するために使う
+    // （Issue #51。`setup` から `Err` を返すと Tauri 側が panic するため、
+    // 失敗の扱いをクロージャーの中で完結させる必要がある）。
+    let setup_diagnostics = std::sync::Arc::clone(&diagnostics);
 
     // P04-3: 計測モード（開発・検証専用。HAKUTAKU_MEASURE_FILE
     // 環境変数）の状態を確定する。環境変数が絶対パスを指していない限り無効の
@@ -242,11 +270,13 @@ pub fn run() {
     // ロックを取ると再入してデッドロックします。代わりに `EvictionFlag`
     // （`log_view::EvictionFlag`。`Arc<AtomicBool>` の薄いラッパー）を立てる
     // だけにし、実際の解放（`hakutaku_core::DisplaySetRegistry::
-    // evict_inactive_sources`）は `log_view::fetch_log_range` の入口
-    // （`log_view::drain_pending_eviction`。新しいロックをまだ取っていない
-    // 安全な地点）で遅延して行います（設計判断の詳細は
-    // `hakutaku_core::registry::DisplaySetRegistry::evict_inactive_sources`
-    // の doc コメント「呼び出しタイミング」を参照）。
+    // evict_inactive_sources`）は Tauri コマンドの入口（新しいロックをまだ
+    // 取っていない安全な地点）で遅延して行います。消費点は
+    // `log_view::fetch_log_range`（スクロール契機）と
+    // `targets::list_targets`（読み込み中の 500ms ポーリング契機）の2つです
+    // （Issue #51。`log_view::EvictionFlag` の doc コメント参照）。設計判断の
+    // 詳細は `hakutaku_core::registry::DisplaySetRegistry::
+    // evict_inactive_sources` の doc コメント「呼び出しタイミング」を参照。
     let eviction_flag = log_view::EvictionFlag::default();
     let eviction_flag_for_handler = std::sync::Arc::clone(&eviction_flag.0);
     let prefetch_diagnostics = std::sync::Arc::clone(&diagnostics);
@@ -257,8 +287,8 @@ pub fn run() {
             operation = "memory.prefetch_suppressed",
             "ソフトしきい値に到達したため、読み込み中の対象で先読み（未要求範囲の\
              読み込み）を停止し、非アクティブなソースのバッファ解放を要求しました\
-             （PERF-014、P08-3）。実際の解放は次回の fetch_log_range 呼び出し時に\
-             遅延して行われます。"
+             （PERF-014、P08-3）。実際の解放は次回の fetch_log_range または\
+             list_targets 呼び出し時に遅延して行われます。"
         );
         eviction_flag_for_handler.store(true, std::sync::atomic::Ordering::Relaxed);
     }));
@@ -312,9 +342,10 @@ pub fn run() {
         // `log_view::open_log_file` / `log_view::fetch_log_range` がこれを使う。
         .manage(log_view::DisplaySetRegistryState::default())
         // P08-3: しきい値到達時の解放要求フラグ。上記の
-        // `register_release_handler` が立て、`log_view::fetch_log_range` が
-        // 入口で確認・消費する（`eviction_flag` 変数は上のクロージャへ
-        // クローンだけ渡し、実体はこの managed state 側に残す）。
+        // `register_release_handler` が立て、`log_view::fetch_log_range` と
+        // `targets::list_targets` が入口で確認・消費する（`eviction_flag`
+        // 変数は上のクロージャへクローンだけ渡し、実体はこの managed state
+        // 側に残す）。
         .manage(eviction_flag)
         // P07-1: 参照対象一覧（アドホックに開いた対象と、設定由来の
         // データソースを開いたセッション）を managed state として保持する。
@@ -376,7 +407,42 @@ pub fn run() {
                 );
                 false
             })
-            .build()?;
+            .build();
+            // ウィンドウを出せなければ、GUI アプリとして続行する意味が無い。
+            // ここで `?` により `Err` を返すと Tauri 側が panic し（`run` の
+            // doc コメント参照）、利用者には何の説明も残らないまま落ちるため、
+            // 他の起動失敗（`bootstrap::run` の各手順・後述の `build` 失敗）と
+            // 同じく「診断ログへ記録 → ネイティブ通知 → 終了コード」で終える
+            // （Issue #51）。
+            let window = match window {
+                Ok(window) => window,
+                Err(error) => {
+                    diag_error!(
+                        setup_diagnostics,
+                        module = "bootstrap",
+                        operation = "startup.window_create",
+                        "メインウィンドウを生成できませんでした: {error}"
+                    );
+
+                    let notice = bootstrap::notify::Notice {
+                        kind: bootstrap::notify::NoticeKind::Error,
+                        title: "Hakutaku: 起動に失敗しました".to_string(),
+                        body: format!(
+                            "メインウィンドウを生成できなかったため、Hakutaku を起動できませんでした。\n\
+                             \n\
+                             理由:\n\
+                             \u{20}\u{20}{error}\n\
+                             \n\
+                             WebView2 Runtime の状態が変わっていないかを確認し、Hakutaku を再度\n\
+                             起動してください。改善しない場合は診断ログ（logs フォルダ）を\n\
+                             確認してください。"
+                        ),
+                    };
+                    bootstrap::notify::show(&notice);
+
+                    std::process::exit(EXIT_CODE_WINDOW_CREATION_FAILURE);
+                }
+            };
             // モニタ情報が取れた場合だけ、初期サイズをモニタの論理サイズへ
             // 丸める（Issue #9）。取得失敗（Err / None）や set_size の失敗は
             // 無視して既定サイズのまま起動する（丸めは表示位置の改善であり、
@@ -471,7 +537,32 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::clamped_initial_window_size;
+    use super::{
+        clamped_initial_window_size, EXIT_CODE_TAURI_RUN_FAILURE, EXIT_CODE_WINDOW_CREATION_FAILURE,
+    };
+
+    /// 受け入れ条件（Issue #51）: 起動を中止する経路の終了コードは、`bootstrap`
+    /// 側（`Aborted::exit_code`）とこのモジュール側を合わせてすべて異なる。
+    /// 重複すると、利用者・導入担当が終了コードから中止理由を切り分けられなく
+    /// なる（`bootstrap::tests::exit_codes_are_pairwise_distinct` の検査を、
+    /// `bootstrap` の外で定義しているコードまで広げたもの）。
+    #[test]
+    fn startup_exit_codes_are_pairwise_distinct_across_modules() {
+        let codes = [
+            EXIT_CODE_TAURI_RUN_FAILURE,
+            EXIT_CODE_WINDOW_CREATION_FAILURE,
+            crate::bootstrap::EXIT_CODE_LAYOUT_UNAVAILABLE,
+            crate::bootstrap::EXIT_CODE_RUNTIME_UNAVAILABLE,
+            crate::bootstrap::EXIT_CODE_WEBVIEW2_DATA_UNAVAILABLE,
+            crate::bootstrap::EXIT_CODE_RUNTIME_FOLDER_IS_LINK,
+        ];
+
+        for (index, code) in codes.iter().enumerate() {
+            for other in codes.iter().skip(index + 1) {
+                assert_ne!(code, other, "終了コードが重複しています: {codes:?}");
+            }
+        }
+    }
 
     /// 表示スケール 150% の 1920×1080（モニタ論理サイズ 1280×720）では、高さを
     /// 利用可能サイズ（720 − 88 = 632）へ丸める（Issue #9 の再現条件）。
