@@ -13,9 +13,10 @@
 //   4. `record_measurement_results` で結果を logs へ送信する。途中でエラーに
 //      なった場合も、同じ経路で失敗記録を送信する（`recordFailure`）
 //
-// 外部からの終了判定は、`logs/measurement-p04-*.json` の出現で行う（成功・
-// 失敗のどちらでも書き出される）。アプリの自動終了はしない。呼び出し側が
-// taskkill する。ウィンドウタイトルを判定に使ってはならない: Tauri 2系は
+// 外部からの終了判定は、`logs/measurements/measurement-p04-*.json` の出現で
+// 行う（成功・失敗のどちらでも書き出される）。アプリの自動終了はしない。
+// 呼び出し側が taskkill する。ウィンドウタイトルを判定に使ってはならない:
+// Tauri 2系は
 // document.title をネイティブウィンドウのタイトルへ同期しない
 // （`on_document_title_changed` ハンドラーを登録した場合だけ変更が Rust 側へ
 // 通知される仕組みで、本アプリは登録していない）ため、外部プロセスから
@@ -610,8 +611,8 @@ async function verifyContinuousScroll(retentionLimits) {
 
 /**
  * 計測が途中で失敗したことを、成功時と同じ `record_measurement_results` 経路で
- * `logs/measurement-p04-*.json` として書き残す（外部からの終了判定用。
- * モジュール doc コメント参照）。
+ * `logs/measurements/measurement-p04-*.json` として書き残す（外部からの
+ * 終了判定用。モジュール doc コメント参照）。
  *
  * 成功時の結果 JSON と区別できるよう、`failed: true` とエラーメッセージを持つ
  * 最小の記録にする。この書き残し自体に失敗した場合、フロントエンドから外部へ

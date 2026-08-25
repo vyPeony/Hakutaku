@@ -12,6 +12,12 @@
 // このモジュール自身は状態を書き換えず、log_view.js からの記録呼び出しを
 // 受けて計数を更新するだけの薄い層に徹する。P04-3 の計測モードが
 // `window.__hakutakuStats` を直接読み、上限順守の検証に使う。
+//
+// `window.__hakutakuStats` の公開は計測モードのときだけ行う（Issue #46）。
+// 計測モードは開発・検証専用であり、通常の利用者向け起動でこの観測 API を
+// WebView のグローバルへ置く必要はない（SEC-012 の「フロントエンドへ与える
+// 能力を必要最小限に保つ」趣旨。公開の可否は `enableWindowPublication` を
+// 参照）。
 
 let retainedRows = 0;
 let retainedBytes = 0;
@@ -116,14 +122,40 @@ export function getStats() {
 }
 
 /**
- * `window.__hakutakuStats` を読み取り専用で公開する（P04-3 の計測モードが
- * 直接 `window.__hakutakuStats.getStats()` を呼び出せるようにするため）。
+ * `window.__hakutakuStats` を公開してよいかどうか。既定は「公開しない」。
+ *
+ * 計測モードの判定（`get_measurement_mode`）は Rust 側にしかないため、
+ * その結果を受け取る `src/main.js` が `enableWindowPublication()` で立てる。
+ */
+let windowPublicationEnabled = false;
+
+/**
+ * `window.__hakutakuStats` の公開を許可する（Issue #46）。
+ *
+ * 計測モード（`get_measurement_mode` が `active: true`）のときだけ、
+ * `src/main.js` の起動フローから呼び出す。呼び出し順に依存しないよう、
+ * ここでも公開を試みる（`initLogView` の `publishToWindow()` が先に走っていて
+ * も、後から走っても、計測モードなら公開される）。
+ */
+export function enableWindowPublication() {
+  windowPublicationEnabled = true;
+  publishToWindow();
+}
+
+/**
+ * 計測モードのときだけ、`window.__hakutakuStats` を読み取り専用で公開する
+ * （P04-3 の計測モードが直接 `window.__hakutakuStats.getStats()` を呼び出せる
+ * ようにするため）。通常の利用者向け起動では何もしない（Issue #46。モジュール
+ * 冒頭のコメント参照）。
  *
  * `Object.freeze` は公開するオブジェクト自身（`getStats` プロパティの再代入）
  * だけを禁止する。`getStats` は呼び出しのたびに最新のスナップショットを生成
  * する関数のため、公開オブジェクトを凍結しても返す値が古くなることはない。
  */
 export function publishToWindow() {
+  if (!windowPublicationEnabled) {
+    return;
+  }
   if (typeof window === "undefined") {
     return;
   }
